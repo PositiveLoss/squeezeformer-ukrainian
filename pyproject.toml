@@ -1,0 +1,20 @@
+[project]
+name = "squeezeformer-pytorch"
+version = "0.1.0"
+description = "PyTorch implementation of the Squeezeformer encoder"
+requires-python = ">=3.14"
+dependencies = [
+    "huggingface_hub>=0.34.0",
+    "polars>=1.30.0",
+    "trackio>=0.20.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
