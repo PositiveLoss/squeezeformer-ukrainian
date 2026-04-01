@@ -43,15 +43,35 @@ Published variant table used in code:
 
 The repository is designed to run in a local `uv` environment.
 
+CPU setup:
+
 ```bash
 uv venv .venv
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 uv pip install polars jiwer sentencepiece huggingface_hub trackio pytest ruff
 ```
 
+TPU setup:
+
+```bash
+uv venv .venv
+source .venv/bin/activate
+
+# Install PyTorch, TorchAudio, and Torch/XLA builds that match your TPU runtime.
+uv pip install torch torchaudio torch_xla
+
+# Install the project dependencies.
+uv pip install -e .
+uv pip install pytest ruff
+```
+
 For TPU runs, install a `torch_xla` build that matches your `torch` version and runtime, then
 pass `--device xla` or `--device xla:N` to `train.py` or `evaluate.py`. The current TPU path is
 single-process only; the existing `torchrun` distributed path remains CUDA/CPU-oriented.
+
+On managed TPU environments such as Colab or Kaggle, prefer creating the `uv` environment after
+the TPU runtime is already attached. If the runtime preinstalls `torch`, `torch_xla`, or related
+TPU packages, keep those versions aligned when installing into `.venv`.
 
 ## Dataset Access
 
