@@ -3,22 +3,27 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 import torch
 import trackio
 from torch import nn
 
-from squeezeformer_pytorch.asr import SqueezeformerCTC, Tokenizer, tokenizer_from_dict
+from squeezeformer_pytorch.asr import (
+    SqueezeformerCTC,
+    load_lm_scorer,
+    tokenizer_from_dict,
+)
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
     create_dataloader,
     download_cv22_dataset,
     load_cv22_records,
+    prevalidate_records,
 )
-from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import SqueezeformerConfig
-from train import DTypeChoice, _autocast_context
+from train import DecodeStrategy, DTypeChoice, evaluate
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +39,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--feature-cache-dir", default=None)
+    parser.add_argument(
+        "--bucket-by-length",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--prevalidate-audio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--prevalidate-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--dtype",
@@ -41,14 +69,19 @@ def parse_args() -> argparse.Namespace:
         choices=list(DTypeChoice),
         default=DTypeChoice.BFLOAT16,
     )
+    parser.add_argument(
+        "--decode-strategy",
+        type=DecodeStrategy,
+        choices=list(DecodeStrategy),
+        default=DecodeStrategy.GREEDY,
+    )
+    parser.add_argument("--beam-size", type=int, default=8)
+    parser.add_argument("--lm-scorer", default=None)
+    parser.add_argument("--lm-weight", type=float, default=0.0)
+    parser.add_argument("--example-limit", type=int, default=5)
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     return parser.parse_args()
-
-
-def greedy_decode(log_probs: torch.Tensor, tokenizer: Tokenizer) -> list[str]:
-    token_ids = log_probs.argmax(dim=-1).cpu().tolist()
-    return [tokenizer.decode_ctc(sequence) for sequence in token_ids]
 
 
 def main() -> None:
@@ -75,44 +108,64 @@ def main() -> None:
         test_fraction=args.test_fraction,
         max_samples=args.max_samples,
     )
-    dataset = CV22ASRDataset(records, tokenizer=tokenizer, featurizer=AudioFeaturizer())
+    if args.prevalidate_audio:
+        records = prevalidate_records(records, num_workers=args.prevalidate_workers)
+        if not records:
+            raise RuntimeError(
+                "Audio prevalidation removed every sample from the evaluation split."
+            )
+    featurizer = AudioFeaturizer(**checkpoint.get("featurizer_config", {}))
+    feature_cache_dir = (
+        Path(args.feature_cache_dir) / args.split if args.feature_cache_dir else None
+    )
+    dataset = CV22ASRDataset(
+        records,
+        tokenizer=tokenizer,
+        featurizer=featurizer,
+        feature_cache_dir=feature_cache_dir,
+    )
     dataloader = create_dataloader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        bucket_by_length=args.bucket_by_length,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
-
-    total_loss = 0.0
-    references: list[str] = []
-    hypotheses: list[str] = []
-    with torch.no_grad():
-        for batch in dataloader:
-            features = batch["features"].to(device)
-            feature_lengths = batch["feature_lengths"].to(device)
-            targets = batch["targets"].to(device)
-            target_lengths = batch["target_lengths"].to(device)
-            with _autocast_context(device, args.dtype):
-                log_probs, output_lengths = model.log_probs(features, feature_lengths)
-                loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
-            total_loss += float(loss.item())
-            references.extend(batch["transcripts"])
-            hypotheses.extend(greedy_decode(log_probs, tokenizer))
-
-    metrics = {
+    lm_scorer = load_lm_scorer(args.lm_scorer)
+    result = evaluate(
+        model=model,
+        dataloader=dataloader,
+        criterion=criterion,
+        tokenizer=tokenizer,
+        device=device,
+        dtype=args.dtype,
+        decode_strategy=args.decode_strategy,
+        beam_size=args.beam_size,
+        lm_scorer=lm_scorer,
+        lm_weight=args.lm_weight,
+        example_limit=args.example_limit,
+    )
+    metrics = result["metrics"] | {
         "split": args.split,
-        "loss": total_loss / max(1, len(dataloader)),
-        "cer": char_error_rate(references, hypotheses),
-        "wer": word_error_rate(references, hypotheses),
         "samples": len(records),
+        "decode_strategy": args.decode_strategy,
     }
-    print(json.dumps(metrics, indent=2, ensure_ascii=False))
+    payload = {"metrics": metrics, "examples": result["examples"]}
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
 
+    trackio_config = {
+        "evaluation_split": args.split,
+        "checkpoint": str(args.checkpoint),
+        "decode_strategy": args.decode_strategy,
+    }
     trackio.init(
         project=args.trackio_project,
         space_id=args.trackio_space_id,
-        config={"evaluation_split": args.split, "checkpoint": str(args.checkpoint)},
+        config=trackio_config,
     )
     trackio.log(metrics)
     trackio.finish()

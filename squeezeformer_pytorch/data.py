@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,7 @@ import torchaudio
 from huggingface_hub import snapshot_download
 from torch import Tensor
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 from .asr import Tokenizer
 
@@ -26,6 +28,8 @@ class CV22Record:
     audio_bytes: bytes | None
     transcript: str
     utterance_id: str
+    speaker_id: str
+    estimated_frames: int
 
 
 class AudioFeaturizer(torch.nn.Module):
@@ -35,9 +39,18 @@ class AudioFeaturizer(torch.nn.Module):
         n_fft: int = 400,
         hop_length: int = 160,
         n_mels: int = 80,
+        preemphasis: float = 0.97,
+        normalize_signal: bool = True,
+        normalize_feature: bool = True,
+        normalize_per_frame: bool = False,
     ) -> None:
         super().__init__()
         self.sample_rate = sample_rate
+        self.preemphasis = preemphasis
+        self.normalize_signal = normalize_signal
+        self.normalize_feature = normalize_feature
+        self.normalize_per_frame = normalize_per_frame
+        self.hop_length = hop_length
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate,
             n_fft=n_fft,
@@ -54,8 +67,35 @@ class AudioFeaturizer(torch.nn.Module):
                 sample_rate,
                 self.sample_rate,
             )[0]
+        if self.normalize_signal:
+            waveform = waveform - waveform.mean()
+            waveform = waveform / waveform.abs().amax().clamp_min(1e-6)
+        if self.preemphasis > 0:
+            waveform = torch.cat(
+                [waveform[:1], waveform[1:] - self.preemphasis * waveform[:-1]],
+                dim=0,
+            )
         features = self.mel(waveform)
-        return torch.log(features.clamp_min(1e-5)).transpose(0, 1)
+        features = torch.log(features.clamp_min(1e-5)).transpose(0, 1)
+        if self.normalize_feature:
+            if self.normalize_per_frame:
+                mean = features.mean(dim=-1, keepdim=True)
+                std = features.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-5)
+            else:
+                mean = features.mean(dim=0, keepdim=True)
+                std = features.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-5)
+            features = (features - mean) / std
+        return features
+
+    def config_dict(self) -> dict[str, object]:
+        return {
+            "sample_rate": self.sample_rate,
+            "preemphasis": self.preemphasis,
+            "normalize_signal": self.normalize_signal,
+            "normalize_feature": self.normalize_feature,
+            "normalize_per_frame": self.normalize_per_frame,
+            "hop_length": self.hop_length,
+        }
 
 
 class SpecAugment(torch.nn.Module):
@@ -94,8 +134,13 @@ class SpecAugment(torch.nn.Module):
         return augmented
 
 
-def _normalize_text(text: str) -> str:
-    return " ".join(text.strip().lower().split())
+def normalize_transcript(text: str) -> str:
+    normalized = text.strip().lower()
+    normalized = normalized.replace("’", "'").replace("`", "'").replace("ʼ", "'")
+    normalized = re.sub(r"[“”«»]", '"', normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
+    return normalized
 
 
 def _hash_to_unit_interval(value: str, seed: int) -> float:
@@ -121,7 +166,7 @@ def _extract_transcript(row: dict[str, Any]) -> str:
     for column in TRANSCRIPT_COLUMNS:
         value = row.get(column)
         if isinstance(value, str) and value.strip():
-            return _normalize_text(value)
+            return normalize_transcript(value)
     raise KeyError(f"No transcript column found in row. Tried {TRANSCRIPT_COLUMNS}.")
 
 
@@ -187,13 +232,23 @@ def load_cv22_records(
             audio_path, audio_bytes = _resolve_audio(row, dataset_root=dataset_root)
         except KeyError:
             continue
-        utterance_id = str(row.get("client_id") or row.get("id") or audio_path or len(records))
+        utterance_id = str(row.get("id") or audio_path or len(records))
+        speaker_id = str(row.get("client_id") or row.get("speaker_id") or utterance_id)
+        duration_seconds = (
+            row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
+        )
+        if isinstance(duration_seconds, (float, int)):
+            estimated_frames = max(1, int((float(duration_seconds) * 16000) / 160))
+        else:
+            estimated_frames = 0
         records.append(
             CV22Record(
                 audio_path=audio_path,
                 audio_bytes=audio_bytes,
                 transcript=transcript,
                 utterance_id=utterance_id,
+                speaker_id=speaker_id,
+                estimated_frames=estimated_frames,
             )
         )
 
@@ -202,7 +257,7 @@ def load_cv22_records(
 
     selected: list[CV22Record] = []
     for record in records:
-        score = _hash_to_unit_interval(record.utterance_id, seed=seed)
+        score = _hash_to_unit_interval(record.speaker_id, seed=seed)
         train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
         if split == "train" and score < train_cutoff:
             selected.append(record)
@@ -226,25 +281,42 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
         tokenizer: Tokenizer,
         featurizer: AudioFeaturizer,
         specaugment: SpecAugment | None = None,
+        feature_cache_dir: str | Path | None = None,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
         self.featurizer = featurizer
         self.specaugment = specaugment
+        self.feature_cache_dir = Path(feature_cache_dir) if feature_cache_dir is not None else None
+        if self.feature_cache_dir is not None:
+            self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _feature_cache_path(self, record: CV22Record) -> Path | None:
+        if self.feature_cache_dir is None:
+            return None
+        frontend_hash = hashlib.sha256(
+            repr(self.featurizer.config_dict()).encode("utf-8")
+        ).hexdigest()[:12]
+        return self.feature_cache_dir / f"{record.utterance_id}_{frontend_hash}.pt"
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
-        if record.audio_path is not None and Path(record.audio_path).exists():
-            waveform, sample_rate = torchaudio.load(record.audio_path)
-        elif record.audio_bytes is not None:
-            waveform, sample_rate = torchaudio.load(io.BytesIO(record.audio_bytes))
+        cache_path = self._feature_cache_path(record)
+        if cache_path is not None and cache_path.exists():
+            features = torch.load(cache_path, map_location="cpu")
         else:
-            raise FileNotFoundError(f"Audio for record {record.utterance_id} is not available.")
-
-        features = self.featurizer(waveform, sample_rate)
+            if record.audio_path is not None and Path(record.audio_path).exists():
+                waveform, sample_rate = torchaudio.load(record.audio_path)
+            elif record.audio_bytes is not None:
+                waveform, sample_rate = torchaudio.load(io.BytesIO(record.audio_bytes))
+            else:
+                raise FileNotFoundError(f"Audio for record {record.utterance_id} is not available.")
+            features = self.featurizer(waveform, sample_rate)
+            if cache_path is not None:
+                torch.save(features, cache_path)
         if self.specaugment is not None:
             features = self.specaugment(features)
         target_ids = torch.tensor(self.tokenizer.encode(record.transcript), dtype=torch.long)
@@ -256,6 +328,66 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
             "transcript": record.transcript,
             "utterance_id": record.utterance_id,
         }
+
+
+class LengthBucketBatchSampler(BatchSampler):
+    def __init__(self, records: list[CV22Record], batch_size: int, shuffle: bool) -> None:
+        self.records = records
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+
+    def __iter__(self):
+        indices = sorted(
+            range(len(self.records)), key=lambda index: self.records[index].estimated_frames
+        )
+        batches = [
+            indices[start : start + self.batch_size]
+            for start in range(0, len(indices), self.batch_size)
+        ]
+        if self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in order]
+        yield from batches
+
+    def __len__(self) -> int:
+        return (len(self.records) + self.batch_size - 1) // self.batch_size
+
+
+def _record_is_valid(record: CV22Record) -> bool:
+    try:
+        if record.audio_path is not None and Path(record.audio_path).exists():
+            torchaudio.info(record.audio_path)
+            return True
+        if record.audio_bytes is not None:
+            torchaudio.info(io.BytesIO(record.audio_bytes))
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def prevalidate_records(
+    records: list[CV22Record],
+    num_workers: int = 4,
+) -> list[CV22Record]:
+    if num_workers <= 1:
+        return [record for record in records if _record_is_valid(record)]
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        validity = list(executor.map(_record_is_valid, records))
+    return [record for record, is_valid in zip(records, validity, strict=True) if is_valid]
+
+
+def estimate_record_frames(record: CV22Record, hop_length: int) -> int:
+    if record.estimated_frames > 0:
+        return record.estimated_frames
+    if record.audio_path is not None and Path(record.audio_path).exists():
+        try:
+            info = torchaudio.info(record.audio_path)
+            return max(1, int(info.num_frames / hop_length))
+        except Exception:
+            return 0
+    return 0
 
 
 def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -291,11 +423,34 @@ def create_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    bucket_by_length: bool = False,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 2,
 ) -> DataLoader[dict[str, Any]]:
+    for record in dataset.records:
+        if record.estimated_frames <= 0:
+            object.__setattr__(
+                record,
+                "estimated_frames",
+                estimate_record_frames(record, hop_length=dataset.featurizer.hop_length),
+            )
+    dataloader_kwargs = {
+        "num_workers": num_workers,
+        "collate_fn": collate_asr_batch,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers and num_workers > 0,
+    }
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    if bucket_by_length:
+        batch_sampler = LengthBucketBatchSampler(
+            dataset.records, batch_size=batch_size, shuffle=shuffle
+        )
+        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_asr_batch,
+        **dataloader_kwargs,
     )

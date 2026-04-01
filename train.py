@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections import defaultdict
+from copy import deepcopy
 from dataclasses import asdict
 from enum import StrEnum
 from pathlib import Path
@@ -10,13 +12,16 @@ from typing import NamedTuple
 
 import torch
 import trackio
-from torch import nn
+from torch import Tensor, nn
 
 from squeezeformer_pytorch.asr import (
     CharacterTokenizer,
     SentencePieceTokenizer,
     SqueezeformerCTC,
     Tokenizer,
+    ctc_prefix_beam_search,
+    load_lm_scorer,
+    tokenizer_from_dict,
 )
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
@@ -25,9 +30,10 @@ from squeezeformer_pytorch.data import (
     create_dataloader,
     download_cv22_dataset,
     load_cv22_records,
+    prevalidate_records,
 )
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
-from squeezeformer_pytorch.model import squeezeformer_variant
+from squeezeformer_pytorch.model import SqueezeformerConfig, squeezeformer_variant
 
 
 def _checkpoint_name(epoch: int, val_wer: float) -> str:
@@ -48,6 +54,11 @@ class DTypeChoice(StrEnum):
 class OptimizerChoice(StrEnum):
     MUON = "muon"
     ADAMW = "adamw"
+
+
+class DecodeStrategy(StrEnum):
+    GREEDY = "greedy"
+    BEAM = "beam"
 
 
 def _variant_defaults(variant: str) -> SchedulerDefaults:
@@ -83,21 +94,47 @@ def build_paper_scheduler(
 def build_optimizer(
     model: SqueezeformerCTC,
     optimizer_name: OptimizerChoice,
-    lr: float,
-    weight_decay: float,
+    muon_lr: float,
+    adamw_lr: float,
+    muon_weight_decay: float,
+    adamw_weight_decay: float,
 ) -> tuple[list[torch.optim.Optimizer], list[str]]:
     if optimizer_name == OptimizerChoice.ADAMW:
-        return [torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)], ["adamw"]
+        decay_params = []
+        no_decay_params = []
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if parameter.ndim < 2 or any(
+                token in name.lower() for token in ("bias", "norm", "scale")
+            ):
+                no_decay_params.append(parameter)
+            else:
+                decay_params.append(parameter)
+        return [
+            torch.optim.AdamW(
+                [
+                    {"params": decay_params, "weight_decay": adamw_weight_decay},
+                    {"params": no_decay_params, "weight_decay": 0.0},
+                ],
+                lr=adamw_lr,
+            )
+        ], ["adamw"]
 
     muon_params = []
-    adamw_params = []
+    adamw_decay_params = []
+    adamw_no_decay_params = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if name.startswith("encoder.") and parameter.ndim == 2:
             muon_params.append(parameter)
+        elif parameter.ndim < 2 or any(
+            token in name.lower() for token in ("bias", "norm", "scale")
+        ):
+            adamw_no_decay_params.append(parameter)
         else:
-            adamw_params.append(parameter)
+            adamw_decay_params.append(parameter)
 
     optimizers: list[torch.optim.Optimizer] = []
     optimizer_names: list[str] = []
@@ -105,16 +142,67 @@ def build_optimizer(
         optimizers.append(
             torch.optim.Muon(
                 muon_params,
-                lr=lr,
-                weight_decay=weight_decay,
+                lr=muon_lr,
+                weight_decay=muon_weight_decay,
                 adjust_lr_fn="match_rms_adamw",
             )
         )
         optimizer_names.append("muon")
-    if adamw_params:
-        optimizers.append(torch.optim.AdamW(adamw_params, lr=lr, weight_decay=weight_decay))
+    if adamw_decay_params or adamw_no_decay_params:
+        optimizers.append(
+            torch.optim.AdamW(
+                [
+                    {"params": adamw_decay_params, "weight_decay": adamw_weight_decay},
+                    {"params": adamw_no_decay_params, "weight_decay": 0.0},
+                ],
+                lr=adamw_lr,
+            )
+        )
         optimizer_names.append("adamw_aux")
     return optimizers, optimizer_names
+
+
+class ExponentialMovingAverage:
+    def __init__(self, model: nn.Module, decay: float) -> None:
+        self.decay = decay
+        self.shadow = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        }
+
+    def update(self, model: nn.Module) -> None:
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name in self.shadow:
+                    self.shadow[name].mul_(self.decay).add_(
+                        parameter.detach(), alpha=1 - self.decay
+                    )
+
+    def state_dict(self) -> dict[str, object]:
+        return {"decay": self.decay, "shadow": self.shadow}
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        self.decay = float(state_dict["decay"])
+        self.shadow = {name: tensor.clone() for name, tensor in state_dict["shadow"].items()}
+
+    def apply_to(self, model: nn.Module) -> dict[str, Tensor]:
+        backup: dict[str, Tensor] = {}
+        for name, parameter in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = parameter.detach().clone()
+                parameter.data.copy_(
+                    self.shadow[name].to(device=parameter.device, dtype=parameter.dtype)
+                )
+        return backup
+
+    @staticmethod
+    def restore(model: nn.Module, backup: dict[str, Tensor]) -> None:
+        for name, parameter in model.named_parameters():
+            if name in backup:
+                parameter.data.copy_(
+                    backup[name].to(device=parameter.device, dtype=parameter.dtype)
+                )
 
 
 def _resolve_autocast_dtype(dtype: DTypeChoice) -> torch.dtype | None:
@@ -180,18 +268,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--resume", default=None)
     parser.add_argument("--variant", default="sm", choices=["xs", "s", "sm", "m", "ml", "l"])
     parser.add_argument("--output-dir", default="artifacts/squeezeformer-cv22")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--muon-learning-rate", type=float, default=None)
+    parser.add_argument("--adamw-learning-rate", type=float, default=None)
+    parser.add_argument("--muon-weight-decay", type=float, default=None)
+    parser.add_argument("--adamw-weight-decay", type=float, default=None)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--feature-cache-dir", default=None)
+    parser.add_argument(
+        "--bucket-by-length",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--prevalidate-audio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--prevalidate-workers", type=int, default=4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--optimizer",
@@ -223,12 +340,125 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=20)
     parser.add_argument("--hold-epochs", type=int, default=160)
     parser.add_argument("--decay-exponent", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--activation-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--block-pattern", default="M,s,C,s")
+    parser.add_argument("--preemphasis", type=float, default=0.97)
+    parser.add_argument(
+        "--normalize-signal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--normalize-feature",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--normalize-per-frame",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--num-freq-masks", type=int, default=2)
+    parser.add_argument("--freq-mask-param", type=int, default=27)
+    parser.add_argument("--num-time-masks", type=int, default=None)
+    parser.add_argument("--time-mask-max-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--decode-strategy",
+        type=DecodeStrategy,
+        choices=list(DecodeStrategy),
+        default=DecodeStrategy.GREEDY,
+    )
+    parser.add_argument("--beam-size", type=int, default=8)
+    parser.add_argument("--lm-scorer", default=None)
+    parser.add_argument("--lm-weight", type=float, default=0.0)
+    parser.add_argument("--example-limit", type=int, default=5)
     return parser.parse_args()
 
 
 def greedy_decode(log_probs: torch.Tensor, tokenizer: Tokenizer) -> list[str]:
     token_ids = log_probs.argmax(dim=-1).cpu().tolist()
     return [tokenizer.decode_ctc(sequence) for sequence in token_ids]
+
+
+def decode_batch(
+    log_probs: torch.Tensor,
+    tokenizer: Tokenizer,
+    strategy: DecodeStrategy,
+    beam_size: int = 8,
+    lm_scorer=None,
+    lm_weight: float = 0.0,
+) -> list[str]:
+    if strategy == DecodeStrategy.GREEDY:
+        return greedy_decode(log_probs, tokenizer)
+    return [
+        ctc_prefix_beam_search(
+            sequence.cpu(),
+            tokenizer=tokenizer,
+            beam_size=beam_size,
+            lm_scorer=lm_scorer,
+            lm_weight=lm_weight,
+        )
+        for sequence in log_probs
+    ]
+
+
+def _bucket_name(reference: str) -> str:
+    word_count = len(reference.split())
+    if word_count <= 5:
+        return "short"
+    if word_count <= 15:
+        return "medium"
+    return "long"
+
+
+def length_bucket_metrics(
+    references: list[str],
+    hypotheses: list[str],
+) -> dict[str, float]:
+    grouped_refs: dict[str, list[str]] = defaultdict(list)
+    grouped_hyps: dict[str, list[str]] = defaultdict(list)
+    for reference, hypothesis in zip(references, hypotheses, strict=True):
+        bucket = _bucket_name(reference)
+        grouped_refs[bucket].append(reference)
+        grouped_hyps[bucket].append(hypothesis)
+
+    metrics: dict[str, float] = {}
+    for bucket in ("short", "medium", "long"):
+        metrics[f"samples_{bucket}"] = float(len(grouped_refs[bucket]))
+        if grouped_refs[bucket]:
+            metrics[f"wer_{bucket}"] = word_error_rate(grouped_refs[bucket], grouped_hyps[bucket])
+            metrics[f"cer_{bucket}"] = char_error_rate(grouped_refs[bucket], grouped_hyps[bucket])
+    return metrics
+
+
+def collect_examples(
+    utterance_ids: list[str],
+    references: list[str],
+    hypotheses: list[str],
+    limit: int,
+) -> list[dict[str, str]]:
+    examples = []
+    pairs = list(zip(utterance_ids, references, hypotheses, strict=True))
+    pairs.sort(key=lambda item: (item[1] == item[2], abs(len(item[1]) - len(item[2]))))
+    for utterance_id, reference, hypothesis in pairs[:limit]:
+        examples.append(
+            {
+                "utterance_id": utterance_id,
+                "reference": reference,
+                "hypothesis": hypothesis,
+            }
+        )
+    return examples
 
 
 def evaluate(
@@ -238,12 +468,18 @@ def evaluate(
     tokenizer: Tokenizer,
     device: torch.device,
     dtype: DTypeChoice,
-) -> dict[str, float]:
+    decode_strategy: DecodeStrategy = DecodeStrategy.GREEDY,
+    beam_size: int = 8,
+    lm_scorer=None,
+    lm_weight: float = 0.0,
+    example_limit: int = 5,
+) -> dict[str, object]:
     model.eval()
     total_loss = 0.0
     total_batches = 0
     references: list[str] = []
     hypotheses: list[str] = []
+    utterance_ids: list[str] = []
     with torch.no_grad():
         for batch in dataloader:
             features = batch["features"].to(device)
@@ -257,12 +493,77 @@ def evaluate(
             total_loss += float(loss.item())
             total_batches += 1
             references.extend(batch["transcripts"])
-            hypotheses.extend(greedy_decode(log_probs, tokenizer))
+            utterance_ids.extend(batch["utterance_ids"])
+            hypotheses.extend(
+                decode_batch(
+                    log_probs,
+                    tokenizer=tokenizer,
+                    strategy=decode_strategy,
+                    beam_size=beam_size,
+                    lm_scorer=lm_scorer,
+                    lm_weight=lm_weight,
+                )
+            )
 
-    return {
+    metrics = {
         "loss": total_loss / max(1, total_batches),
         "cer": char_error_rate(references, hypotheses),
         "wer": word_error_rate(references, hypotheses),
+    }
+    metrics.update(length_bucket_metrics(references, hypotheses))
+    return {
+        "metrics": metrics,
+        "examples": collect_examples(utterance_ids, references, hypotheses, limit=example_limit),
+    }
+
+
+def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
+    tokens = tuple(token.strip() for token in block_pattern.split(",") if token.strip())
+    if not tokens or any(token not in {"M", "C", "s"} for token in tokens):
+        raise ValueError("block pattern must be a comma-separated sequence drawn from M,C,s")
+    return tokens
+
+
+def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    for index, example in enumerate(examples):
+        payload[f"{prefix}_example_{index}_id"] = example["utterance_id"]
+        payload[f"{prefix}_example_{index}_ref"] = example["reference"]
+        payload[f"{prefix}_example_{index}_hyp"] = example["hypothesis"]
+    return payload
+
+
+def _build_checkpoint(
+    model: SqueezeformerCTC,
+    encoder_config: SqueezeformerConfig,
+    tokenizer: Tokenizer,
+    featurizer: AudioFeaturizer,
+    epoch: int,
+    global_step: int,
+    best_val_wer: float,
+    metrics: dict[str, float],
+    optimizers: list[torch.optim.Optimizer],
+    optimizer_names: list[str],
+    schedulers: list[torch.optim.lr_scheduler.LRScheduler],
+    scaler: torch.amp.GradScaler,
+    ema: ExponentialMovingAverage | None,
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    return {
+        "model_state_dict": model.state_dict(),
+        "encoder_config": asdict(encoder_config),
+        "tokenizer": tokenizer.to_dict(),
+        "featurizer_config": featurizer.config_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_wer": best_val_wer,
+        "metrics": metrics,
+        "optimizer_names": optimizer_names,
+        "optimizer_state_dicts": [optimizer.state_dict() for optimizer in optimizers],
+        "scheduler_state_dicts": [scheduler.state_dict() for scheduler in schedulers],
+        "scaler_state_dict": scaler.state_dict(),
+        "ema_state_dict": ema.state_dict() if ema is not None else None,
+        "training_args": vars(args),
     }
 
 
@@ -272,6 +573,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     variant_defaults = _variant_defaults(args.variant)
+    lm_scorer = load_lm_scorer(args.lm_scorer)
 
     dataset_root = download_cv22_dataset(
         repo_id=args.dataset_repo,
@@ -294,8 +596,16 @@ def main() -> None:
         test_fraction=args.test_fraction,
         max_samples=args.max_val_samples,
     )
+    if args.prevalidate_audio:
+        train_records = prevalidate_records(train_records, num_workers=args.prevalidate_workers)
+        val_records = prevalidate_records(val_records, num_workers=args.prevalidate_workers)
+        if not train_records or not val_records:
+            raise RuntimeError("Audio prevalidation removed every sample from train or validation.")
 
-    if args.tokenizer == "sentencepiece":
+    checkpoint = torch.load(args.resume, map_location="cpu") if args.resume else None
+    if checkpoint is not None:
+        tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
+    elif args.tokenizer == "sentencepiece":
         tokenizer = SentencePieceTokenizer.train(
             (record.transcript for record in train_records),
             model_prefix=output_dir / "tokenizer",
@@ -308,45 +618,102 @@ def main() -> None:
     tokenizer_path = output_dir / "tokenizer.json"
     tokenizer.save(tokenizer_path)
 
-    featurizer = AudioFeaturizer()
+    featurizer = AudioFeaturizer(
+        preemphasis=args.preemphasis,
+        normalize_signal=args.normalize_signal,
+        normalize_feature=args.normalize_feature,
+        normalize_per_frame=args.normalize_per_frame,
+    )
+    specaugment = SpecAugment(
+        num_freq_masks=args.num_freq_masks,
+        freq_mask_param=args.freq_mask_param,
+        num_time_masks=args.num_time_masks or variant_defaults.num_time_masks,
+        time_mask_max_ratio=args.time_mask_max_ratio,
+    )
+    train_feature_cache_dir = (
+        Path(args.feature_cache_dir) / "train" if args.feature_cache_dir is not None else None
+    )
+    val_feature_cache_dir = (
+        Path(args.feature_cache_dir) / "validation" if args.feature_cache_dir is not None else None
+    )
     train_dataset = CV22ASRDataset(
         train_records,
         tokenizer=tokenizer,
         featurizer=featurizer,
-        specaugment=SpecAugment(num_time_masks=variant_defaults.num_time_masks),
+        specaugment=specaugment,
+        feature_cache_dir=train_feature_cache_dir,
     )
-    val_dataset = CV22ASRDataset(val_records, tokenizer=tokenizer, featurizer=featurizer)
+    val_dataset = CV22ASRDataset(
+        val_records,
+        tokenizer=tokenizer,
+        featurizer=featurizer,
+        feature_cache_dir=val_feature_cache_dir,
+    )
     train_loader = create_dataloader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        bucket_by_length=args.bucket_by_length,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
     )
     val_loader = create_dataloader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        bucket_by_length=args.bucket_by_length,
+        pin_memory=args.pin_memory,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor,
     )
 
-    encoder_config = squeezeformer_variant(args.variant)
+    encoder_config = (
+        SqueezeformerConfig(**checkpoint["encoder_config"])
+        if checkpoint is not None
+        else squeezeformer_variant(args.variant)
+    )
+    if checkpoint is None:
+        encoder_config = deepcopy(encoder_config)
+        encoder_config.block_pattern = _resolve_block_pattern(args.block_pattern)
+        encoder_config.activation_checkpointing = args.activation_checkpointing
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
     device = torch.device(args.device)
     model.to(device)
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    forward_model = torch.compile(model) if args.compile else model
     use_grad_scaler = device.type == "cuda" and args.dtype == DTypeChoice.FLOAT16
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     peak_lr = args.learning_rate if args.learning_rate is not None else variant_defaults.peak_lr
+    muon_lr = args.muon_learning_rate if args.muon_learning_rate is not None else peak_lr
+    adamw_lr = args.adamw_learning_rate if args.adamw_learning_rate is not None else peak_lr
+    muon_weight_decay = (
+        args.muon_weight_decay if args.muon_weight_decay is not None else args.weight_decay
+    )
+    adamw_weight_decay = (
+        args.adamw_weight_decay if args.adamw_weight_decay is not None else args.weight_decay
+    )
+    optimizer_steps_per_epoch = max(
+        1,
+        (len(train_loader) + args.gradient_accumulation_steps - 1)
+        // args.gradient_accumulation_steps,
+    )
     optimizers, optimizer_names = build_optimizer(
         model=model,
         optimizer_name=args.optimizer,
-        lr=peak_lr,
-        weight_decay=args.weight_decay,
+        muon_lr=muon_lr,
+        adamw_lr=adamw_lr,
+        muon_weight_decay=muon_weight_decay,
+        adamw_weight_decay=adamw_weight_decay,
     )
     schedulers = [
         build_paper_scheduler(
             optimizer,
-            steps_per_epoch=max(1, len(train_loader)),
+            steps_per_epoch=optimizer_steps_per_epoch,
             warmup_epochs=args.warmup_epochs,
             hold_epochs=args.hold_epochs,
             decay_exponent=args.decay_exponent,
@@ -354,6 +721,27 @@ def main() -> None:
         for optimizer in optimizers
     ]
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
+    ema = ExponentialMovingAverage(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    start_epoch = 1
+    global_step = 0
+    best_val_wer = float("inf")
+    if checkpoint is not None:
+        optimizer_states = checkpoint.get("optimizer_state_dicts", [])
+        scheduler_states = checkpoint.get("scheduler_state_dicts", [])
+        if len(optimizer_states) != len(optimizers) or len(scheduler_states) != len(schedulers):
+            raise RuntimeError(
+                "Resume checkpoint optimizer/scheduler layout does not match current setup."
+            )
+        for optimizer, state_dict in zip(optimizers, optimizer_states, strict=True):
+            optimizer.load_state_dict(state_dict)
+        for scheduler, state_dict in zip(schedulers, scheduler_states, strict=True):
+            scheduler.load_state_dict(state_dict)
+        scaler.load_state_dict(checkpoint.get("scaler_state_dict", {}))
+        if ema is not None and checkpoint.get("ema_state_dict") is not None:
+            ema.load_state_dict(checkpoint["ema_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+        best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
 
     trackio.init(
         project=args.trackio_project,
@@ -364,60 +752,102 @@ def main() -> None:
             "train_samples": len(train_records),
             "val_samples": len(val_records),
             "active_optimizers": optimizer_names,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+            "featurizer_config": featurizer.config_dict(),
         },
     )
 
-    best_val_wer = float("inf")
-    for epoch in range(1, args.epochs + 1):
-        model.train()
+    for epoch in range(start_epoch, args.epochs + 1):
+        forward_model.train()
         running_loss = 0.0
-        for step, batch in enumerate(train_loader, start=1):
-            for optimizer in optimizers:
-                optimizer.zero_grad(set_to_none=True)
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        for batch_index, batch in enumerate(train_loader, start=1):
             features = batch["features"].to(device)
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
 
             with _autocast_context(device, args.dtype):
-                log_probs, output_lengths = model.log_probs(features, feature_lengths)
+                log_probs, output_lengths = forward_model.log_probs(features, feature_lengths)
                 loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
-            scaler.scale(loss).backward()
-            for optimizer in optimizers:
-                scaler.step(optimizer)
-            scaler.update()
-
             running_loss += float(loss.item())
-            if step % args.log_every == 0:
-                trackio.log(
-                    {
-                        "epoch": epoch,
-                        "step": step,
-                        "train_loss_step": float(loss.item()),
-                        "learning_rate": optimizers[0].param_groups[0]["lr"],
-                    }
-                )
-            for scheduler in schedulers:
-                scheduler.step()
+            scaler.scale(loss / args.gradient_accumulation_steps).backward()
+
+            should_step = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(
+                train_loader
+            )
+            if should_step:
+                for optimizer in optimizers:
+                    scaler.step(optimizer)
+                scaler.update()
+                for optimizer in optimizers:
+                    optimizer.zero_grad(set_to_none=True)
+                for scheduler in schedulers:
+                    scheduler.step()
+                global_step += 1
+                if ema is not None:
+                    ema.update(model)
+
+                if global_step % args.log_every == 0:
+                    trackio.log(
+                        {
+                            "epoch": epoch,
+                            "global_step": global_step,
+                            "train_loss_step": float(loss.item()),
+                            "learning_rate_muon": optimizers[0].param_groups[0]["lr"],
+                            "learning_rate_aux": optimizers[-1].param_groups[0]["lr"],
+                        }
+                    )
 
         train_loss = running_loss / max(1, len(train_loader))
-        val_metrics = evaluate(model, val_loader, criterion, tokenizer, device, args.dtype)
+        ema_backup = ema.apply_to(model) if ema is not None else None
+        validation = evaluate(
+            model,
+            val_loader,
+            criterion,
+            tokenizer,
+            device,
+            args.dtype,
+            decode_strategy=args.decode_strategy,
+            beam_size=args.beam_size,
+            lm_scorer=lm_scorer,
+            lm_weight=args.lm_weight,
+            example_limit=args.example_limit,
+        )
+        if ema_backup is not None:
+            ExponentialMovingAverage.restore(model, ema_backup)
+        val_metrics = validation["metrics"]
         log_payload = {
             "epoch": epoch,
+            "global_step": global_step,
             "train_loss": train_loss,
             "val_loss": val_metrics["loss"],
             "val_cer": val_metrics["cer"],
             "val_wer": val_metrics["wer"],
         }
+        for key, value in val_metrics.items():
+            if key not in {"loss", "cer", "wer"}:
+                log_payload[f"val_{key}"] = value
+        log_payload.update(_flatten_examples("val", validation["examples"]))
         trackio.log(log_payload)
 
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "encoder_config": asdict(encoder_config),
-            "tokenizer": tokenizer.to_dict(),
-            "epoch": epoch,
-            "metrics": log_payload,
-        }
+        checkpoint = _build_checkpoint(
+            model=model,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            featurizer=featurizer,
+            epoch=epoch,
+            global_step=global_step,
+            best_val_wer=min(best_val_wer, val_metrics["wer"]),
+            metrics=log_payload,
+            optimizers=optimizers,
+            optimizer_names=optimizer_names,
+            schedulers=schedulers,
+            scaler=scaler,
+            ema=ema,
+            args=args,
+        )
         latest_path = output_dir / "checkpoint_last.pt"
         torch.save(checkpoint, latest_path)
         if val_metrics["wer"] < best_val_wer:
@@ -437,6 +867,7 @@ def main() -> None:
                 "best_val_wer": best_val_wer,
                 "variant": args.variant,
                 "keep_top_k": args.keep_top_k,
+                "decode_strategy": args.decode_strategy,
             },
             indent=2,
         ),

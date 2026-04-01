@@ -88,6 +88,26 @@ def test_time_reduction_kernel_matches_paper() -> None:
     assert reduction.kernel_size == 3
 
 
+def test_variant_time_unet_indices_match_reference_layout() -> None:
+    expected = {
+        "xs": ((7,), (15,)),
+        "s": ((8,), (17,)),
+        "sm": ((7,), (15,)),
+        "m": ((9,), (19,)),
+        "ml": ((8,), (17,)),
+        "l": ((10,), (21,)),
+    }
+    for variant, (reduce_idx, recover_idx) in expected.items():
+        config = squeezeformer_variant(variant)
+        assert config.time_reduce_idx == reduce_idx
+        assert config.time_recover_idx == recover_idx
+
+
+def test_default_block_pattern_matches_paper_layout() -> None:
+    config = squeezeformer_variant("sm")
+    assert config.block_pattern == ("M", "s", "C", "s")
+
+
 def test_paper_defaults_use_sentencepiece_compatible_variant_defaults() -> None:
     assert _variant_defaults("sm").peak_lr == 2e-3
     assert _variant_defaults("sm").num_time_masks == 5
@@ -137,12 +157,14 @@ def test_muon_optimizer_partition_uses_encoder_hidden_weights() -> None:
     optimizers, optimizer_names = build_optimizer(
         model=model,
         optimizer_name=OptimizerChoice.MUON,
-        lr=1e-3,
-        weight_decay=1e-4,
+        muon_lr=1e-3,
+        adamw_lr=5e-4,
+        muon_weight_decay=1e-4,
+        adamw_weight_decay=5e-5,
     )
     assert optimizer_names == ["muon", "adamw_aux"]
     muon_params = optimizers[0].param_groups[0]["params"]
-    adamw_params = optimizers[1].param_groups[0]["params"]
+    adamw_params = optimizers[1].param_groups[0]["params"] + optimizers[1].param_groups[1]["params"]
     assert muon_params
     assert adamw_params
     assert all(parameter.ndim == 2 for parameter in muon_params)

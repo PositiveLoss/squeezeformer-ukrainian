@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 
 def _subsample_length(
@@ -302,21 +303,36 @@ class SqueezeformerBlock(nn.Module):
         ff_expansion_factor: int,
         conv_expansion_factor: int,
         dropout: float,
+        block_pattern: tuple[str, ...],
     ) -> None:
         super().__init__()
-        self.mhsa_ff = MHSAFFModule(
-            dim=dim,
-            num_heads=num_heads,
-            ff_expansion_factor=ff_expansion_factor,
-            dropout=dropout,
-        )
-        self.conv_ff = ConvFFModule(
-            dim=dim,
-            kernel_size=kernel_size,
-            conv_expansion_factor=conv_expansion_factor,
-            ff_expansion_factor=ff_expansion_factor,
-            dropout=dropout,
-        )
+        self.block_pattern = block_pattern
+        layers: list[nn.Module] = []
+        for token in block_pattern:
+            if token == "M":
+                layers.append(
+                    MHSAFFModule(
+                        dim=dim,
+                        num_heads=num_heads,
+                        ff_expansion_factor=ff_expansion_factor,
+                        dropout=dropout,
+                    )
+                )
+            elif token == "C":
+                layers.append(
+                    ConvFFModule(
+                        dim=dim,
+                        kernel_size=kernel_size,
+                        conv_expansion_factor=conv_expansion_factor,
+                        ff_expansion_factor=ff_expansion_factor,
+                        dropout=dropout,
+                    )
+                )
+            elif token == "s":
+                layers.append(nn.Identity())
+            else:
+                raise ValueError(f"Unsupported block token: {token}")
+        self.layers = nn.ModuleList(layers)
 
     def forward(
         self,
@@ -325,8 +341,12 @@ class SqueezeformerBlock(nn.Module):
         attn_mask: Tensor | None,
         pad_mask: Tensor | None,
     ) -> Tensor:
-        x = self.mhsa_ff(x, pos=pos, attn_mask=attn_mask)
-        return self.conv_ff(x, pad_mask=pad_mask)
+        for token, layer in zip(self.block_pattern, self.layers, strict=True):
+            if token == "M":
+                x = layer(x, pos=pos, attn_mask=attn_mask)
+            elif token == "C":
+                x = layer(x, pad_mask=pad_mask)
+        return x
 
 
 class Conv2dSubsampling(nn.Module):
@@ -409,6 +429,9 @@ class SqueezeformerConfig:
     conv_expansion_factor: int = 2
     dropout: float = 0.1
     depthwise_subsampling: bool = True
+    block_pattern: tuple[str, ...] = ("M", "s", "C", "s")
+    time_reduction_kernel_size: int = 3
+    activation_checkpointing: bool = False
     time_reduce_idx: tuple[int, ...] = (7,)
     time_recover_idx: tuple[int, ...] = (15,)
 
@@ -487,7 +510,13 @@ class SqueezeformerEncoder(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.positional_encoding = RelativePositionalEncoding(config.d_model)
         self.time_reduce = nn.ModuleDict(
-            {str(i): TimeReductionLayer(config.d_model) for i in config.time_reduce_idx}
+            {
+                str(i): TimeReductionLayer(
+                    config.d_model,
+                    kernel_size=config.time_reduction_kernel_size,
+                )
+                for i in config.time_reduce_idx
+            }
         )
         self.time_recover = nn.ModuleDict(
             {str(i): TimeRecoveryLayer(config.d_model) for i in config.time_recover_idx}
@@ -501,6 +530,7 @@ class SqueezeformerEncoder(nn.Module):
                     ff_expansion_factor=config.ff_expansion_factor,
                     conv_expansion_factor=config.conv_expansion_factor,
                     dropout=config.dropout,
+                    block_pattern=config.block_pattern,
                 )
                 for _ in range(config.num_layers)
             ]
@@ -537,7 +567,17 @@ class SqueezeformerEncoder(nn.Module):
             pos = self.positional_encoding(x)
             attn_mask = _make_attn_mask(lengths, max_length=x.size(1))
             pad_mask = _make_pad_mask(lengths, max_length=x.size(1))
-            x = block(x, pos=pos, attn_mask=attn_mask, pad_mask=pad_mask)
+            if self.config.activation_checkpointing and self.training:
+                x = activation_checkpoint(
+                    lambda a, b, c, d: block(a, pos=b, attn_mask=c, pad_mask=d),
+                    x,
+                    pos,
+                    attn_mask,
+                    pad_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, pos=pos, attn_mask=attn_mask, pad_mask=pad_mask)
 
         return x, lengths
 

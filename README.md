@@ -1,26 +1,27 @@
 # Squeezeformer PyTorch
 
-This repository contains a standalone PyTorch implementation of the Squeezeformer encoder described in the paper source under [arXiv-2206.00888v2](/workspace/arXiv-2206.00888v2), plus minimal CTC training and evaluation scripts for the gated Hugging Face dataset `speech-uk/cv22`.
+This repository contains a standalone PyTorch implementation of the Squeezeformer encoder from [arXiv-2206.00888v2](/workspace/arXiv-2206.00888v2), plus CTC training and evaluation scripts for the gated Hugging Face dataset `speech-uk/cv22`.
 
-## What Is In The Repo
+## What Is Here
 
-- [model.py](/workspace/squeezeformer_pytorch/model.py): Squeezeformer encoder
-- [asr.py](/workspace/squeezeformer_pytorch/asr.py): CTC wrapper and tokenizer implementations
-- [data.py](/workspace/squeezeformer_pytorch/data.py): dataset download, Polars manifest loading, audio featurization, batching
+- [model.py](/workspace/squeezeformer_pytorch/model.py): encoder architecture and published size variants
+- [asr.py](/workspace/squeezeformer_pytorch/asr.py): CTC wrapper, tokenizer implementations, beam search, LM scorer hook
+- [data.py](/workspace/squeezeformer_pytorch/data.py): dataset download, Polars manifest loading, transcript normalization, featurization, caching, bucketing
 - [metrics.py](/workspace/squeezeformer_pytorch/metrics.py): CER and WER through `jiwer`
 - [train.py](/workspace/train.py): training entrypoint
 - [evaluate.py](/workspace/evaluate.py): evaluation entrypoint
-- [tests](/workspace/tests): basic model and tokenizer checks
+- [tests](/workspace/tests): architecture and training utility checks
 
-## Implemented Architecture
+## Architecture Fidelity
 
-The encoder follows the paper’s main architectural changes:
+The encoder implements the paper’s main Squeezeformer changes:
 
 - depthwise-separable 4x acoustic subsampling
-- MF/CF block layout
+- explicit MF/CF block pattern, default `M,s,C,s`
 - scaled post-LN residual modules
 - relative-position attention
-- Temporal U-Net style time reduction and recovery
+- Temporal U-Net time reduction and recovery
+- paper-aligned reduction kernel size `3`
 - published size variants: `xs`, `s`, `sm`, `m`, `ml`, `l`
 
 Published variant table used in code:
@@ -32,39 +33,23 @@ Published variant table used in code:
 - `ml`: 18 layers, 512 dim, 8 heads
 - `l`: 22 layers, 640 dim, 8 heads
 
-This is still not a full paper reproduction, but the current code now aligns with several paper-critical defaults:
-
-- greedy CTC decoding
-- SentencePiece or character tokenization
-- SentencePiece-128 as the default tokenizer configuration
-- Muon as the default optimizer path
-- paper-style warmup, hold, and inverse-power decay scheduler
-- variant-aware SpecAugment defaults
-
 ## Environment Setup
 
-The workflow uses a local `uv` environment.
-
-Create the environment:
+The repository is designed to run in a local `uv` environment.
 
 ```bash
 uv venv .venv
-```
-
-Install dependencies:
-
-```bash
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 uv pip install polars jiwer sentencepiece huggingface_hub trackio pytest ruff
 ```
 
 ## Dataset Access
 
-The scripts use `speech-uk/cv22` from Hugging Face:
+The scripts use `speech-uk/cv22`:
 
 - dataset page: `https://huggingface.co/datasets/speech-uk/cv22`
 - the dataset is gated
-- you must accept the access conditions on Hugging Face before the scripts can download it
+- you must accept the dataset terms on Hugging Face before download works
 
 Set a token before training or evaluation:
 
@@ -74,132 +59,94 @@ export HF_TOKEN=your_huggingface_token
 
 The loader downloads the dataset snapshot with `huggingface_hub.snapshot_download()` and reads TSV or Parquet manifests with `polars`.
 
-Important: the dataset itself exposes only a train split. This repo creates deterministic internal `train`, `validation`, and `test` splits by hashing each utterance id with the provided seed and split fractions.
+Important: the dataset itself exposes only a source train split. This repo creates deterministic internal `train`, `validation`, and `test` splits by hashing `speaker_id` or `client_id` with the provided seed and split fractions, so the default split is speaker-aware rather than record-only.
 
 Default split behavior:
 
 - `--val-fraction 0.1`
 - `--test-fraction 0.1`
 
-So the effective split is:
-
-- 80% train
-- 10% validation
-- 10% test
-
-This is record-based splitting, not speaker-aware splitting.
+That yields an effective `80 / 10 / 10` train/validation/test split.
 
 ## Tokenization
 
-Two tokenizer modes are supported:
+Supported tokenizer modes:
 
-- `character`
 - `sentencepiece`
+- `character`
 
-Character mode builds a vocabulary directly from the training transcripts.
-
-SentencePiece mode trains a tokenizer during `train.py` and stores:
-
-- `tokenizer.json`
-- `tokenizer.model`
-
-Evaluation reloads the tokenizer from checkpoint metadata, so you do not need to pass the tokenizer type again.
-
-## Quick Start
-
-Character tokenizer:
-
-```bash
-HF_TOKEN=... uv run python train.py \
-  --variant sm \
-  --tokenizer character \
-  --device cpu \
-  --output-dir artifacts/cv22-sm-char \
-  --batch-size 8 \
-  --epochs 10
-```
-
-SentencePiece tokenizer:
-
-```bash
-HF_TOKEN=... uv run python train.py \
-  --variant sm \
-  --optimizer muon \
-  --tokenizer sentencepiece \
-  --spm-vocab-size 128 \
-  --spm-model-type unigram \
-  --device cpu \
-  --dtype bfloat16 \
-  --output-dir artifacts/cv22-sm-spm \
-  --batch-size 8 \
-  --epochs 10
-```
-
-Evaluate:
-
-```bash
-HF_TOKEN=... uv run python evaluate.py \
-  --checkpoint artifacts/cv22-sm-spm/checkpoint_best.pt \
-  --split test \
-  --device cpu \
-  --dtype bfloat16
-```
-
-## Training Script
-
-[train.py](/workspace/train.py) does the following:
-
-1. downloads the dataset snapshot
-2. loads manifests with Polars
-3. creates deterministic train/validation splits from the single source split
-4. builds either a character tokenizer or a SentencePiece tokenizer from training transcripts
-5. extracts 80-bin log-mel features with `torchaudio`
-6. applies SpecAugment during training
-7. trains a Squeezeformer encoder plus CTC head with the paper-style scheduler
-7. logs metrics to `trackio`
-8. saves checkpoints and tokenizer artifacts
-
-Common arguments:
-
-- `--dataset-repo`
-- `--hf-token`
-- `--cache-dir`
-- `--variant`
-- `--output-dir`
-- `--batch-size`
-- `--epochs`
-- `--learning-rate`
-- `--weight-decay`
-- `--optimizer`
-- `--num-workers`
-- `--seed`
-- `--warmup-epochs`
-- `--hold-epochs`
-- `--decay-exponent`
-- `--val-fraction`
-- `--test-fraction`
-- `--max-train-samples`
-- `--max-val-samples`
-- `--device`
-- `--dtype`
-- `--trackio-project`
-- `--trackio-space-id`
-- `--log-every`
-- `--keep-top-k`
-- `--tokenizer`
-- `--spm-vocab-size`
-- `--spm-model-type`
-
-Important defaults:
+Default training behavior:
 
 - `--tokenizer sentencepiece`
 - `--spm-vocab-size 128`
 - `--spm-model-type unigram`
+
+SentencePiece runs write both:
+
+- `tokenizer.json`
+- `tokenizer.model`
+
+Evaluation reloads the tokenizer from checkpoint metadata, so you do not need to specify tokenizer settings again.
+
+## Audio Frontend
+
+The frontend is now configurable and closer to the paper’s recipe:
+
+- 80-bin log-mel features
+- pre-emphasis, default `0.97`
+- waveform normalization, enabled by default
+- feature normalization, enabled by default
+- configurable per-frame normalization if you want it
+- configurable SpecAugment frequency and time masking
+
+Relevant training flags:
+
+- `--preemphasis`
+- `--normalize-signal/--no-normalize-signal`
+- `--normalize-feature/--no-normalize-feature`
+- `--normalize-per-frame/--no-normalize-per-frame`
+- `--num-freq-masks`
+- `--freq-mask-param`
+- `--num-time-masks`
+- `--time-mask-max-ratio`
+
+## Training Features
+
+[train.py](/workspace/train.py) now includes:
+
+- SentencePiece-128 by default
+- Muon by default, with AdamW on auxiliary parameter groups
+- separate Muon vs AdamW LR and weight-decay controls
+- no-decay filtering for biases, norms, and scale parameters
+- paper-style warmup, hold, and inverse-power decay scheduling
+- gradient accumulation
+- EMA checkpoints and EMA-based validation
+- optional `torch.compile`
+- optional activation checkpointing inside encoder blocks
+- feature caching on disk
+- length bucketing
+- dataloader tuning knobs for `pin_memory`, `persistent_workers`, and `prefetch_factor`
+- optional audio prevalidation before training
+- top-k checkpoint retention
+- checkpoint resume with optimizer, scheduler, scaler, EMA, and global step state
+- greedy or beam-search validation decoding
+- LM scorer hook for beam search
+- per-epoch decoded examples in `trackio`
+- WER/CER metrics broken out by utterance-length bucket
+
+Important defaults:
+
 - `--optimizer muon`
 - `--dtype bfloat16`
+- `--tokenizer sentencepiece`
+- `--spm-vocab-size 128`
 - `--warmup-epochs 20`
 - `--hold-epochs 160`
 - `--decay-exponent 1.0`
+- `--bucket-by-length`
+- `--pin-memory`
+- `--persistent-workers`
+- `--ema-decay 0.999`
 
 Variant-aware defaults derived from the paper:
 
@@ -207,65 +154,138 @@ Variant-aware defaults derived from the paper:
 - `m`: peak LR `1.5e-3`, time masks `7`
 - `ml`, `l`: peak LR `1e-3`, time masks `10`
 
-Optimizer behavior:
+## Quick Start
 
-- default path is `muon`
-- Muon is applied to encoder hidden 2D weights
-- AdamW is still used for remaining parameters such as convolution kernels, biases, norms, and the CTC classifier head
-- use `--optimizer adamw` to revert to a single AdamW optimizer
-
-Files written by training:
-
-- `checkpoint_last.pt`
-- `checkpoint_best.pt`
-- `checkpoints_topk/` containing the best `--keep-top-k` checkpoints by validation WER
-- `tokenizer.json`
-- `tokenizer.model` when `--tokenizer sentencepiece`
-- `train_summary.json`
-
-Smoke-test example:
+Minimal CPU smoke test:
 
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant xs \
   --device cpu \
+  --dtype bfloat16 \
   --output-dir artifacts/smoke \
   --epochs 1 \
   --max-train-samples 64 \
   --max-val-samples 16
 ```
 
-## Evaluation Script
+More complete run with caching, bucketing, and beam-search validation:
 
-[evaluate.py](/workspace/evaluate.py) loads a checkpoint and computes:
+```bash
+HF_TOKEN=... uv run python train.py \
+  --variant sm \
+  --optimizer muon \
+  --tokenizer sentencepiece \
+  --spm-vocab-size 128 \
+  --device cpu \
+  --dtype bfloat16 \
+  --gradient-accumulation-steps 4 \
+  --feature-cache-dir artifacts/feature_cache \
+  --decode-strategy beam \
+  --beam-size 8 \
+  --output-dir artifacts/cv22-sm \
+  --batch-size 8 \
+  --epochs 10
+```
+
+Resume training:
+
+```bash
+HF_TOKEN=... uv run python train.py \
+  --resume artifacts/cv22-sm/checkpoint_last.pt \
+  --output-dir artifacts/cv22-sm
+```
+
+Evaluate:
+
+```bash
+HF_TOKEN=... uv run python evaluate.py \
+  --checkpoint artifacts/cv22-sm/checkpoint_best.pt \
+  --split test \
+  --device cpu \
+  --dtype bfloat16 \
+  --decode-strategy beam \
+  --beam-size 8
+```
+
+## Optimizer Behavior
+
+The default optimizer path is mixed:
+
+- Muon is applied to encoder 2D hidden weights
+- AdamW is applied to the remaining parameters
+- AdamW splits decay and no-decay parameter groups
+
+Useful knobs:
+
+- `--optimizer muon|adamw`
+- `--learning-rate`
+- `--muon-learning-rate`
+- `--adamw-learning-rate`
+- `--weight-decay`
+- `--muon-weight-decay`
+- `--adamw-weight-decay`
+
+If the Muon path is not what you want, use `--optimizer adamw`.
+
+## Decoding And LM Hook
+
+Both training-time validation and `evaluate.py` support:
+
+- `--decode-strategy greedy|beam`
+- `--beam-size`
+- `--lm-scorer`
+- `--lm-weight`
+
+`--lm-scorer` expects a Python callable in `module:function` form that takes a decoded prefix string and returns a scalar score. Example:
+
+```bash
+uv run python evaluate.py \
+  --checkpoint artifacts/cv22-sm/checkpoint_best.pt \
+  --decode-strategy beam \
+  --lm-scorer my_lm:score_text \
+  --lm-weight 0.2
+```
+
+This is intentionally a hook, not a bundled language model implementation.
+
+## Checkpoints
+
+Training writes:
+
+- `checkpoint_last.pt`
+- `checkpoint_best.pt`
+- `checkpoints_topk/` with the best `--keep-top-k` checkpoints by validation WER
+- `checkpoints_topk/metadata.json`
+- `tokenizer.json`
+- `tokenizer.model` for SentencePiece runs
+- `train_summary.json`
+
+Resume loads:
+
+- model weights
+- optimizer state
+- scheduler state
+- grad scaler state
+- EMA state
+- epoch
+- global step
+- best validation WER
+
+## Evaluation Outputs
+
+[evaluate.py](/workspace/evaluate.py) prints and logs:
 
 - loss
 - CER
 - WER
-
-It also logs the result to `trackio`.
-
-Common arguments:
-
-- `--checkpoint`
-- `--dataset-repo`
-- `--hf-token`
-- `--cache-dir`
-- `--split`
-- `--batch-size`
-- `--num-workers`
-- `--seed`
-- `--val-fraction`
-- `--test-fraction`
-- `--max-samples`
-- `--device`
-- `--dtype`
-- `--trackio-project`
-- `--trackio-space-id`
+- per-bucket CER/WER for `short`, `medium`, and `long` utterances
+- sample count
+- decoded example pairs
 
 ## Trackio
 
-Training and evaluation use `trackio` for metric logging.
+Training and evaluation log metrics to `trackio`.
 
 Local dashboard:
 
@@ -277,26 +297,6 @@ To sync logs to a Hugging Face Space, pass:
 
 - `--trackio-space-id username/space-name`
 
-## Project Layout
-
-```text
-/workspace
-├── README.md
-├── pyproject.toml
-├── train.py
-├── evaluate.py
-├── squeezeformer_pytorch
-│   ├── __init__.py
-│   ├── model.py
-│   ├── asr.py
-│   ├── data.py
-│   └── metrics.py
-├── tests
-│   ├── conftest.py
-│   └── test_squeezeformer.py
-└── arXiv-2206.00888v2
-```
-
 ## Validation
 
 Current local checks:
@@ -307,13 +307,12 @@ uv run pytest -q
 uv run python -c "import train, evaluate; print('imports_ok')"
 ```
 
-## Known Limits
+## Current Limits
 
-- This is still not the original large-scale TPU training environment from the paper.
-- Decoding is greedy CTC only.
-- The dataset loader is written for Common Voice-style manifests and should still be treated as a practical integration, not a benchmark-grade data pipeline.
-- Splitting is record-based rather than speaker-aware.
-- There is no beam search, language model fusion, mixed precision training, resume logic, or distributed training support.
+- This is still not the original large-scale paper training environment.
+- The LM interface is only a scorer hook; there is no bundled external LM package or fusion recipe.
+- There is no distributed training support.
+- The dataset integration is practical and tested structurally, but the first full gated run is still the final contract check against the live dataset contents.
 
 ## Sources
 
