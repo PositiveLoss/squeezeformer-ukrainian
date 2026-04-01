@@ -300,6 +300,10 @@ depend on hardware or runtime pressure:
 - `--prefetch-factor`
 - `--beam-size` for CPU beam-search runs
 
+`hparam_tuner.py` also accepts `--device xla` for TPU-oriented estimates. That path uses
+conservative TPU heuristics instead of live HBM probing, so treat the output as a starting
+point and adjust `--max-batch-frames` or accumulation if your runtime still OOMs.
+
 Example CPU estimate for the command below:
 
 ```bash
