@@ -29,8 +29,9 @@ class CV22Record:
     audio_bytes: bytes | None
     transcript: str
     utterance_id: str
-    speaker_id: str
     estimated_frames: int
+    speaker_id: str | None = None
+    has_speaker_id: bool = False
     num_samples: int = 0
     sample_rate: int = 0
 
@@ -401,7 +402,8 @@ def load_cv22_records(
         ):
             continue
         utterance_id = str(row.get("id") or audio_path or len(records))
-        speaker_id = str(row.get("client_id") or row.get("speaker_id") or utterance_id)
+        raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
+        speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
         duration_seconds = (
             row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
         )
@@ -416,6 +418,7 @@ def load_cv22_records(
                 transcript=transcript,
                 utterance_id=utterance_id,
                 speaker_id=speaker_id,
+                has_speaker_id=speaker_id is not None,
                 estimated_frames=estimated_frames,
             )
         )
@@ -425,7 +428,8 @@ def load_cv22_records(
 
     selected: list[CV22Record] = []
     for record in records:
-        score = _hash_to_unit_interval(record.speaker_id, seed=seed)
+        split_key = record.speaker_id or record.utterance_id
+        score = _hash_to_unit_interval(split_key, seed=seed)
         train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
         if split == "train" and score < train_cutoff:
             selected.append(record)
@@ -525,6 +529,8 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
             "target_length": target_ids.numel(),
             "transcript": record.transcript,
             "utterance_id": record.utterance_id,
+            "speaker_id": record.speaker_id,
+            "has_speaker_id": record.has_speaker_id,
         }
 
 
@@ -720,6 +726,8 @@ def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
     targets = []
     transcripts = []
     utterance_ids = []
+    speaker_ids = []
+    has_speaker_ids = []
     for item in batch:
         feature = item["features"]
         if feature.size(0) < max_feature_length:
@@ -728,6 +736,8 @@ def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         targets.append(item["targets"])
         transcripts.append(item["transcript"])
         utterance_ids.append(item["utterance_id"])
+        speaker_ids.append(item["speaker_id"])
+        has_speaker_ids.append(item["has_speaker_id"])
 
     return {
         "features": torch.stack(padded_features, dim=0),
@@ -736,6 +746,8 @@ def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "target_lengths": target_lengths,
         "transcripts": transcripts,
         "utterance_ids": utterance_ids,
+        "speaker_ids": speaker_ids,
+        "has_speaker_ids": has_speaker_ids,
     }
 
 

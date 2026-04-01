@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -11,8 +12,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
+import torch.distributed as dist
 import trackio
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from squeezeformer_pytorch.asr import (
     CharacterTokenizer,
@@ -285,12 +288,93 @@ def _update_top_checkpoints(
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
+def _average_topk_checkpoints(output_dir: Path) -> Path | None:
+    metadata_path = output_dir / "checkpoints_topk" / "metadata.json"
+    if not metadata_path.exists():
+        return None
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not metadata:
+        return None
+
+    averaged_state: dict[str, Tensor] | None = None
+    template_checkpoint: dict[str, object] | None = None
+    for item in metadata:
+        checkpoint_path = output_dir / "checkpoints_topk" / str(item["path"])
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint["model_state_dict"]
+        if averaged_state is None:
+            averaged_state = {
+                key: value.detach().clone().to(dtype=torch.float32)
+                for key, value in state_dict.items()
+            }
+            template_checkpoint = checkpoint
+        else:
+            for key, value in state_dict.items():
+                averaged_state[key].add_(value.detach().to(dtype=torch.float32))
+
+    assert averaged_state is not None
+    assert template_checkpoint is not None
+    factor = 1.0 / len(metadata)
+    model_state_dict = {}
+    for key, value in template_checkpoint["model_state_dict"].items():
+        averaged = averaged_state[key] * factor
+        model_state_dict[key] = averaged.to(dtype=value.dtype)
+    averaged_checkpoint = dict(template_checkpoint)
+    averaged_checkpoint["model_state_dict"] = model_state_dict
+    averaged_checkpoint["averaged_from"] = metadata
+    averaged_path = output_dir / "checkpoint_topk_avg.pt"
+    torch.save(averaged_checkpoint, averaged_path)
+    return averaged_path
+
+
+def _build_split_audit(split_records: dict[str, list]) -> dict[str, object]:
+    speaker_sets = {
+        split_name: {
+            record.speaker_id
+            for record in records
+            if record.has_speaker_id and record.speaker_id
+        }
+        for split_name, records in split_records.items()
+    }
+    counts = {
+        split_name: {
+            "samples": len(records),
+            "speakers": len(speaker_sets[split_name]),
+            "records_with_speaker_id": sum(int(record.has_speaker_id) for record in records),
+        }
+        for split_name, records in split_records.items()
+    }
+    overlaps = {}
+    split_names = list(split_records)
+    for index, split_name in enumerate(split_names):
+        for other_name in split_names[index + 1 :]:
+            key = f"{split_name}_vs_{other_name}"
+            overlaps[key] = len(speaker_sets[split_name] & speaker_sets[other_name])
+    speaker_counts = [item["speakers"] for item in counts.values() if item["speakers"] > 0]
+    balance_ratio = (
+        max(speaker_counts) / max(1, min(speaker_counts)) if len(speaker_counts) >= 2 else 1.0
+    )
+    return {
+        "counts": counts,
+        "speaker_overlaps": overlaps,
+        "speaker_balance_ratio": balance_ratio,
+        "speaker_id_available": all(
+            item["records_with_speaker_id"] == item["samples"] for item in counts.values()
+        ),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Squeezeformer CTC on speech-uk/cv22.")
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--resume", default=None)
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--variant", default="sm", choices=["xs", "s", "sm", "m", "ml", "l"])
     parser.add_argument("--output-dir", default="artifacts/squeezeformer-cv22")
     parser.add_argument("--batch-size", type=int, default=8)
@@ -502,22 +586,76 @@ def length_bucket_metrics(
 
 def collect_examples(
     utterance_ids: list[str],
+    speaker_ids: list[str | None],
     references: list[str],
     hypotheses: list[str],
     limit: int,
-) -> list[dict[str, str]]:
-    examples = []
-    pairs = list(zip(utterance_ids, references, hypotheses, strict=True))
-    pairs.sort(key=lambda item: (item[1] == item[2], abs(len(item[1]) - len(item[2]))))
-    for utterance_id, reference, hypothesis in pairs[:limit]:
-        examples.append(
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    hardest_examples = []
+    random_examples = []
+    pairs = list(zip(utterance_ids, speaker_ids, references, hypotheses, strict=True))
+    ranked_pairs = sorted(
+        pairs,
+        key=lambda item: (item[2] == item[3], abs(len(item[2]) - len(item[3]))),
+    )
+    for utterance_id, speaker_id, reference, hypothesis in ranked_pairs[:limit]:
+        hardest_examples.append(
             {
                 "utterance_id": utterance_id,
+                "speaker_id": speaker_id or "",
                 "reference": reference,
                 "hypothesis": hypothesis,
             }
         )
-    return examples
+    shuffled_pairs = list(pairs)
+    random.Random(13).shuffle(shuffled_pairs)
+    for utterance_id, speaker_id, reference, hypothesis in shuffled_pairs[:limit]:
+        random_examples.append(
+            {
+                "utterance_id": utterance_id,
+                "speaker_id": speaker_id or "",
+                "reference": reference,
+                "hypothesis": hypothesis,
+            }
+        )
+    return hardest_examples, random_examples
+
+
+def speaker_level_metrics(
+    speaker_ids: list[str | None],
+    has_speaker_ids: list[bool],
+    references: list[str],
+    hypotheses: list[str],
+) -> dict[str, object]:
+    grouped_refs: dict[str, list[str]] = defaultdict(list)
+    grouped_hyps: dict[str, list[str]] = defaultdict(list)
+    missing_count = 0
+    for speaker_id, has_speaker_id, reference, hypothesis in zip(
+        speaker_ids, has_speaker_ids, references, hypotheses, strict=True
+    ):
+        if not has_speaker_id or not speaker_id:
+            missing_count += 1
+            continue
+        grouped_refs[speaker_id].append(reference)
+        grouped_hyps[speaker_id].append(hypothesis)
+    per_speaker = {
+        speaker_id: {
+            "samples": len(grouped_refs[speaker_id]),
+            "wer": word_error_rate(grouped_refs[speaker_id], grouped_hyps[speaker_id]),
+            "cer": char_error_rate(grouped_refs[speaker_id], grouped_hyps[speaker_id]),
+        }
+        for speaker_id in grouped_refs
+    }
+    macro_wer = (
+        sum(item["wer"] for item in per_speaker.values()) / len(per_speaker) if per_speaker else 0.0
+    )
+    return {
+        "speaker_count": len(per_speaker),
+        "speaker_macro_wer": macro_wer,
+        "speaker_id_available": missing_count == 0,
+        "missing_speaker_id_samples": missing_count,
+        "per_speaker": per_speaker,
+    }
 
 
 def evaluate(
@@ -539,6 +677,8 @@ def evaluate(
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
+    speaker_ids: list[str | None] = []
+    has_speaker_ids: list[bool] = []
     with torch.no_grad():
         for batch in dataloader:
             features = batch["features"].to(device)
@@ -553,6 +693,8 @@ def evaluate(
             total_batches += 1
             references.extend(batch["transcripts"])
             utterance_ids.extend(batch["utterance_ids"])
+            speaker_ids.extend(batch["speaker_ids"])
+            has_speaker_ids.extend(batch["has_speaker_ids"])
             hypotheses.extend(
                 decode_batch(
                     log_probs,
@@ -570,9 +712,23 @@ def evaluate(
         "wer": word_error_rate(references, hypotheses),
     }
     metrics.update(length_bucket_metrics(references, hypotheses))
+    speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
+    metrics["speaker_count"] = float(speaker_metrics["speaker_count"])
+    metrics["speaker_macro_wer"] = float(speaker_metrics["speaker_macro_wer"])
+    metrics["speaker_id_available"] = float(speaker_metrics["speaker_id_available"])
+    metrics["missing_speaker_id_samples"] = float(speaker_metrics["missing_speaker_id_samples"])
+    hardest_examples, random_examples = collect_examples(
+        utterance_ids,
+        speaker_ids,
+        references,
+        hypotheses,
+        limit=example_limit,
+    )
     return {
         "metrics": metrics,
-        "examples": collect_examples(utterance_ids, references, hypotheses, limit=example_limit),
+        "hardest_examples": hardest_examples,
+        "random_examples": random_examples,
+        "speaker_metrics": speaker_metrics,
     }
 
 
@@ -628,6 +784,7 @@ def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, 
     payload: dict[str, str] = {}
     for index, example in enumerate(examples):
         payload[f"{prefix}_example_{index}_id"] = example["utterance_id"]
+        payload[f"{prefix}_example_{index}_speaker"] = example["speaker_id"]
         payload[f"{prefix}_example_{index}_ref"] = example["reference"]
         payload[f"{prefix}_example_{index}_hyp"] = example["hypothesis"]
     return payload
@@ -673,9 +830,23 @@ def main() -> None:
         raise ValueError(
             "--adaptive-batch-unit and --adaptive-batch-budget must be set together."
         )
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    if args.distributed and not distributed:
+        raise ValueError("--distributed expects a torchrun-style environment with WORLD_SIZE > 1.")
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_main_process = rank == 0
+    if distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend)
+    if distributed and args.compile:
+        raise ValueError("--compile is not currently supported together with distributed training.")
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
     variant_defaults = _variant_defaults(args.variant)
     lm_scorer = load_lm_scorer(args.lm_scorer)
 
@@ -711,6 +882,12 @@ def main() -> None:
         val_records = prevalidate_records(val_records, num_workers=args.prevalidate_workers)
         if not train_records or not val_records:
             raise RuntimeError("Audio prevalidation removed every sample from train or validation.")
+    split_audit = _build_split_audit({"train": train_records, "validation": val_records})
+    if is_main_process:
+        (output_dir / "split_audit.json").write_text(
+            json.dumps(split_audit, indent=2),
+            encoding="utf-8",
+        )
 
     checkpoint = torch.load(args.resume, map_location="cpu") if args.resume else None
     if checkpoint is not None:
@@ -765,8 +942,13 @@ def main() -> None:
     val_feature_cache_dir = (
         Path(args.feature_cache_dir) / "validation" if args.feature_cache_dir is not None else None
     )
+    local_train_records = (
+        [record for index, record in enumerate(train_records) if index % world_size == rank]
+        if distributed
+        else train_records
+    )
     train_dataset = CV22ASRDataset(
-        train_records,
+        local_train_records,
         tokenizer=tokenizer,
         featurizer=featurizer,
         specaugment=specaugment,
@@ -820,11 +1002,20 @@ def main() -> None:
             activation_checkpointing=args.activation_checkpointing,
         )
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
-    device = torch.device(args.device)
+    if distributed and torch.cuda.is_available():
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(args.device)
     model.to(device)
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state_dict"])
-    forward_model = torch.compile(model) if args.compile else model
+    if distributed:
+        forward_model: nn.Module = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+        )
+    else:
+        forward_model = torch.compile(model) if args.compile else model
     use_grad_scaler = device.type == "cuda" and args.dtype == DTypeChoice.FLOAT16
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
@@ -890,19 +1081,23 @@ def main() -> None:
         global_step = int(checkpoint.get("global_step", 0))
         best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
 
-    trackio.init(
-        project=args.trackio_project,
-        space_id=args.trackio_space_id,
-        config={
-            **vars(args),
-            "encoder_config": asdict(encoder_config),
-            "train_samples": len(train_records),
-            "val_samples": len(val_records),
-            "active_optimizers": optimizer_names,
-            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
-            "featurizer_config": featurizer.config_dict(),
-        },
-    )
+    if is_main_process:
+        trackio.init(
+            project=args.trackio_project,
+            space_id=args.trackio_space_id,
+            config={
+                **vars(args),
+                "encoder_config": asdict(encoder_config),
+                "train_samples": len(train_records),
+                "val_samples": len(val_records),
+                "active_optimizers": optimizer_names,
+                "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                "featurizer_config": featurizer.config_dict(),
+                "split_audit": split_audit,
+                "distributed": distributed,
+                "world_size": world_size,
+            },
+        )
 
     for epoch in range(start_epoch, args.epochs + 1):
         forward_model.train()
@@ -944,7 +1139,7 @@ def main() -> None:
                 if ema is not None:
                     ema.update(model)
 
-                if global_step % args.log_every == 0:
+                if is_main_process and global_step % args.log_every == 0:
                     learning_rates = {
                         f"learning_rate_{name}": optimizer.param_groups[0]["lr"]
                         for name, optimizer in zip(optimizer_names, optimizers, strict=True)
@@ -961,79 +1156,106 @@ def main() -> None:
                     )
 
         train_loss = running_loss / max(1, len(train_loader))
-        ema_backup = ema.apply_to(model) if ema is not None else None
-        validation = evaluate(
-            model,
-            val_loader,
-            criterion,
-            tokenizer,
-            device,
-            args.dtype,
-            decode_strategy=args.decode_strategy,
-            beam_size=args.beam_size,
-            lm_scorer=lm_scorer,
-            lm_weight=args.lm_weight,
-            example_limit=args.example_limit,
-        )
-        if ema_backup is not None:
-            ExponentialMovingAverage.restore(model, ema_backup)
-        val_metrics = validation["metrics"]
-        log_payload = {
-            "epoch": epoch,
-            "global_step": global_step,
-            "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
-            "val_cer": val_metrics["cer"],
-            "val_wer": val_metrics["wer"],
-        }
-        for key, value in val_metrics.items():
-            if key not in {"loss", "cer", "wer"}:
-                log_payload[f"val_{key}"] = value
-        log_payload.update(_flatten_examples("val", validation["examples"]))
-        trackio.log(log_payload)
+        if is_main_process:
+            ema_backup = ema.apply_to(model) if ema is not None else None
+            validation = evaluate(
+                model,
+                val_loader,
+                criterion,
+                tokenizer,
+                device,
+                args.dtype,
+                decode_strategy=args.decode_strategy,
+                beam_size=args.beam_size,
+                lm_scorer=lm_scorer,
+                lm_weight=args.lm_weight,
+                example_limit=args.example_limit,
+            )
+            if ema_backup is not None:
+                ExponentialMovingAverage.restore(model, ema_backup)
+            val_metrics = validation["metrics"]
+            log_payload = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "train_loss": train_loss,
+                "val_loss": val_metrics["loss"],
+                "val_cer": val_metrics["cer"],
+                "val_wer": val_metrics["wer"],
+            }
+            for key, value in val_metrics.items():
+                if key not in {"loss", "cer", "wer"}:
+                    log_payload[f"val_{key}"] = value
+            log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
+            log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
+            trackio.log(log_payload)
+            report = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "metrics": val_metrics,
+                "hardest_examples": validation["hardest_examples"],
+                "random_examples": validation["random_examples"],
+                "speaker_metrics": validation["speaker_metrics"],
+                "split_audit": split_audit,
+            }
+            reports_dir = output_dir / "eval_reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path = reports_dir / f"epoch_{epoch:04d}.json"
+            report_path.write_text(
+                json.dumps(report, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
 
-        checkpoint = _build_checkpoint(
-            model=model,
-            encoder_config=encoder_config,
-            tokenizer=tokenizer,
-            featurizer=featurizer,
-            epoch=epoch,
-            global_step=global_step,
-            best_val_wer=min(best_val_wer, val_metrics["wer"]),
-            metrics=log_payload,
-            optimizers=optimizers,
-            optimizer_names=optimizer_names,
-            schedulers=schedulers,
-            scaler=scaler,
-            ema=ema,
-            args=args,
-        )
-        latest_path = output_dir / "checkpoint_last.pt"
-        torch.save(checkpoint, latest_path)
-        if val_metrics["wer"] < best_val_wer:
-            best_val_wer = val_metrics["wer"]
-            torch.save(checkpoint, output_dir / "checkpoint_best.pt")
-        _update_top_checkpoints(
-            output_dir=output_dir,
-            checkpoint=checkpoint,
-            epoch=epoch,
-            val_wer=val_metrics["wer"],
-            keep_top_k=args.keep_top_k,
-        )
+            checkpoint = _build_checkpoint(
+                model=model,
+                encoder_config=encoder_config,
+                tokenizer=tokenizer,
+                featurizer=featurizer,
+                epoch=epoch,
+                global_step=global_step,
+                best_val_wer=min(best_val_wer, val_metrics["wer"]),
+                metrics=log_payload,
+                optimizers=optimizers,
+                optimizer_names=optimizer_names,
+                schedulers=schedulers,
+                scaler=scaler,
+                ema=ema,
+                args=args,
+            )
+            latest_path = output_dir / "checkpoint_last.pt"
+            torch.save(checkpoint, latest_path)
+            if val_metrics["wer"] < best_val_wer:
+                best_val_wer = val_metrics["wer"]
+                torch.save(checkpoint, output_dir / "checkpoint_best.pt")
+            _update_top_checkpoints(
+                output_dir=output_dir,
+                checkpoint=checkpoint,
+                epoch=epoch,
+                val_wer=val_metrics["wer"],
+                keep_top_k=args.keep_top_k,
+            )
+            _average_topk_checkpoints(output_dir)
+        if distributed:
+            dist.barrier()
 
-    (output_dir / "train_summary.json").write_text(
-        json.dumps(
-            {
-                "best_val_wer": best_val_wer,
-                "variant": args.variant,
-                "keep_top_k": args.keep_top_k,
-                "decode_strategy": args.decode_strategy,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    trackio.finish()
+    if is_main_process:
+        (output_dir / "train_summary.json").write_text(
+            json.dumps(
+                {
+                    "best_val_wer": best_val_wer,
+                    "variant": args.variant,
+                    "keep_top_k": args.keep_top_k,
+                    "decode_strategy": args.decode_strategy,
+                    "distributed": distributed,
+                    "world_size": world_size,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        trackio.finish()
+    if distributed and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

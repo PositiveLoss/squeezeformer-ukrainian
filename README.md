@@ -13,6 +13,7 @@ This repository contains a standalone PyTorch implementation of the Squeezeforme
 - [train_lm.py](/workspace/train_lm.py): train a shallow-fusion n-gram LM from newline-delimited text
 - [export_cv22_corpus.py](/workspace/export_cv22_corpus.py): export normalized cv22 transcripts as an LM corpus
 - [evaluate.py](/workspace/evaluate.py): evaluation entrypoint
+- [benchmark.py](/workspace/benchmark.py): synthetic throughput, memory, and decode-speed benchmark
 - [tests](/workspace/tests): architecture and training utility checks
 
 ## Architecture Fidelity
@@ -64,7 +65,7 @@ The loader downloads the dataset snapshot with `huggingface_hub.snapshot_downloa
 
 For local development and smoke tests, `--dataset-repo` can also point at a local directory that contains Common Voice-style manifests and audio files.
 
-Important: the dataset itself exposes only a source train split. This repo creates deterministic internal `train`, `validation`, and `test` splits by hashing `speaker_id` or `client_id` with the provided seed and split fractions, so the default split is speaker-aware rather than record-only.
+Important: the dataset itself exposes only a source train split. This repo creates deterministic internal `train`, `validation`, and `test` splits from that source data. When real speaker metadata such as `client_id` or `speaker_id` is available, the split is speaker-aware. When the dataset does not expose speaker identity, the pipeline falls back to utterance-level hashing so training still works, and the split audit marks speaker identity as unavailable.
 
 Default split behavior:
 
@@ -157,8 +158,12 @@ Relevant training flags:
 - greedy or beam-search validation decoding
 - LM scorer hook for beam search
 - optional training-time fit of a concrete shallow-fusion n-gram LM
-- per-epoch decoded examples in `trackio`
+- hardest and random decoded example logging in `trackio`
 - WER/CER metrics broken out by utterance-length bucket
+- speaker-level metrics and split audits
+- automatic top-k checkpoint averaging
+- per-checkpoint JSON evaluation reports
+- basic single-node distributed training through `torchrun`
 
 Important defaults:
 
@@ -248,6 +253,15 @@ HF_TOKEN=... uv run python train.py \
   --output-dir artifacts/cv22-sm
 ```
 
+Distributed training:
+
+```bash
+HF_TOKEN=... torchrun --nproc_per_node=2 train.py \
+  --distributed \
+  --variant sm \
+  --output-dir artifacts/cv22-sm-ddp
+```
+
 Local resumable smoke test:
 
 ```bash
@@ -262,6 +276,17 @@ HF_TOKEN=... uv run python evaluate.py \
   --split test \
   --device cpu \
   --dtype bfloat16 \
+  --decode-strategy beam \
+  --beam-size 8
+```
+
+Benchmark:
+
+```bash
+uv run python benchmark.py \
+  --variant sm \
+  --batch-size 8 \
+  --time-steps 512 \
   --decode-strategy beam \
   --beam-size 8
 ```
@@ -361,8 +386,11 @@ Training writes:
 
 - `checkpoint_last.pt`
 - `checkpoint_best.pt`
+- `checkpoint_topk_avg.pt`
 - `checkpoints_topk/` with the best `--keep-top-k` checkpoints by validation WER
 - `checkpoints_topk/metadata.json`
+- `eval_reports/epoch_XXXX.json`
+- `split_audit.json`
 - `tokenizer.json`
 - `tokenizer.model` for SentencePiece runs
 - `train_summary.json`
@@ -386,8 +414,10 @@ Resume loads:
 - CER
 - WER
 - per-bucket CER/WER for `short`, `medium`, and `long` utterances
+- speaker-level aggregate metrics
 - sample count
-- decoded example pairs
+- hardest decoded example pairs
+- random decoded example pairs
 
 ## Trackio
 

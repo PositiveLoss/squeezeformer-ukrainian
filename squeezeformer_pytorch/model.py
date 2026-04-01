@@ -304,9 +304,11 @@ class SqueezeformerBlock(nn.Module):
         conv_expansion_factor: int,
         dropout: float,
         block_pattern: tuple[str, ...],
+        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
         self.block_pattern = block_pattern
+        self.drop_path_rate = drop_path_rate
         layers: list[nn.Module] = []
         for token in block_pattern:
             if token == "M":
@@ -341,11 +343,18 @@ class SqueezeformerBlock(nn.Module):
         attn_mask: Tensor | None,
         pad_mask: Tensor | None,
     ) -> Tensor:
+        residual = x
         for token, layer in zip(self.block_pattern, self.layers, strict=True):
             if token == "M":
                 x = layer(x, pos=pos, attn_mask=attn_mask)
             elif token == "C":
                 x = layer(x, pad_mask=pad_mask)
+        if self.training and self.drop_path_rate > 0:
+            keep_prob = 1.0 - self.drop_path_rate
+            shape = (x.size(0),) + (1,) * (x.dim() - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            binary_mask = torch.floor(random_tensor)
+            x = residual + (x - residual) * binary_mask / keep_prob
         return x
 
 
@@ -432,6 +441,7 @@ class SqueezeformerConfig:
     block_pattern: tuple[str, ...] = ("M", "s", "C", "s")
     time_reduction_kernel_size: int = 3
     activation_checkpointing: bool = False
+    stochastic_depth_rate: float = 0.0
     time_reduce_idx: tuple[int, ...] = (7,)
     time_recover_idx: tuple[int, ...] = (15,)
 
@@ -462,6 +472,7 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=324,
         num_layers=20,
         num_heads=4,
+        stochastic_depth_rate=0.03,
         time_reduce_idx=(9,),
         time_recover_idx=(19,),
     ),
@@ -469,6 +480,7 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=512,
         num_layers=18,
         num_heads=8,
+        stochastic_depth_rate=0.05,
         time_reduce_idx=(8,),
         time_recover_idx=(17,),
     ),
@@ -476,6 +488,7 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=640,
         num_layers=22,
         num_heads=8,
+        stochastic_depth_rate=0.1,
         time_reduce_idx=(10,),
         time_recover_idx=(21,),
     ),
@@ -531,8 +544,11 @@ class SqueezeformerEncoder(nn.Module):
                     conv_expansion_factor=config.conv_expansion_factor,
                     dropout=config.dropout,
                     block_pattern=config.block_pattern,
+                    drop_path_rate=(
+                        config.stochastic_depth_rate * layer_index / max(1, config.num_layers - 1)
+                    ),
                 )
-                for _ in range(config.num_layers)
+                for layer_index in range(config.num_layers)
             ]
         )
 

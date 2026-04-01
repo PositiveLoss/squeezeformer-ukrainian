@@ -18,6 +18,7 @@ from squeezeformer_pytorch.data import (
     MaxFramesBatchSampler,
     SpecAugment,
     load_cv22_corpus_texts,
+    load_cv22_records,
     transcript_is_usable,
 )
 from train import (
@@ -26,6 +27,7 @@ from train import (
     _variant_defaults,
     build_optimizer,
     build_paper_scheduler,
+    speaker_level_metrics,
 )
 
 
@@ -85,6 +87,14 @@ def test_variant_table_matches_paper() -> None:
         assert (cfg.num_layers, cfg.d_model, cfg.num_heads) == values
 
 
+def test_stochastic_depth_enabled_for_larger_variants() -> None:
+    assert squeezeformer_variant("xs").stochastic_depth_rate == 0.0
+    assert squeezeformer_variant("m").stochastic_depth_rate > 0.0
+    assert squeezeformer_variant("l").stochastic_depth_rate > squeezeformer_variant(
+        "m"
+    ).stochastic_depth_rate
+
+
 def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
     tokenizer = SentencePieceTokenizer.train(
         ["привіт світе", "це короткий тест", "мовна модель"],
@@ -136,6 +146,26 @@ def test_load_cv22_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> N
     assert deduped == ["це тест", "мовна модель"]
 
 
+def test_load_cv22_records_works_without_speaker_id_field(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tid\tduration\n"
+        "a.wav\tце тест\tutt0\t0.3\n"
+        "b.wav\tмовна модель\tutt1\t0.3\n",
+        encoding="utf-8",
+    )
+    records = load_cv22_records(
+        dataset_root=tmp_path,
+        split="train",
+        seed=13,
+        val_fraction=0.0,
+        test_fraction=0.0,
+    )
+    assert len(records) == 2
+    assert all(record.speaker_id is None for record in records)
+    assert all(not record.has_speaker_id for record in records)
+
+
 def test_transcript_filter_rejects_pathological_rows() -> None:
     assert transcript_is_usable(
         "це нормальний рядок",
@@ -151,10 +181,10 @@ def test_transcript_filter_rejects_pathological_rows() -> None:
 
 def test_max_frames_batch_sampler_respects_frame_budget() -> None:
     records = [
-        CV22Record(None, None, "a", "0", "s0", estimated_frames=20),
-        CV22Record(None, None, "b", "1", "s1", estimated_frames=25),
-        CV22Record(None, None, "c", "2", "s2", estimated_frames=40),
-        CV22Record(None, None, "d", "3", "s3", estimated_frames=45),
+        CV22Record(None, None, "a", "0", estimated_frames=20, speaker_id="s0", has_speaker_id=True),
+        CV22Record(None, None, "b", "1", estimated_frames=25, speaker_id="s1", has_speaker_id=True),
+        CV22Record(None, None, "c", "2", estimated_frames=40, speaker_id="s2", has_speaker_id=True),
+        CV22Record(None, None, "d", "3", estimated_frames=45, speaker_id="s3", has_speaker_id=True),
     ]
     sampler = MaxFramesBatchSampler(records, max_batch_frames=90, shuffle=False)
     batches = list(iter(sampler))
@@ -166,10 +196,42 @@ def test_max_frames_batch_sampler_respects_frame_budget() -> None:
 
 def test_adaptive_batch_sampler_respects_token_budget() -> None:
     records = [
-        CV22Record(None, None, "aaa", "0", "s0", estimated_frames=20),
-        CV22Record(None, None, "bbbb", "1", "s1", estimated_frames=25),
-        CV22Record(None, None, "cc", "2", "s2", estimated_frames=40),
-        CV22Record(None, None, "dddd", "3", "s3", estimated_frames=45),
+        CV22Record(
+            None,
+            None,
+            "aaa",
+            "0",
+            estimated_frames=20,
+            speaker_id="s0",
+            has_speaker_id=True,
+        ),
+        CV22Record(
+            None,
+            None,
+            "bbbb",
+            "1",
+            estimated_frames=25,
+            speaker_id="s1",
+            has_speaker_id=True,
+        ),
+        CV22Record(
+            None,
+            None,
+            "cc",
+            "2",
+            estimated_frames=40,
+            speaker_id="s2",
+            has_speaker_id=True,
+        ),
+        CV22Record(
+            None,
+            None,
+            "dddd",
+            "3",
+            estimated_frames=45,
+            speaker_id="s3",
+            has_speaker_id=True,
+        ),
     ]
     sampler = AdaptiveBatchSampler(records, target_batch_units=6, unit="tokens", shuffle=False)
     batches = list(iter(sampler))
@@ -188,6 +250,18 @@ def test_ema_decay_warmup_increases_toward_target() -> None:
         observed.append(ema.current_decay())
     assert observed[0] < observed[-1]
     assert observed[-1] == 0.9
+
+
+def test_speaker_metrics_mark_missing_speaker_ids_unavailable() -> None:
+    metrics = speaker_level_metrics(
+        speaker_ids=[None, None],
+        has_speaker_ids=[False, False],
+        references=["це тест", "мовна модель"],
+        hypotheses=["це тест", "мовна модель"],
+    )
+    assert metrics["speaker_count"] == 0
+    assert metrics["speaker_id_available"] is False
+    assert metrics["missing_speaker_id_samples"] == 2
 
 
 def test_time_reduction_kernel_matches_paper() -> None:

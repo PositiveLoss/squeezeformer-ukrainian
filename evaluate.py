@@ -79,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm-scorer", default=None)
     parser.add_argument("--lm-weight", type=float, default=0.0)
     parser.add_argument("--example-limit", type=int, default=5)
+    parser.add_argument("--report-path", default=None)
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     return parser.parse_args()
@@ -154,8 +155,17 @@ def main() -> None:
         "samples": len(records),
         "decode_strategy": args.decode_strategy,
     }
-    payload = {"metrics": metrics, "examples": result["examples"]}
+    payload = {
+        "metrics": metrics,
+        "hardest_examples": result["hardest_examples"],
+        "random_examples": result["random_examples"],
+        "speaker_metrics": result["speaker_metrics"],
+    }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
+    if args.report_path:
+        report_path = Path(args.report_path)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     trackio_config = {
         "evaluation_split": args.split,
