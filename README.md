@@ -37,6 +37,7 @@ This is still not a full paper reproduction, but the current code now aligns wit
 - greedy CTC decoding
 - SentencePiece or character tokenization
 - SentencePiece-128 as the default tokenizer configuration
+- Muon as the default optimizer path
 - paper-style warmup, hold, and inverse-power decay scheduler
 - variant-aware SpecAugment defaults
 
@@ -123,6 +124,7 @@ SentencePiece tokenizer:
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant sm \
+  --optimizer muon \
   --tokenizer sentencepiece \
   --spm-vocab-size 128 \
   --spm-model-type unigram \
@@ -168,6 +170,7 @@ Common arguments:
 - `--epochs`
 - `--learning-rate`
 - `--weight-decay`
+- `--optimizer`
 - `--num-workers`
 - `--seed`
 - `--warmup-epochs`
@@ -192,6 +195,7 @@ Important defaults:
 - `--tokenizer sentencepiece`
 - `--spm-vocab-size 128`
 - `--spm-model-type unigram`
+- `--optimizer muon`
 - `--dtype bfloat16`
 - `--warmup-epochs 20`
 - `--hold-epochs 160`
@@ -202,6 +206,13 @@ Variant-aware defaults derived from the paper:
 - `xs`, `s`, `sm`: peak LR `2e-3`, time masks `5`
 - `m`: peak LR `1.5e-3`, time masks `7`
 - `ml`, `l`: peak LR `1e-3`, time masks `10`
+
+Optimizer behavior:
+
+- default path is `muon`
+- Muon is applied to encoder hidden 2D weights
+- AdamW is still used for remaining parameters such as convolution kernels, biases, norms, and the CTC classifier head
+- use `--optimizer adamw` to revert to a single AdamW optimizer
 
 Files written by training:
 

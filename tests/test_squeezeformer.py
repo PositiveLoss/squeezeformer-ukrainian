@@ -5,12 +5,13 @@ import torch
 
 from squeezeformer_pytorch import (
     SentencePieceTokenizer,
+    SqueezeformerCTC,
     build_squeezeformer_encoder,
     squeezeformer_variant,
     tokenizer_from_dict,
 )
 from squeezeformer_pytorch.data import SpecAugment
-from train import _variant_defaults, build_paper_scheduler
+from train import OptimizerChoice, _variant_defaults, build_optimizer, build_paper_scheduler
 
 
 def expected_subsampled_length(length: int) -> int:
@@ -128,3 +129,20 @@ def test_specaugment_preserves_shape() -> None:
     features = torch.ones(20, 8)
     augmented = augment(features)
     assert augmented.shape == features.shape
+
+
+def test_muon_optimizer_partition_uses_encoder_hidden_weights() -> None:
+    config = squeezeformer_variant("xs")
+    model = SqueezeformerCTC(encoder_config=config, vocab_size=32)
+    optimizers, optimizer_names = build_optimizer(
+        model=model,
+        optimizer_name=OptimizerChoice.MUON,
+        lr=1e-3,
+        weight_decay=1e-4,
+    )
+    assert optimizer_names == ["muon", "adamw_aux"]
+    muon_params = optimizers[0].param_groups[0]["params"]
+    adamw_params = optimizers[1].param_groups[0]["params"]
+    assert muon_params
+    assert adamw_params
+    assert all(parameter.ndim == 2 for parameter in muon_params)

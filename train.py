@@ -45,6 +45,11 @@ class DTypeChoice(StrEnum):
     BFLOAT16 = "bfloat16"
 
 
+class OptimizerChoice(StrEnum):
+    MUON = "muon"
+    ADAMW = "adamw"
+
+
 def _variant_defaults(variant: str) -> SchedulerDefaults:
     if variant in {"xs", "s", "sm"}:
         return SchedulerDefaults(peak_lr=2e-3, num_time_masks=5)
@@ -73,6 +78,43 @@ def build_paper_scheduler(
         return (warmup_steps**decay_exponent) / (decay_step**decay_exponent)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def build_optimizer(
+    model: SqueezeformerCTC,
+    optimizer_name: OptimizerChoice,
+    lr: float,
+    weight_decay: float,
+) -> tuple[list[torch.optim.Optimizer], list[str]]:
+    if optimizer_name == OptimizerChoice.ADAMW:
+        return [torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)], ["adamw"]
+
+    muon_params = []
+    adamw_params = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("encoder.") and parameter.ndim == 2:
+            muon_params.append(parameter)
+        else:
+            adamw_params.append(parameter)
+
+    optimizers: list[torch.optim.Optimizer] = []
+    optimizer_names: list[str] = []
+    if muon_params:
+        optimizers.append(
+            torch.optim.Muon(
+                muon_params,
+                lr=lr,
+                weight_decay=weight_decay,
+                adjust_lr_fn="match_rms_adamw",
+            )
+        )
+        optimizer_names.append("muon")
+    if adamw_params:
+        optimizers.append(torch.optim.AdamW(adamw_params, lr=lr, weight_decay=weight_decay))
+        optimizer_names.append("adamw_aux")
+    return optimizers, optimizer_names
 
 
 def _resolve_autocast_dtype(dtype: DTypeChoice) -> torch.dtype | None:
@@ -151,6 +193,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--optimizer",
+        type=OptimizerChoice,
+        choices=list(OptimizerChoice),
+        default=OptimizerChoice.MUON,
+    )
     parser.add_argument(
         "--dtype",
         type=DTypeChoice,
@@ -289,18 +337,22 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     peak_lr = args.learning_rate if args.learning_rate is not None else variant_defaults.peak_lr
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    optimizers, optimizer_names = build_optimizer(
+        model=model,
+        optimizer_name=args.optimizer,
         lr=peak_lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = build_paper_scheduler(
-        optimizer,
-        steps_per_epoch=max(1, len(train_loader)),
-        warmup_epochs=args.warmup_epochs,
-        hold_epochs=args.hold_epochs,
-        decay_exponent=args.decay_exponent,
-    )
+    schedulers = [
+        build_paper_scheduler(
+            optimizer,
+            steps_per_epoch=max(1, len(train_loader)),
+            warmup_epochs=args.warmup_epochs,
+            hold_epochs=args.hold_epochs,
+            decay_exponent=args.decay_exponent,
+        )
+        for optimizer in optimizers
+    ]
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
 
     trackio.init(
@@ -311,6 +363,7 @@ def main() -> None:
             "encoder_config": asdict(encoder_config),
             "train_samples": len(train_records),
             "val_samples": len(val_records),
+            "active_optimizers": optimizer_names,
         },
     )
 
@@ -319,7 +372,8 @@ def main() -> None:
         model.train()
         running_loss = 0.0
         for step, batch in enumerate(train_loader, start=1):
-            optimizer.zero_grad(set_to_none=True)
+            for optimizer in optimizers:
+                optimizer.zero_grad(set_to_none=True)
             features = batch["features"].to(device)
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
@@ -329,7 +383,8 @@ def main() -> None:
                 log_probs, output_lengths = model.log_probs(features, feature_lengths)
                 loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
+            for optimizer in optimizers:
+                scaler.step(optimizer)
             scaler.update()
 
             running_loss += float(loss.item())
@@ -339,10 +394,11 @@ def main() -> None:
                         "epoch": epoch,
                         "step": step,
                         "train_loss_step": float(loss.item()),
-                        "learning_rate": optimizer.param_groups[0]["lr"],
+                        "learning_rate": optimizers[0].param_groups[0]["lr"],
                     }
                 )
-            scheduler.step()
+            for scheduler in schedulers:
+                scheduler.step()
 
         train_loss = running_loss / max(1, len(train_loader))
         val_metrics = evaluate(model, val_loader, criterion, tokenizer, device, args.dtype)
