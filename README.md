@@ -134,6 +134,50 @@ Relevant training flags:
 - `--reverb-delay-ms-min`
 - `--reverb-delay-ms-max`
 
+## Feature Extraction
+
+This repo does not ship a separate offline feature-export command. Feature extraction happens
+through the dataset pipeline, and you can persist extracted log-mel tensors on disk with
+`--feature-cache-dir`.
+
+When caching is enabled:
+
+- training writes cached tensors under `FEATURE_CACHE_DIR/train`
+- validation writes cached tensors under `FEATURE_CACHE_DIR/validation`
+- evaluation writes cached tensors under `FEATURE_CACHE_DIR/<split>`
+- each cached file is a `.pt` tensor keyed by utterance id and frontend config hash
+
+Example: warm the train and validation feature cache during a short run
+
+```bash
+HF_TOKEN=... uv run python train.py \
+  --variant xs \
+  --device cpu \
+  --dtype bfloat16 \
+  --output-dir artifacts/cache_warm \
+  --epochs 1 \
+  --feature-cache-dir artifacts/feature_cache \
+  --max-train-samples 1000 \
+  --max-val-samples 200
+```
+
+Example: extract and cache features for the evaluation split without training
+
+```bash
+HF_TOKEN=... uv run python evaluate.py \
+  --checkpoint artifacts/squeezeformer-cv22/checkpoint_last.pt \
+  --split test \
+  --device cpu \
+  --dtype bfloat16 \
+  --feature-cache-dir artifacts/feature_cache
+```
+
+Notes:
+
+- cache reuse is disabled for training samples when waveform augmentation is enabled
+- changing frontend settings such as `--preemphasis` or normalization flags produces a new cache key
+- the cache stores model inputs after featurization, not raw audio embeddings from the encoder
+
 ## Training Features
 
 [train.py](/workspace/train.py) now includes:
