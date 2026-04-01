@@ -8,7 +8,7 @@ import torch
 import trackio
 from torch import nn
 
-from squeezeformer_pytorch.asr import CharacterTokenizer, SqueezeformerCTC
+from squeezeformer_pytorch.asr import SqueezeformerCTC, Tokenizer, tokenizer_from_dict
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def greedy_decode(log_probs: torch.Tensor, tokenizer: CharacterTokenizer) -> list[str]:
+def greedy_decode(log_probs: torch.Tensor, tokenizer: Tokenizer) -> list[str]:
     token_ids = log_probs.argmax(dim=-1).cpu().tolist()
     return [tokenizer.decode_ctc(sequence) for sequence in token_ids]
 
@@ -47,7 +47,7 @@ def greedy_decode(log_probs: torch.Tensor, tokenizer: CharacterTokenizer) -> lis
 def main() -> None:
     args = parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    tokenizer = CharacterTokenizer.from_dict(checkpoint["tokenizer"])
+    tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
     encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
     model.load_state_dict(checkpoint["model_state_dict"])

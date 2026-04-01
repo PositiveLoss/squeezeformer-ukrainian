@@ -10,7 +10,12 @@ import torch
 import trackio
 from torch import nn
 
-from squeezeformer_pytorch.asr import CharacterTokenizer, SqueezeformerCTC
+from squeezeformer_pytorch.asr import (
+    CharacterTokenizer,
+    SentencePieceTokenizer,
+    SqueezeformerCTC,
+    Tokenizer,
+)
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
@@ -43,10 +48,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--tokenizer",
+        default="character",
+        choices=["character", "sentencepiece"],
+    )
+    parser.add_argument("--spm-vocab-size", type=int, default=256)
+    parser.add_argument(
+        "--spm-model-type",
+        default="unigram",
+        choices=["unigram", "bpe", "char", "word"],
+    )
     return parser.parse_args()
 
 
-def greedy_decode(log_probs: torch.Tensor, tokenizer: CharacterTokenizer) -> list[str]:
+def greedy_decode(log_probs: torch.Tensor, tokenizer: Tokenizer) -> list[str]:
     token_ids = log_probs.argmax(dim=-1).cpu().tolist()
     return [tokenizer.decode_ctc(sequence) for sequence in token_ids]
 
@@ -55,7 +71,7 @@ def evaluate(
     model: SqueezeformerCTC,
     dataloader,
     criterion: nn.CTCLoss,
-    tokenizer: CharacterTokenizer,
+    tokenizer: Tokenizer,
     device: torch.device,
 ) -> dict[str, float]:
     model.eval()
@@ -112,7 +128,16 @@ def main() -> None:
         max_samples=args.max_val_samples,
     )
 
-    tokenizer = CharacterTokenizer.build(record.transcript for record in train_records)
+    if args.tokenizer == "sentencepiece":
+        tokenizer = SentencePieceTokenizer.train(
+            (record.transcript for record in train_records),
+            model_prefix=output_dir / "tokenizer",
+            vocab_size=args.spm_vocab_size,
+            model_type=args.spm_model_type,
+        )
+        tokenizer.save(output_dir / "tokenizer.model")
+    else:
+        tokenizer = CharacterTokenizer.build(record.transcript for record in train_records)
     tokenizer_path = output_dir / "tokenizer.json"
     tokenizer.save(tokenizer_path)
 

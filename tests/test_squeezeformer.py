@@ -1,8 +1,14 @@
 import math
+from pathlib import Path
 
 import torch
 
-from squeezeformer_pytorch import build_squeezeformer_encoder, squeezeformer_variant
+from squeezeformer_pytorch import (
+    SentencePieceTokenizer,
+    build_squeezeformer_encoder,
+    squeezeformer_variant,
+    tokenizer_from_dict,
+)
 
 
 def expected_subsampled_length(length: int) -> int:
@@ -59,3 +65,15 @@ def test_variant_table_matches_paper() -> None:
     for name, values in expected.items():
         cfg = squeezeformer_variant(name)
         assert (cfg.num_layers, cfg.d_model, cfg.num_heads) == values
+
+
+def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
+    tokenizer = SentencePieceTokenizer.train(
+        ["привіт світе", "це короткий тест", "мовна модель"],
+        model_prefix=tmp_path / "spm",
+        vocab_size=24,
+    )
+    token_ids = tokenizer.encode("привіт світе")
+    assert token_ids
+    restored = tokenizer_from_dict(tokenizer.to_dict())
+    assert restored.decode(token_ids)

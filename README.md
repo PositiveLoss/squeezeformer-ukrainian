@@ -29,6 +29,8 @@ This is an encoder-first implementation, not a full reproduction of the authorsâ
 - tokenization is character-level, not SentencePiece
 - training defaults are practical local defaults, not the paperâ€™s TPU-scale recipe
 
+SentencePiece tokenization is also supported as a runtime option for the training and evaluation scripts.
+
 ## Requirements
 
 The project uses a local `uv` environment.
@@ -38,6 +40,7 @@ Core runtime dependencies:
 - `torch`
 - `torchaudio`
 - `polars`
+- `sentencepiece`
 - `huggingface_hub`
 - `trackio`
 - `pytest`
@@ -53,7 +56,7 @@ Install dependencies:
 
 ```bash
 uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-uv pip install polars huggingface_hub trackio pytest ruff
+uv pip install polars sentencepiece huggingface_hub trackio pytest ruff
 ```
 
 ## Dataset Access
@@ -79,6 +82,7 @@ Train a small run:
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant sm \
+  --tokenizer sentencepiece \
   --output-dir artifacts/cv22-sm \
   --batch-size 8 \
   --epochs 10
@@ -119,6 +123,9 @@ Common options:
 - `--max-val-samples`
 - `--trackio-project`
 - `--trackio-space-id`
+- `--tokenizer`: `character` or `sentencepiece`
+- `--spm-vocab-size`
+- `--spm-model-type`
 
 Example with smaller subsets for a smoke test:
 
