@@ -4,7 +4,9 @@ import argparse
 import json
 import os
 from dataclasses import asdict
+from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import trackio
@@ -19,6 +21,7 @@ from squeezeformer_pytorch.asr import (
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
+    SpecAugment,
     create_dataloader,
     download_cv22_dataset,
     load_cv22_records,
@@ -29,6 +32,66 @@ from squeezeformer_pytorch.model import squeezeformer_variant
 
 def _checkpoint_name(epoch: int, val_wer: float) -> str:
     return f"checkpoint_epoch={epoch:04d}_valwer={val_wer:.6f}.pt"
+
+
+class SchedulerDefaults(NamedTuple):
+    peak_lr: float
+    num_time_masks: int
+
+
+class DTypeChoice(StrEnum):
+    FLOAT32 = "float32"
+    FLOAT16 = "float16"
+    BFLOAT16 = "bfloat16"
+
+
+def _variant_defaults(variant: str) -> SchedulerDefaults:
+    if variant in {"xs", "s", "sm"}:
+        return SchedulerDefaults(peak_lr=2e-3, num_time_masks=5)
+    if variant == "m":
+        return SchedulerDefaults(peak_lr=1.5e-3, num_time_masks=7)
+    return SchedulerDefaults(peak_lr=1e-3, num_time_masks=10)
+
+
+def build_paper_scheduler(
+    optimizer: torch.optim.Optimizer,
+    steps_per_epoch: int,
+    warmup_epochs: int = 20,
+    hold_epochs: int = 160,
+    decay_exponent: float = 1.0,
+):
+    warmup_steps = max(1, warmup_epochs * steps_per_epoch)
+    hold_steps = max(0, hold_epochs * steps_per_epoch)
+
+    def lr_lambda(step: int) -> float:
+        current_step = step + 1
+        if current_step < warmup_steps:
+            return current_step / warmup_steps
+        if current_step < warmup_steps + hold_steps:
+            return 1.0
+        decay_step = max(1, current_step - hold_steps)
+        return (warmup_steps**decay_exponent) / (decay_step**decay_exponent)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def _resolve_autocast_dtype(dtype: DTypeChoice) -> torch.dtype | None:
+    if dtype == DTypeChoice.FLOAT32:
+        return None
+    if dtype == DTypeChoice.FLOAT16:
+        return torch.float16
+    if dtype == DTypeChoice.BFLOAT16:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def _autocast_context(device: torch.device, dtype: DTypeChoice):
+    autocast_dtype = _resolve_autocast_dtype(dtype)
+    if autocast_dtype is None:
+        return torch.autocast(device_type=device.type, enabled=False)
+    if device.type == "cpu" and autocast_dtype == torch.float16:
+        raise ValueError("float16 autocast is not supported on CPU. Use bfloat16 or float32.")
+    return torch.autocast(device_type=device.type, dtype=autocast_dtype)
 
 
 def _update_top_checkpoints(
@@ -79,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="artifacts/squeezeformer-cv22")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=13)
@@ -88,21 +151,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--dtype",
+        type=DTypeChoice,
+        choices=list(DTypeChoice),
+        default=DTypeChoice.BFLOAT16,
+    )
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--keep-top-k", type=int, default=5)
     parser.add_argument(
         "--tokenizer",
-        default="character",
+        default="sentencepiece",
         choices=["character", "sentencepiece"],
     )
-    parser.add_argument("--spm-vocab-size", type=int, default=256)
+    parser.add_argument("--spm-vocab-size", type=int, default=128)
     parser.add_argument(
         "--spm-model-type",
         default="unigram",
         choices=["unigram", "bpe", "char", "word"],
     )
+    parser.add_argument("--warmup-epochs", type=int, default=20)
+    parser.add_argument("--hold-epochs", type=int, default=160)
+    parser.add_argument("--decay-exponent", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -117,6 +189,7 @@ def evaluate(
     criterion: nn.CTCLoss,
     tokenizer: Tokenizer,
     device: torch.device,
+    dtype: DTypeChoice,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -130,8 +203,9 @@ def evaluate(
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
 
-            log_probs, output_lengths = model.log_probs(features, feature_lengths)
-            loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
+            with _autocast_context(device, dtype):
+                log_probs, output_lengths = model.log_probs(features, feature_lengths)
+                loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
             total_loss += float(loss.item())
             total_batches += 1
             references.extend(batch["transcripts"])
@@ -149,6 +223,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    variant_defaults = _variant_defaults(args.variant)
 
     dataset_root = download_cv22_dataset(
         repo_id=args.dataset_repo,
@@ -186,7 +261,12 @@ def main() -> None:
     tokenizer.save(tokenizer_path)
 
     featurizer = AudioFeaturizer()
-    train_dataset = CV22ASRDataset(train_records, tokenizer=tokenizer, featurizer=featurizer)
+    train_dataset = CV22ASRDataset(
+        train_records,
+        tokenizer=tokenizer,
+        featurizer=featurizer,
+        specaugment=SpecAugment(num_time_masks=variant_defaults.num_time_masks),
+    )
     val_dataset = CV22ASRDataset(val_records, tokenizer=tokenizer, featurizer=featurizer)
     train_loader = create_dataloader(
         train_dataset,
@@ -205,11 +285,21 @@ def main() -> None:
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
     device = torch.device(args.device)
     model.to(device)
+    use_grad_scaler = device.type == "cuda" and args.dtype == DTypeChoice.FLOAT16
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
+    peak_lr = args.learning_rate if args.learning_rate is not None else variant_defaults.peak_lr
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.learning_rate,
+        lr=peak_lr,
         weight_decay=args.weight_decay,
+    )
+    scheduler = build_paper_scheduler(
+        optimizer,
+        steps_per_epoch=max(1, len(train_loader)),
+        warmup_epochs=args.warmup_epochs,
+        hold_epochs=args.hold_epochs,
+        decay_exponent=args.decay_exponent,
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
 
@@ -235,10 +325,12 @@ def main() -> None:
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
 
-            log_probs, output_lengths = model.log_probs(features, feature_lengths)
-            loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
-            loss.backward()
-            optimizer.step()
+            with _autocast_context(device, args.dtype):
+                log_probs, output_lengths = model.log_probs(features, feature_lengths)
+                loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += float(loss.item())
             if step % args.log_every == 0:
@@ -250,9 +342,10 @@ def main() -> None:
                         "learning_rate": optimizer.param_groups[0]["lr"],
                     }
                 )
+            scheduler.step()
 
         train_loss = running_loss / max(1, len(train_loader))
-        val_metrics = evaluate(model, val_loader, criterion, tokenizer, device)
+        val_metrics = evaluate(model, val_loader, criterion, tokenizer, device, args.dtype)
         log_payload = {
             "epoch": epoch,
             "train_loss": train_loss,

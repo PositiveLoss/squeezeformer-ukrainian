@@ -366,7 +366,7 @@ class Conv2dSubsampling(nn.Module):
 
 
 class TimeReductionLayer(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 5, stride: int = 2) -> None:
+    def __init__(self, dim: int, kernel_size: int = 3, stride: int = 2) -> None:
         super().__init__()
         self.dim = dim
         self.kernel_size = kernel_size

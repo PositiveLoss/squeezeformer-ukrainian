@@ -18,6 +18,7 @@ from squeezeformer_pytorch.data import (
 )
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import SqueezeformerConfig
+from train import DTypeChoice, _autocast_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--dtype",
+        type=DTypeChoice,
+        choices=list(DTypeChoice),
+        default=DTypeChoice.BFLOAT16,
+    )
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     return parser.parse_args()
@@ -86,8 +93,9 @@ def main() -> None:
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
-            log_probs, output_lengths = model.log_probs(features, feature_lengths)
-            loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
+            with _autocast_context(device, args.dtype):
+                log_probs, output_lengths = model.log_probs(features, feature_lengths)
+                loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
             total_loss += float(loss.item())
             references.extend(batch["transcripts"])
             hypotheses.extend(greedy_decode(log_probs, tokenizer))

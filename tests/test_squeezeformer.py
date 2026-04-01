@@ -9,6 +9,8 @@ from squeezeformer_pytorch import (
     squeezeformer_variant,
     tokenizer_from_dict,
 )
+from squeezeformer_pytorch.data import SpecAugment
+from train import _variant_defaults, build_paper_scheduler
 
 
 def expected_subsampled_length(length: int) -> int:
@@ -77,3 +79,52 @@ def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
     assert token_ids
     restored = tokenizer_from_dict(tokenizer.to_dict())
     assert restored.decode(token_ids)
+
+
+def test_time_reduction_kernel_matches_paper() -> None:
+    model = build_squeezeformer_encoder("sm")
+    reduction = model.time_reduce["7"]
+    assert reduction.kernel_size == 3
+
+
+def test_paper_defaults_use_sentencepiece_compatible_variant_defaults() -> None:
+    assert _variant_defaults("sm").peak_lr == 2e-3
+    assert _variant_defaults("sm").num_time_masks == 5
+    assert _variant_defaults("m").peak_lr == 1.5e-3
+    assert _variant_defaults("m").num_time_masks == 7
+    assert _variant_defaults("l").peak_lr == 1e-3
+    assert _variant_defaults("l").num_time_masks == 10
+
+
+def test_paper_scheduler_warmup_hold_decay() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0)
+    scheduler = build_paper_scheduler(
+        optimizer,
+        steps_per_epoch=2,
+        warmup_epochs=1,
+        hold_epochs=1,
+        decay_exponent=1.0,
+    )
+    observed = []
+    for _ in range(8):
+        optimizer.step()
+        scheduler.step()
+        observed.append(optimizer.param_groups[0]["lr"])
+    assert observed[0] == 1.0
+    assert observed[1] == 1.0
+    assert observed[2] == 1.0
+    assert observed[3] < observed[2]
+    assert observed[4] < observed[3]
+
+
+def test_specaugment_preserves_shape() -> None:
+    augment = SpecAugment(
+        num_freq_masks=2,
+        freq_mask_param=4,
+        num_time_masks=2,
+        time_mask_max_ratio=0.2,
+    )
+    features = torch.ones(20, 8)
+    augmented = augment(features)
+    assert augmented.shape == features.shape

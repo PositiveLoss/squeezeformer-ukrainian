@@ -14,7 +14,7 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from .asr import CharacterTokenizer
+from .asr import Tokenizer
 
 TRANSCRIPT_COLUMNS = ("sentence", "transcript", "text", "normalized_text")
 AUDIO_COLUMNS = ("path", "audio")
@@ -56,6 +56,42 @@ class AudioFeaturizer(torch.nn.Module):
             )[0]
         features = self.mel(waveform)
         return torch.log(features.clamp_min(1e-5)).transpose(0, 1)
+
+
+class SpecAugment(torch.nn.Module):
+    def __init__(
+        self,
+        num_freq_masks: int = 2,
+        freq_mask_param: int = 27,
+        num_time_masks: int = 5,
+        time_mask_max_ratio: float = 0.05,
+    ) -> None:
+        super().__init__()
+        self.num_freq_masks = num_freq_masks
+        self.freq_mask_param = freq_mask_param
+        self.num_time_masks = num_time_masks
+        self.time_mask_max_ratio = time_mask_max_ratio
+
+    def forward(self, features: Tensor) -> Tensor:
+        augmented = features.clone()
+        time_steps, feature_bins = augmented.shape
+
+        for _ in range(self.num_freq_masks):
+            width = int(torch.randint(0, self.freq_mask_param + 1, (1,)).item())
+            if width == 0 or width >= feature_bins:
+                continue
+            start = int(torch.randint(0, feature_bins - width + 1, (1,)).item())
+            augmented[:, start : start + width] = 0
+
+        max_time_width = max(1, int(time_steps * self.time_mask_max_ratio))
+        for _ in range(self.num_time_masks):
+            width = int(torch.randint(0, max_time_width + 1, (1,)).item())
+            if width == 0 or width >= time_steps:
+                continue
+            start = int(torch.randint(0, time_steps - width + 1, (1,)).item())
+            augmented[start : start + width, :] = 0
+
+        return augmented
 
 
 def _normalize_text(text: str) -> str:
@@ -187,12 +223,14 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         records: list[CV22Record],
-        tokenizer: CharacterTokenizer,
+        tokenizer: Tokenizer,
         featurizer: AudioFeaturizer,
+        specaugment: SpecAugment | None = None,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
         self.featurizer = featurizer
+        self.specaugment = specaugment
 
     def __len__(self) -> int:
         return len(self.records)
@@ -207,6 +245,8 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
             raise FileNotFoundError(f"Audio for record {record.utterance_id} is not available.")
 
         features = self.featurizer(waveform, sample_rate)
+        if self.specaugment is not None:
+            features = self.specaugment(features)
         target_ids = torch.tensor(self.tokenizer.encode(record.transcript), dtype=torch.long)
         return {
             "features": features,

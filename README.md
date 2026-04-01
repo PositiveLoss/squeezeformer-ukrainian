@@ -32,11 +32,13 @@ Published variant table used in code:
 - `ml`: 18 layers, 512 dim, 8 heads
 - `l`: 22 layers, 640 dim, 8 heads
 
-This is not a full paper reproduction. It is a practical encoder-first ASR stack with:
+This is still not a full paper reproduction, but the current code now aligns with several paper-critical defaults:
 
 - greedy CTC decoding
-- either character or SentencePiece tokenization
-- local single-process training defaults
+- SentencePiece or character tokenization
+- SentencePiece-128 as the default tokenizer configuration
+- paper-style warmup, hold, and inverse-power decay scheduler
+- variant-aware SpecAugment defaults
 
 ## Environment Setup
 
@@ -122,9 +124,10 @@ SentencePiece tokenizer:
 HF_TOKEN=... uv run python train.py \
   --variant sm \
   --tokenizer sentencepiece \
-  --spm-vocab-size 256 \
+  --spm-vocab-size 128 \
   --spm-model-type unigram \
   --device cpu \
+  --dtype bfloat16 \
   --output-dir artifacts/cv22-sm-spm \
   --batch-size 8 \
   --epochs 10
@@ -136,7 +139,8 @@ Evaluate:
 HF_TOKEN=... uv run python evaluate.py \
   --checkpoint artifacts/cv22-sm-spm/checkpoint_best.pt \
   --split test \
-  --device cpu
+  --device cpu \
+  --dtype bfloat16
 ```
 
 ## Training Script
@@ -148,7 +152,8 @@ HF_TOKEN=... uv run python evaluate.py \
 3. creates deterministic train/validation splits from the single source split
 4. builds either a character tokenizer or a SentencePiece tokenizer from training transcripts
 5. extracts 80-bin log-mel features with `torchaudio`
-6. trains a Squeezeformer encoder plus CTC head
+6. applies SpecAugment during training
+7. trains a Squeezeformer encoder plus CTC head with the paper-style scheduler
 7. logs metrics to `trackio`
 8. saves checkpoints and tokenizer artifacts
 
@@ -165,11 +170,15 @@ Common arguments:
 - `--weight-decay`
 - `--num-workers`
 - `--seed`
+- `--warmup-epochs`
+- `--hold-epochs`
+- `--decay-exponent`
 - `--val-fraction`
 - `--test-fraction`
 - `--max-train-samples`
 - `--max-val-samples`
 - `--device`
+- `--dtype`
 - `--trackio-project`
 - `--trackio-space-id`
 - `--log-every`
@@ -177,6 +186,22 @@ Common arguments:
 - `--tokenizer`
 - `--spm-vocab-size`
 - `--spm-model-type`
+
+Important defaults:
+
+- `--tokenizer sentencepiece`
+- `--spm-vocab-size 128`
+- `--spm-model-type unigram`
+- `--dtype bfloat16`
+- `--warmup-epochs 20`
+- `--hold-epochs 160`
+- `--decay-exponent 1.0`
+
+Variant-aware defaults derived from the paper:
+
+- `xs`, `s`, `sm`: peak LR `2e-3`, time masks `5`
+- `m`: peak LR `1.5e-3`, time masks `7`
+- `ml`, `l`: peak LR `1e-3`, time masks `10`
 
 Files written by training:
 
@@ -192,7 +217,6 @@ Smoke-test example:
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant xs \
-  --tokenizer character \
   --device cpu \
   --output-dir artifacts/smoke \
   --epochs 1 \
@@ -224,6 +248,7 @@ Common arguments:
 - `--test-fraction`
 - `--max-samples`
 - `--device`
+- `--dtype`
 - `--trackio-project`
 - `--trackio-space-id`
 
@@ -273,7 +298,7 @@ uv run python -c "import train, evaluate; print('imports_ok')"
 
 ## Known Limits
 
-- This is not the original large-scale paper training recipe.
+- This is still not the original large-scale TPU training environment from the paper.
 - Decoding is greedy CTC only.
 - The dataset loader is written for Common Voice-style manifests and should still be treated as a practical integration, not a benchmark-grade data pipeline.
 - Splitting is record-based rather than speaker-aware.
