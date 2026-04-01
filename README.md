@@ -11,6 +11,7 @@ This repository contains a standalone PyTorch implementation of the Squeezeforme
 - [metrics.py](/workspace/squeezeformer_pytorch/metrics.py): CER and WER through `jiwer`
 - [train.py](/workspace/train.py): training entrypoint
 - [train_lm.py](/workspace/train_lm.py): train a shallow-fusion n-gram LM from a text corpus or dataset transcripts
+- [extract_features.py](/workspace/extract_features.py): extract and cache frontend log-mel features without training
 - [export_cv22_corpus.py](/workspace/export_cv22_corpus.py): export normalized cv22 transcripts as an LM corpus
 - [evaluate.py](/workspace/evaluate.py): evaluation entrypoint
 - [benchmark.py](/workspace/benchmark.py): synthetic throughput, memory, and decode-speed benchmark
@@ -136,15 +137,15 @@ Relevant training flags:
 
 ## Feature Extraction
 
-This repo does not ship a separate offline feature-export command. Feature extraction happens
-through the dataset pipeline, and you can persist extracted log-mel tensors on disk with
-`--feature-cache-dir`.
+This repo supports both on-the-fly cache warming through training/evaluation and a standalone
+offline extractor via [extract_features.py](/workspace/extract_features.py).
 
 When caching is enabled:
 
 - training writes cached tensors under `FEATURE_CACHE_DIR/train`
 - validation writes cached tensors under `FEATURE_CACHE_DIR/validation`
 - evaluation writes cached tensors under `FEATURE_CACHE_DIR/<split>`
+- offline extraction writes cached tensors under `FEATURE_CACHE_DIR/<split>`
 - each cached file is a `.pt` tensor keyed by utterance id and frontend config hash
 
 Example: warm the train and validation feature cache during a short run
@@ -172,11 +173,22 @@ HF_TOKEN=... uv run python evaluate.py \
   --feature-cache-dir artifacts/feature_cache
 ```
 
+Example: extract and cache the train split directly, including for large local datasets,
+without first launching a train/eval job
+
+```bash
+HF_TOKEN=... uv run python extract_features.py \
+  --dataset-repo speech-uk/cv22 \
+  --split train \
+  --feature-cache-dir artifacts/feature_cache
+```
+
 Notes:
 
 - cache reuse is disabled for training samples when waveform augmentation is enabled
 - changing frontend settings such as `--preemphasis` or normalization flags produces a new cache key
 - the cache stores model inputs after featurization, not raw audio embeddings from the encoder
+- the offline extractor now streams split selection from dataset manifests instead of building the full record list in RAM first
 
 ## Training Features
 

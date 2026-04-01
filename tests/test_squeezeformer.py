@@ -19,6 +19,7 @@ from squeezeformer_pytorch.data import (
     MaxFramesBatchSampler,
     SpecAugment,
     iter_cv22_corpus_texts,
+    iter_cv22_records,
     load_cv22_corpus_texts,
     load_cv22_records,
     transcript_is_usable,
@@ -73,6 +74,20 @@ def test_temporal_unet_recovers_subsampled_resolution() -> None:
 
     assert output_lengths.item() == expected_subsampled_length(200)
     assert outputs.shape[1] == output_lengths.item()
+
+
+@torch.no_grad()
+def test_temporal_unet_handles_odd_length_sequences() -> None:
+    model = build_squeezeformer_encoder("sm")
+    model.eval()
+    lengths = torch.tensor([555], dtype=torch.int64)
+    features = torch.randn(1, 555, 80)
+
+    outputs, output_lengths = model(features, lengths)
+
+    assert output_lengths.item() == expected_subsampled_length(555)
+    assert outputs.shape[1] == output_lengths.item()
+    assert torch.isfinite(outputs).all()
 
 
 def test_variant_table_matches_paper() -> None:
@@ -177,6 +192,39 @@ def test_load_cv22_records_works_without_speaker_id_field(tmp_path: Path) -> Non
     assert len(records) == 2
     assert all(record.speaker_id is None for record in records)
     assert all(not record.has_speaker_id for record in records)
+
+
+def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tid\tspeaker_id\tduration\n"
+        "a.wav\tце тест\tutt0\tspk0\t0.3\n"
+        "b.wav\tмовна модель\tutt1\tspk1\t0.3\n"
+        "c.wav\tще приклад\tutt2\tspk2\t0.3\n",
+        encoding="utf-8",
+    )
+    streamed = list(
+        iter_cv22_records(
+            dataset_root=tmp_path,
+            split="train",
+            seed=13,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            max_samples=2,
+        )
+    )
+    loaded = load_cv22_records(
+        dataset_root=tmp_path,
+        split="train",
+        seed=13,
+        val_fraction=0.2,
+        test_fraction=0.2,
+        max_samples=2,
+    )
+    assert [record.utterance_id for record in streamed] == [
+        record.utterance_id for record in loaded
+    ]
+    assert len(streamed) <= 2
 
 
 def test_transcript_filter_rejects_pathological_rows() -> None:

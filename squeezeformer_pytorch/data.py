@@ -426,8 +426,42 @@ def load_cv22_records(
     max_transcript_chars: int = 400,
     max_symbol_ratio: float = 0.5,
 ) -> list[CVRecord]:
-    records: list[CVRecord] = []
+    records = list(
+        iter_cv22_records(
+            dataset_root=dataset_root,
+            split=split,
+            seed=seed,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+            max_samples=max_samples,
+            min_transcript_chars=min_transcript_chars,
+            max_transcript_chars=max_transcript_chars,
+            max_symbol_ratio=max_symbol_ratio,
+        )
+    )
+    if not records:
+        raise RuntimeError(f"Split '{split}' is empty after applying the current split fractions.")
+    return records
+
+
+def iter_cv22_records(
+    dataset_root: Path,
+    split: str,
+    seed: int,
+    val_fraction: float,
+    test_fraction: float,
+    max_samples: int | None = None,
+    min_transcript_chars: int = 1,
+    max_transcript_chars: int = 400,
+    max_symbol_ratio: float = 0.5,
+) -> Iterable[CVRecord]:
+    selected = 0
+    found_usable_record = False
+    scanned = 0
+    train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
+
     for row in iter_manifest_rows(dataset_root):
+        scanned += 1
         try:
             transcript = _extract_transcript(row)
             audio_path, audio_bytes = _resolve_audio(row, dataset_root=dataset_root)
@@ -440,7 +474,8 @@ def load_cv22_records(
             max_symbol_ratio=max_symbol_ratio,
         ):
             continue
-        utterance_id = str(row.get("id") or audio_path or len(records))
+        found_usable_record = True
+        utterance_id = str(row.get("id") or audio_path or scanned)
         raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
         speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
         duration_seconds = (
@@ -450,39 +485,32 @@ def load_cv22_records(
             estimated_frames = max(1, int((float(duration_seconds) * 16000) / 160))
         else:
             estimated_frames = 0
-        records.append(
-            CVRecord(
-                audio_path=audio_path,
-                audio_bytes=audio_bytes,
-                transcript=transcript,
-                utterance_id=utterance_id,
-                speaker_id=speaker_id,
-                has_speaker_id=speaker_id is not None,
-                estimated_frames=estimated_frames,
-            )
+        record = CVRecord(
+            audio_path=audio_path,
+            audio_bytes=audio_bytes,
+            transcript=transcript,
+            utterance_id=utterance_id,
+            speaker_id=speaker_id,
+            has_speaker_id=speaker_id is not None,
+            estimated_frames=estimated_frames,
         )
-
-    if not records:
-        raise RuntimeError("No usable records were found in the dataset manifests.")
-
-    selected: list[CVRecord] = []
-    for record in records:
         split_key = record.speaker_id or record.utterance_id
         score = _hash_to_unit_interval(split_key, seed=seed)
-        train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
-        if split == "train" and score < train_cutoff:
-            selected.append(record)
-        elif split == "validation" and train_cutoff <= score < train_cutoff + val_fraction:
-            selected.append(record)
-        elif split == "test" and score >= train_cutoff + val_fraction:
-            selected.append(record)
+        if split == "train" and score >= train_cutoff:
+            continue
+        if split == "validation" and not (
+            train_cutoff <= score < train_cutoff + val_fraction
+        ):
+            continue
+        if split == "test" and score < train_cutoff + val_fraction:
+            continue
+        yield record
+        selected += 1
+        if max_samples is not None and selected >= max_samples:
+            return
 
-    if max_samples is not None:
-        selected = selected[:max_samples]
-
-    if not selected:
-        raise RuntimeError(f"Split '{split}' is empty after applying the current split fractions.")
-    return selected
+    if not found_usable_record:
+        raise RuntimeError("No usable records were found in the dataset manifests.")
 
 
 def load_cv22_corpus_texts(
@@ -574,6 +602,19 @@ def iter_cv22_corpus_texts(
             break
 
 
+def feature_cache_path(
+    feature_cache_dir: str | Path | None,
+    utterance_id: str,
+    featurizer: AudioFeaturizer,
+) -> Path | None:
+    if feature_cache_dir is None:
+        return None
+    feature_cache_path = Path(feature_cache_dir)
+    feature_cache_path.mkdir(parents=True, exist_ok=True)
+    frontend_hash = hashlib.sha256(repr(featurizer.config_dict()).encode("utf-8")).hexdigest()[:12]
+    return feature_cache_path / f"{utterance_id}_{frontend_hash}.pt"
+
+
 class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
@@ -594,12 +635,7 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _feature_cache_path(self, record: CVRecord) -> Path | None:
-        if self.feature_cache_dir is None:
-            return None
-        frontend_hash = hashlib.sha256(
-            repr(self.featurizer.config_dict()).encode("utf-8")
-        ).hexdigest()[:12]
-        return self.feature_cache_dir / f"{record.utterance_id}_{frontend_hash}.pt"
+        return feature_cache_path(self.feature_cache_dir, record.utterance_id, self.featurizer)
 
     def __len__(self) -> int:
         return len(self.records)

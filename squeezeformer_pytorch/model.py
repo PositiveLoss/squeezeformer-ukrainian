@@ -423,7 +423,12 @@ class TimeRecoveryLayer(nn.Module):
 
     def forward(self, x: Tensor, skip: Tensor) -> Tensor:
         x = torch.repeat_interleave(x, repeats=self.stride, dim=1)
-        x = x[:, : skip.size(1), :]
+        target_length = skip.size(1)
+        if x.size(1) < target_length:
+            pad_length = target_length - x.size(1)
+            x = F.pad(x, (0, 0, 0, pad_length), mode="replicate")
+        else:
+            x = x[:, :target_length, :]
         return self.proj(x) + skip
 
 
