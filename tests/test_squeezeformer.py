@@ -16,9 +16,12 @@ from squeezeformer_pytorch import (
 from squeezeformer_pytorch.asr import load_lm_scorer
 from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
+    AudioFeaturizer,
+    CV22ASRDataset,
     CVRecord,
     MaxFramesBatchSampler,
     SpecAugment,
+    WaveformAugment,
     iter_cv22_corpus_texts,
     iter_cv22_records,
     load_cv22_corpus_texts,
@@ -409,6 +412,41 @@ def test_specaugment_preserves_shape() -> None:
     features = torch.ones(20, 8)
     augmented = augment(features)
     assert augmented.shape == features.shape
+
+
+def test_feature_cache_is_used_when_waveform_augment_is_effectively_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class DummyTokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [len(text)]
+
+    load_calls = 0
+
+    def fake_load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[torch.Tensor, int]:
+        nonlocal load_calls
+        load_calls += 1
+        return torch.ones(1, 320), 16_000
+
+    monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
+
+    dataset = CV22ASRDataset(
+        records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        tokenizer=DummyTokenizer(),
+        featurizer=AudioFeaturizer(),
+        waveform_augment=WaveformAugment(
+            speed_perturb_prob=0.0,
+            noise_prob=0.0,
+            reverb_prob=0.0,
+        ),
+        feature_cache_dir=tmp_path,
+    )
+
+    first_item = dataset[0]
+    second_item = dataset[0]
+
+    assert load_calls == 1
+    assert torch.equal(first_item["features"], second_item["features"])
 
 
 def test_muon_optimizer_partition_uses_encoder_hidden_weights() -> None:

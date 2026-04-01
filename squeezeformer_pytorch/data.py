@@ -158,6 +158,16 @@ class WaveformAugment(torch.nn.Module):
         self.reverb_decay_range = reverb_decay_range
         self.reverb_delay_ms_range = reverb_delay_ms_range
 
+    def is_enabled(self) -> bool:
+        return any(
+            probability > 0.0
+            for probability in (
+                self.speed_perturb_prob,
+                self.noise_prob,
+                self.reverb_prob,
+            )
+        )
+
     def forward(self, waveform: Tensor, sample_rate: int) -> tuple[Tensor, int]:
         augmented = waveform
         current_sample_rate = sample_rate
@@ -643,12 +653,15 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         cache_path = self._feature_cache_path(record)
-        use_cache = cache_path is not None and self.waveform_augment is None
+        waveform_augment_enabled = (
+            self.waveform_augment is not None and self.waveform_augment.is_enabled()
+        )
+        use_cache = cache_path is not None and not waveform_augment_enabled
         if use_cache and cache_path.exists():
             features = torch.load(cache_path, map_location="cpu")
         else:
             waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
-            if self.waveform_augment is not None:
+            if waveform_augment_enabled:
                 waveform, sample_rate = self.waveform_augment(waveform, sample_rate)
             features = self.featurizer(waveform, sample_rate)
             if use_cache:
