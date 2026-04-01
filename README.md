@@ -173,6 +173,7 @@ Common arguments:
 - `--trackio-project`
 - `--trackio-space-id`
 - `--log-every`
+- `--keep-top-k`
 - `--tokenizer`
 - `--spm-vocab-size`
 - `--spm-model-type`
@@ -181,6 +182,7 @@ Files written by training:
 
 - `checkpoint_last.pt`
 - `checkpoint_best.pt`
+- `checkpoints_topk/` containing the best `--keep-top-k` checkpoints by validation WER
 - `tokenizer.json`
 - `tokenizer.model` when `--tokenizer sentencepiece`
 - `train_summary.json`

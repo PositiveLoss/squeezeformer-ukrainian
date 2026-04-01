@@ -27,6 +27,49 @@ from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import squeezeformer_variant
 
 
+def _checkpoint_name(epoch: int, val_wer: float) -> str:
+    return f"checkpoint_epoch={epoch:04d}_valwer={val_wer:.6f}.pt"
+
+
+def _update_top_checkpoints(
+    output_dir: Path,
+    checkpoint: dict[str, object],
+    epoch: int,
+    val_wer: float,
+    keep_top_k: int,
+) -> None:
+    topk_dir = output_dir / "checkpoints_topk"
+    topk_dir.mkdir(parents=True, exist_ok=True)
+
+    metadata_path = topk_dir / "metadata.json"
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    else:
+        metadata = []
+
+    filename = _checkpoint_name(epoch=epoch, val_wer=val_wer)
+    checkpoint_path = topk_dir / filename
+    torch.save(checkpoint, checkpoint_path)
+
+    metadata.append(
+        {
+            "epoch": epoch,
+            "val_wer": val_wer,
+            "path": str(checkpoint_path.name),
+        }
+    )
+    metadata.sort(key=lambda item: (float(item["val_wer"]), int(item["epoch"])))
+
+    removed = metadata[keep_top_k:]
+    metadata = metadata[:keep_top_k]
+    for item in removed:
+        stale_path = topk_dir / str(item["path"])
+        if stale_path.exists():
+            stale_path.unlink()
+
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Squeezeformer CTC on speech-uk/cv22.")
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
@@ -48,6 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--keep-top-k", type=int, default=5)
     parser.add_argument(
         "--tokenizer",
         default="character",
@@ -230,9 +274,23 @@ def main() -> None:
         if val_metrics["wer"] < best_val_wer:
             best_val_wer = val_metrics["wer"]
             torch.save(checkpoint, output_dir / "checkpoint_best.pt")
+        _update_top_checkpoints(
+            output_dir=output_dir,
+            checkpoint=checkpoint,
+            epoch=epoch,
+            val_wer=val_metrics["wer"],
+            keep_top_k=args.keep_top_k,
+        )
 
     (output_dir / "train_summary.json").write_text(
-        json.dumps({"best_val_wer": best_val_wer, "variant": args.variant}, indent=2),
+        json.dumps(
+            {
+                "best_val_wer": best_val_wer,
+                "variant": args.variant,
+                "keep_top_k": args.keep_top_k,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     trackio.finish()
