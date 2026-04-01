@@ -7,6 +7,7 @@ import time
 import torch
 
 from squeezeformer_pytorch import SqueezeformerCTC, squeezeformer_variant, tokenizer_from_dict
+from squeezeformer_pytorch.checkpoints import load_checkpoint
 from train import (
     DecodeStrategy,
     DTypeChoice,
@@ -61,7 +62,7 @@ class _DummyTokenizer:
 
 def _load_model(args: argparse.Namespace) -> tuple[SqueezeformerCTC, object]:
     if args.checkpoint:
-        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
         tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
         config = squeezeformer_variant(args.variant)
         if "encoder_config" in checkpoint:

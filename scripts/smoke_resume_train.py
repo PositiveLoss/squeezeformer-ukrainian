@@ -10,6 +10,8 @@ from pathlib import Path
 
 import torch
 
+from squeezeformer_pytorch.checkpoints import load_checkpoint
+
 
 def _write_wave(path: Path, frequency: float, duration_seconds: float = 0.3) -> None:
     sample_rate = 16_000
@@ -108,11 +110,7 @@ def main() -> None:
 
         first_command = base_command + ["--epochs", "1"]
         _run_train(first_command, workdir=workspace)
-        first_checkpoint = torch.load(
-            output_dir / "checkpoint_last.pt",
-            map_location="cpu",
-            weights_only=False,
-        )
+        first_checkpoint = load_checkpoint(output_dir / "checkpoint_last.pt", map_location="cpu")
         if first_checkpoint["epoch"] != 1:
             raise RuntimeError("first smoke run did not finish epoch 1")
         first_global_step = int(first_checkpoint.get("global_step", 0))
@@ -126,11 +124,7 @@ def main() -> None:
             str(output_dir / "checkpoint_last.pt"),
         ]
         _run_train(second_command, workdir=workspace)
-        second_checkpoint = torch.load(
-            output_dir / "checkpoint_last.pt",
-            map_location="cpu",
-            weights_only=False,
-        )
+        second_checkpoint = load_checkpoint(output_dir / "checkpoint_last.pt", map_location="cpu")
         if second_checkpoint["epoch"] != 2:
             raise RuntimeError("resume smoke run did not finish epoch 2")
         if int(second_checkpoint.get("global_step", 0)) <= first_global_step:

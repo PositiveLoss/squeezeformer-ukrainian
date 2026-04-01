@@ -14,6 +14,7 @@ from squeezeformer_pytorch.asr import (
     load_lm_scorer,
     tokenizer_from_dict,
 )
+from squeezeformer_pytorch.checkpoints import load_checkpoint
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
@@ -99,7 +100,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
     tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
     encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
