@@ -510,9 +510,7 @@ def iter_cv22_records(
         score = _hash_to_unit_interval(split_key, seed=seed)
         if split == "train" and score >= train_cutoff:
             continue
-        if split == "validation" and not (
-            train_cutoff <= score < train_cutoff + val_fraction
-        ):
+        if split == "validation" and not (train_cutoff <= score < train_cutoff + val_fraction):
             continue
         if split == "test" and score < train_cutoff + val_fraction:
             continue

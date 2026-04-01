@@ -115,9 +115,10 @@ def test_variant_table_matches_paper() -> None:
 def test_stochastic_depth_enabled_for_larger_variants() -> None:
     assert squeezeformer_variant("xs").stochastic_depth_rate == 0.0
     assert squeezeformer_variant("m").stochastic_depth_rate > 0.0
-    assert squeezeformer_variant("l").stochastic_depth_rate > squeezeformer_variant(
-        "m"
-    ).stochastic_depth_rate
+    assert (
+        squeezeformer_variant("l").stochastic_depth_rate
+        > squeezeformer_variant("m").stochastic_depth_rate
+    )
 
 
 def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
@@ -163,9 +164,7 @@ def test_lm_scorer_factory_spec_loads_saved_model(tmp_path: Path) -> None:
     lm = NGramLanguageModel.train(["це тест", "це ще тест"], order=2, alpha=0.1)
     lm_path = tmp_path / "lm.json"
     lm.save(lm_path)
-    scorer = load_lm_scorer(
-        f"squeezeformer_pytorch.lm:load_saved_ngram_scorer:{lm_path}"
-    )
+    scorer = load_lm_scorer(f"squeezeformer_pytorch.lm:load_saved_ngram_scorer:{lm_path}")
     assert scorer is not None
     assert scorer("це") > scorer("цz")
 
@@ -173,10 +172,7 @@ def test_lm_scorer_factory_spec_loads_saved_model(tmp_path: Path) -> None:
 def test_load_cv22_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
-        "path\tsentence\n"
-        "a.wav\t Це   Тест \n"
-        "b.wav\tце тест\n"
-        "c.wav\tМовна   Модель\n",
+        "path\tsentence\na.wav\t Це   Тест \nb.wav\tце тест\nc.wav\tМовна   Модель\n",
         encoding="utf-8",
     )
     texts = load_cv22_corpus_texts(tmp_path, deduplicate=False)
@@ -199,9 +195,7 @@ def test_iter_cv22_corpus_texts_reads_root_level_parquet(tmp_path: Path) -> None
 def test_load_cv22_records_works_without_speaker_id_field(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
-        "path\tsentence\tid\tduration\n"
-        "a.wav\tце тест\tutt0\t0.3\n"
-        "b.wav\tмовна модель\tutt1\t0.3\n",
+        "path\tsentence\tid\tduration\na.wav\tце тест\tutt0\t0.3\nb.wav\tмовна модель\tutt1\t0.3\n",
         encoding="utf-8",
     )
     records = load_cv22_records(
@@ -425,7 +419,9 @@ def test_feature_cache_is_used_when_waveform_augment_is_effectively_disabled(
 
     load_calls = 0
 
-    def fake_load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[torch.Tensor, int]:
+    def fake_load_audio(
+        audio_path: str | None, audio_bytes: bytes | None
+    ) -> tuple[torch.Tensor, int]:
         nonlocal load_calls
         load_calls += 1
         return torch.ones(1, 320), 16_000
@@ -463,7 +459,9 @@ def test_create_dataloader_uses_fork_context_on_linux(monkeypatch: pytest.Monkey
             captured["dataset"] = dataset
             captured["kwargs"] = kwargs
 
-    monkeypatch.setattr("squeezeformer_pytorch.data.materialize_record_metadata", lambda *args, **kwargs: args[0])
+    monkeypatch.setattr(
+        "squeezeformer_pytorch.data.materialize_record_metadata", lambda *args, **kwargs: args[0]
+    )
     monkeypatch.setattr("squeezeformer_pytorch.data.DataLoader", FakeDataLoader)
 
     dataset = CV22ASRDataset(

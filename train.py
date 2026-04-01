@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import random
-import logging
 import sys
 from collections import defaultdict
 from contextlib import nullcontext
@@ -109,9 +109,7 @@ def _parse_xla_device_argument(device: str) -> int | None:
 
 def _is_xla_device_argument(device: str) -> bool:
     normalized = device.strip().lower()
-    return normalized == "xla" or normalized == "tpu" or normalized.startswith(
-        ("xla:", "tpu:")
-    )
+    return normalized == "xla" or normalized == "tpu" or normalized.startswith(("xla:", "tpu:"))
 
 
 def _validate_device_argument(device: str) -> str:
@@ -420,9 +418,7 @@ def _average_topk_checkpoints(output_dir: Path) -> Path | None:
 def _build_split_audit(split_records: dict[str, list]) -> dict[str, object]:
     speaker_sets = {
         split_name: {
-            record.speaker_id
-            for record in records
-            if record.has_speaker_id and record.speaker_id
+            record.speaker_id for record in records if record.has_speaker_id and record.speaker_id
         }
         for split_name, records in split_records.items()
     }
@@ -861,9 +857,7 @@ def _resolve_scheduler_kwargs(args: argparse.Namespace, optimizer_name: str) -> 
         }
     return {
         "warmup_epochs": (
-            args.adamw_warmup_epochs
-            if args.adamw_warmup_epochs is not None
-            else args.warmup_epochs
+            args.adamw_warmup_epochs if args.adamw_warmup_epochs is not None else args.warmup_epochs
         ),
         "hold_epochs": (
             args.adamw_hold_epochs if args.adamw_hold_epochs is not None else args.hold_epochs
@@ -923,9 +917,7 @@ def _build_checkpoint(
 def main() -> None:
     args = parse_args()
     if (args.adaptive_batch_unit is None) != (args.adaptive_batch_budget is None):
-        raise ValueError(
-            "--adaptive-batch-unit and --adaptive-batch-budget must be set together."
-        )
+        raise ValueError("--adaptive-batch-unit and --adaptive-batch-budget must be set together.")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     if args.distributed and not distributed:
@@ -1289,9 +1281,7 @@ def main() -> None:
                         global_step,
                         float(loss.item()),
                         grad_norm,
-                        " ".join(
-                            f"{name}={value:.6g}" for name, value in learning_rates.items()
-                        ),
+                        " ".join(f"{name}={value:.6g}" for name, value in learning_rates.items()),
                     )
                     trackio.log(
                         {
@@ -1307,7 +1297,9 @@ def main() -> None:
         train_loss = running_loss / max(1, len(train_loader))
         if is_main_process:
             ema_backup = ema.apply_to(model) if ema is not None else None
-            logger.info("epoch %s training complete train_loss=%.4f, starting validation", epoch, train_loss)
+            logger.info(
+                "epoch %s training complete train_loss=%.4f, starting validation", epoch, train_loss
+            )
             validation = evaluate(
                 model,
                 val_loader,

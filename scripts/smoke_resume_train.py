@@ -46,9 +46,7 @@ def _build_local_dataset(root: Path) -> Path:
             transcript = transcripts[(speaker_index + variant_index) % len(transcripts)]
             clip_path = clips_dir / clip_name
             _write_wave(clip_path, frequency=220 + 15 * utterance_index)
-            rows.append(
-                f"clips/{clip_name}\t{transcript}\tspeaker_{speaker_index:02d}\t0.3"
-            )
+            rows.append(f"clips/{clip_name}\t{transcript}\tspeaker_{speaker_index:02d}\t0.3")
             utterance_index += 1
 
     (dataset_dir / "train.tsv").write_text("\n".join(rows), encoding="utf-8")

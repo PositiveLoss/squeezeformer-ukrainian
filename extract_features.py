@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import torch
@@ -204,6 +204,7 @@ def main() -> None:
                 raise RuntimeError("No records were selected for feature extraction.")
         else:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
+
                 def submit_task(record):
                     return extract_record_features(
                         record,

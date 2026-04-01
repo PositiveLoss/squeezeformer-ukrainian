@@ -52,8 +52,7 @@ class NGramLanguageModel:
             vocabulary=sorted(vocabulary) + ["</s>"],
             context_totals=dict(context_totals),
             next_token_counts={
-                context: dict(counter)
-                for context, counter in next_token_counts.items()
+                context: dict(counter) for context, counter in next_token_counts.items()
             },
         )
 
