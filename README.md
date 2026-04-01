@@ -582,6 +582,12 @@ Local dashboard:
 trackio show --project "squeezeformer-cv22"
 ```
 
+Shared dashboard:
+
+```bash
+GRADIO_SHARE=True uv run python -c "import trackio; trackio.show()"
+```
+
 To sync logs to a Hugging Face Space, pass:
 
 - `--trackio-space-id username/space-name`
