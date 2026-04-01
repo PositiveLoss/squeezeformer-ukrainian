@@ -13,13 +13,20 @@ from squeezeformer_pytorch import (
 )
 from squeezeformer_pytorch.asr import load_lm_scorer
 from squeezeformer_pytorch.data import (
+    AdaptiveBatchSampler,
     CV22Record,
     MaxFramesBatchSampler,
     SpecAugment,
     load_cv22_corpus_texts,
     transcript_is_usable,
 )
-from train import OptimizerChoice, _variant_defaults, build_optimizer, build_paper_scheduler
+from train import (
+    ExponentialMovingAverage,
+    OptimizerChoice,
+    _variant_defaults,
+    build_optimizer,
+    build_paper_scheduler,
+)
 
 
 def expected_subsampled_length(length: int) -> int:
@@ -155,6 +162,32 @@ def test_max_frames_batch_sampler_respects_frame_budget() -> None:
     for batch in batches:
         max_frames = max(records[index].estimated_frames for index in batch)
         assert len(batch) * max_frames <= 90
+
+
+def test_adaptive_batch_sampler_respects_token_budget() -> None:
+    records = [
+        CV22Record(None, None, "aaa", "0", "s0", estimated_frames=20),
+        CV22Record(None, None, "bbbb", "1", "s1", estimated_frames=25),
+        CV22Record(None, None, "cc", "2", "s2", estimated_frames=40),
+        CV22Record(None, None, "dddd", "3", "s3", estimated_frames=45),
+    ]
+    sampler = AdaptiveBatchSampler(records, target_batch_units=6, unit="tokens", shuffle=False)
+    batches = list(iter(sampler))
+    assert batches
+    for batch in batches:
+        total_tokens = sum(len(records[index].transcript) for index in batch)
+        assert total_tokens <= 6
+
+
+def test_ema_decay_warmup_increases_toward_target() -> None:
+    model = torch.nn.Linear(4, 4)
+    ema = ExponentialMovingAverage(model, decay=0.9, warmup_steps=4)
+    observed = []
+    for _ in range(4):
+        ema.update(model)
+        observed.append(ema.current_decay())
+    assert observed[0] < observed[-1]
+    assert observed[-1] == 0.9
 
 
 def test_time_reduction_kernel_matches_paper() -> None:

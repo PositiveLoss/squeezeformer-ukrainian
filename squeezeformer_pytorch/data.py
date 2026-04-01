@@ -595,6 +595,61 @@ class MaxFramesBatchSampler(BatchSampler):
         return len(self._batches)
 
 
+class AdaptiveBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        records: list[CV22Record],
+        target_batch_units: int,
+        unit: str,
+        shuffle: bool,
+    ) -> None:
+        if unit not in {"frames", "tokens"}:
+            raise ValueError("unit must be one of {'frames', 'tokens'}")
+        self.records = records
+        self.target_batch_units = target_batch_units
+        self.unit = unit
+        self.shuffle = shuffle
+        self._batches = self._build_batches()
+
+    def _record_units(self, record: CV22Record) -> int:
+        if self.unit == "frames":
+            return max(1, record.estimated_frames)
+        return max(1, len(record.transcript))
+
+    def _build_batches(self) -> list[list[int]]:
+        sorted_indices = sorted(
+            range(len(self.records)),
+            key=lambda index: (
+                self.records[index].estimated_frames,
+                len(self.records[index].transcript),
+            ),
+        )
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_units = 0
+        for index in sorted_indices:
+            units = self._record_units(self.records[index])
+            if current_batch and current_units + units > self.target_batch_units:
+                batches.append(current_batch)
+                current_batch = []
+                current_units = 0
+            current_batch.append(index)
+            current_units += units
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def __iter__(self):
+        batches = list(self._batches)
+        if self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in order]
+        yield from batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
 def _record_is_valid(record: CV22Record) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
@@ -691,6 +746,8 @@ def create_dataloader(
     num_workers: int,
     bucket_by_length: bool = False,
     max_batch_frames: int | None = None,
+    adaptive_batch_unit: str | None = None,
+    adaptive_batch_budget: int | None = None,
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
@@ -709,6 +766,14 @@ def create_dataloader(
     }
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    if adaptive_batch_unit is not None and adaptive_batch_budget is not None:
+        batch_sampler = AdaptiveBatchSampler(
+            dataset.records,
+            target_batch_units=adaptive_batch_budget,
+            unit=adaptive_batch_unit,
+            shuffle=shuffle,
+        )
+        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     if max_batch_frames is not None:
         batch_sampler = MaxFramesBatchSampler(
             dataset.records,

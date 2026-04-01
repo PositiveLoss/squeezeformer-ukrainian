@@ -63,6 +63,11 @@ class DecodeStrategy(StrEnum):
     BEAM = "beam"
 
 
+class AdaptiveBatchUnit(StrEnum):
+    FRAMES = "frames"
+    TOKENS = "tokens"
+
+
 def _variant_defaults(variant: str) -> SchedulerDefaults:
     if variant in {"xs", "s", "sm"}:
         return SchedulerDefaults(peak_lr=2e-3, num_time_masks=5)
@@ -165,8 +170,10 @@ def build_optimizer(
 
 
 class ExponentialMovingAverage:
-    def __init__(self, model: nn.Module, decay: float) -> None:
-        self.decay = decay
+    def __init__(self, model: nn.Module, decay: float, warmup_steps: int = 0) -> None:
+        self.target_decay = decay
+        self.warmup_steps = warmup_steps
+        self.num_updates = 0
         self.shadow = {
             name: parameter.detach().clone()
             for name, parameter in model.named_parameters()
@@ -174,18 +181,31 @@ class ExponentialMovingAverage:
         }
 
     def update(self, model: nn.Module) -> None:
+        self.num_updates += 1
+        decay = self.current_decay()
         with torch.no_grad():
             for name, parameter in model.named_parameters():
                 if name in self.shadow:
-                    self.shadow[name].mul_(self.decay).add_(
-                        parameter.detach(), alpha=1 - self.decay
-                    )
+                    self.shadow[name].mul_(decay).add_(parameter.detach(), alpha=1 - decay)
+
+    def current_decay(self) -> float:
+        if self.warmup_steps <= 0:
+            return self.target_decay
+        progress = min(1.0, self.num_updates / self.warmup_steps)
+        return self.target_decay * progress
 
     def state_dict(self) -> dict[str, object]:
-        return {"decay": self.decay, "shadow": self.shadow}
+        return {
+            "target_decay": self.target_decay,
+            "warmup_steps": self.warmup_steps,
+            "num_updates": self.num_updates,
+            "shadow": self.shadow,
+        }
 
     def load_state_dict(self, state_dict: dict[str, object]) -> None:
-        self.decay = float(state_dict["decay"])
+        self.target_decay = float(state_dict.get("target_decay", state_dict.get("decay", 0.0)))
+        self.warmup_steps = int(state_dict.get("warmup_steps", 0))
+        self.num_updates = int(state_dict.get("num_updates", 0))
         self.shadow = {name: tensor.clone() for name, tensor in state_dict["shadow"].items()}
 
     def apply_to(self, model: nn.Module) -> dict[str, Tensor]:
@@ -281,6 +301,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adamw-learning-rate", type=float, default=None)
     parser.add_argument("--muon-weight-decay", type=float, default=None)
     parser.add_argument("--adamw-weight-decay", type=float, default=None)
+    parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=13)
@@ -293,6 +314,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-symbol-ratio", type=float, default=0.5)
     parser.add_argument("--feature-cache-dir", default=None)
     parser.add_argument("--max-batch-frames", type=int, default=None)
+    parser.add_argument(
+        "--adaptive-batch-unit",
+        type=AdaptiveBatchUnit,
+        choices=list(AdaptiveBatchUnit),
+        default=None,
+    )
+    parser.add_argument("--adaptive-batch-budget", type=int, default=None)
     parser.add_argument(
         "--bucket-by-length",
         action=argparse.BooleanOptionalAction,
@@ -348,6 +376,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hold-epochs", type=int, default=160)
     parser.add_argument("--decay-exponent", type=float, default=1.0)
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--ema-warmup-steps", type=int, default=0)
+    parser.add_argument("--muon-warmup-epochs", type=int, default=None)
+    parser.add_argument("--muon-hold-epochs", type=int, default=None)
+    parser.add_argument("--muon-decay-exponent", type=float, default=None)
+    parser.add_argument("--adamw-warmup-epochs", type=int, default=None)
+    parser.add_argument("--adamw-hold-epochs", type=int, default=None)
+    parser.add_argument("--adamw-decay-exponent", type=float, default=None)
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
@@ -555,6 +590,40 @@ def _resolve_float_tuple(values: str) -> tuple[float, ...]:
     return parsed
 
 
+def _resolve_scheduler_kwargs(args: argparse.Namespace, optimizer_name: str) -> dict[str, float]:
+    if optimizer_name == "muon":
+        return {
+            "warmup_epochs": (
+                args.muon_warmup_epochs
+                if args.muon_warmup_epochs is not None
+                else args.warmup_epochs
+            ),
+            "hold_epochs": (
+                args.muon_hold_epochs if args.muon_hold_epochs is not None else args.hold_epochs
+            ),
+            "decay_exponent": (
+                args.muon_decay_exponent
+                if args.muon_decay_exponent is not None
+                else args.decay_exponent
+            ),
+        }
+    return {
+        "warmup_epochs": (
+            args.adamw_warmup_epochs
+            if args.adamw_warmup_epochs is not None
+            else args.warmup_epochs
+        ),
+        "hold_epochs": (
+            args.adamw_hold_epochs if args.adamw_hold_epochs is not None else args.hold_epochs
+        ),
+        "decay_exponent": (
+            args.adamw_decay_exponent
+            if args.adamw_decay_exponent is not None
+            else args.decay_exponent
+        ),
+    }
+
+
 def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, str]:
     payload: dict[str, str] = {}
     for index, example in enumerate(examples):
@@ -600,6 +669,10 @@ def _build_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    if (args.adaptive_batch_unit is None) != (args.adaptive_batch_budget is None):
+        raise ValueError(
+            "--adaptive-batch-unit and --adaptive-batch-budget must be set together."
+        )
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +786,8 @@ def main() -> None:
         num_workers=args.num_workers,
         bucket_by_length=args.bucket_by_length,
         max_batch_frames=args.max_batch_frames,
+        adaptive_batch_unit=args.adaptive_batch_unit,
+        adaptive_batch_budget=args.adaptive_batch_budget,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
@@ -725,6 +800,8 @@ def main() -> None:
         num_workers=args.num_workers,
         bucket_by_length=args.bucket_by_length,
         max_batch_frames=args.max_batch_frames,
+        adaptive_batch_unit=args.adaptive_batch_unit,
+        adaptive_batch_budget=args.adaptive_batch_budget,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
@@ -773,18 +850,25 @@ def main() -> None:
         muon_weight_decay=muon_weight_decay,
         adamw_weight_decay=adamw_weight_decay,
     )
-    schedulers = [
-        build_paper_scheduler(
-            optimizer,
-            steps_per_epoch=optimizer_steps_per_epoch,
-            warmup_epochs=args.warmup_epochs,
-            hold_epochs=args.hold_epochs,
-            decay_exponent=args.decay_exponent,
+    schedulers = []
+    for optimizer, optimizer_group_name in zip(optimizers, optimizer_names, strict=True):
+        schedulers.append(
+            build_paper_scheduler(
+                optimizer,
+                steps_per_epoch=optimizer_steps_per_epoch,
+                **_resolve_scheduler_kwargs(args, optimizer_group_name),
+            )
         )
-        for optimizer in optimizers
-    ]
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
-    ema = ExponentialMovingAverage(model, decay=args.ema_decay) if args.ema_decay > 0 else None
+    ema = (
+        ExponentialMovingAverage(
+            model,
+            decay=args.ema_decay,
+            warmup_steps=args.ema_warmup_steps,
+        )
+        if args.ema_decay > 0
+        else None
+    )
     start_epoch = 1
     global_step = 0
     best_val_wer = float("inf")
@@ -841,6 +925,14 @@ def main() -> None:
                 train_loader
             )
             if should_step:
+                if args.grad_clip_norm > 0:
+                    for optimizer in optimizers:
+                        scaler.unscale_(optimizer)
+                    grad_norm = float(
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm)
+                    )
+                else:
+                    grad_norm = 0.0
                 for optimizer in optimizers:
                     scaler.step(optimizer)
                 scaler.update()
@@ -853,13 +945,18 @@ def main() -> None:
                     ema.update(model)
 
                 if global_step % args.log_every == 0:
+                    learning_rates = {
+                        f"learning_rate_{name}": optimizer.param_groups[0]["lr"]
+                        for name, optimizer in zip(optimizer_names, optimizers, strict=True)
+                    }
                     trackio.log(
                         {
                             "epoch": epoch,
                             "global_step": global_step,
                             "train_loss_step": float(loss.item()),
-                            "learning_rate_muon": optimizers[0].param_groups[0]["lr"],
-                            "learning_rate_aux": optimizers[-1].param_groups[0]["lr"],
+                            "grad_norm": grad_norm,
+                            "ema_decay": ema.current_decay() if ema is not None else 0.0,
+                            **learning_rates,
                         }
                     )
 

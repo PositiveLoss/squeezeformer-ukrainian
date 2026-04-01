@@ -135,16 +135,20 @@ Relevant training flags:
 - SentencePiece-128 by default
 - Muon by default, with AdamW on auxiliary parameter groups
 - separate Muon vs AdamW LR and weight-decay controls
+- separate Muon vs AdamW scheduler overrides
 - no-decay filtering for biases, norms, and scale parameters
 - paper-style warmup, hold, and inverse-power decay scheduling
+- gradient clipping
 - gradient accumulation
 - EMA checkpoints and EMA-based validation
+- EMA warmup
 - optional `torch.compile`
 - optional activation checkpointing inside encoder blocks
 - feature caching on disk
 - up-front audio metadata and frame-count materialization
 - length bucketing
 - optional max-frames batching instead of fixed utterance-count batches
+- adaptive batch scaling by effective frames or transcript tokens
 - dataloader tuning knobs for `pin_memory`, `persistent_workers`, and `prefetch_factor`
 - optional audio prevalidation before training
 - transcript filtering for too-short, too-long, empty, and symbol-heavy rows
@@ -221,7 +225,20 @@ Additional data-quality and batching controls:
 - `--max-transcript-chars`
 - `--max-symbol-ratio`
 - `--max-batch-frames`
+- `--adaptive-batch-unit frames|tokens`
+- `--adaptive-batch-budget`
 - `--metadata-workers`
+
+Additional optimization controls:
+
+- `--grad-clip-norm`
+- `--ema-warmup-steps`
+- `--muon-warmup-epochs`
+- `--muon-hold-epochs`
+- `--muon-decay-exponent`
+- `--adamw-warmup-epochs`
+- `--adamw-hold-epochs`
+- `--adamw-decay-exponent`
 
 Resume training:
 
