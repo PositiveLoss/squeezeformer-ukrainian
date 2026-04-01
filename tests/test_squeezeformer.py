@@ -14,7 +14,7 @@ from squeezeformer_pytorch import (
 from squeezeformer_pytorch.asr import load_lm_scorer
 from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
-    CV22Record,
+    CVRecord,
     MaxFramesBatchSampler,
     SpecAugment,
     load_cv22_corpus_texts,
@@ -181,10 +181,10 @@ def test_transcript_filter_rejects_pathological_rows() -> None:
 
 def test_max_frames_batch_sampler_respects_frame_budget() -> None:
     records = [
-        CV22Record(None, None, "a", "0", estimated_frames=20, speaker_id="s0", has_speaker_id=True),
-        CV22Record(None, None, "b", "1", estimated_frames=25, speaker_id="s1", has_speaker_id=True),
-        CV22Record(None, None, "c", "2", estimated_frames=40, speaker_id="s2", has_speaker_id=True),
-        CV22Record(None, None, "d", "3", estimated_frames=45, speaker_id="s3", has_speaker_id=True),
+        CVRecord(None, None, "a", "0", estimated_frames=20, speaker_id="s0", has_speaker_id=True),
+        CVRecord(None, None, "b", "1", estimated_frames=25, speaker_id="s1", has_speaker_id=True),
+        CVRecord(None, None, "c", "2", estimated_frames=40, speaker_id="s2", has_speaker_id=True),
+        CVRecord(None, None, "d", "3", estimated_frames=45, speaker_id="s3", has_speaker_id=True),
     ]
     sampler = MaxFramesBatchSampler(records, max_batch_frames=90, shuffle=False)
     batches = list(iter(sampler))
@@ -196,7 +196,7 @@ def test_max_frames_batch_sampler_respects_frame_budget() -> None:
 
 def test_adaptive_batch_sampler_respects_token_budget() -> None:
     records = [
-        CV22Record(
+        CVRecord(
             None,
             None,
             "aaa",
@@ -205,7 +205,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s0",
             has_speaker_id=True,
         ),
-        CV22Record(
+        CVRecord(
             None,
             None,
             "bbbb",
@@ -214,7 +214,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s1",
             has_speaker_id=True,
         ),
-        CV22Record(
+        CVRecord(
             None,
             None,
             "cc",
@@ -223,7 +223,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s2",
             has_speaker_id=True,
         ),
-        CV22Record(
+        CVRecord(
             None,
             None,
             "dddd",

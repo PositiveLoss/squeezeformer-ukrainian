@@ -8,6 +8,9 @@ dependencies = [
     "jiwer>=4.0.0",
     "polars>=1.30.0",
     "sentencepiece>=0.2.0",
+    "torch>=2.11.0",
+    "torchaudio>=2.11.0",
+    "torchcodec>=0.11.0",
     "trackio>=0.20.2",
 ]
 
@@ -20,3 +23,9 @@ target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.8",
+]

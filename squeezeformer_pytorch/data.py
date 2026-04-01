@@ -24,7 +24,7 @@ AUDIO_COLUMNS = ("path", "audio")
 
 
 @dataclass(frozen=True)
-class CV22Record:
+class CVRecord:
     audio_path: str | None
     audio_bytes: bytes | None
     transcript: str
@@ -381,13 +381,13 @@ def load_cv22_records(
     min_transcript_chars: int = 1,
     max_transcript_chars: int = 400,
     max_symbol_ratio: float = 0.5,
-) -> list[CV22Record]:
+) -> list[CVRecord]:
     frames = _collect_manifest_frames(dataset_root)
     if not frames:
         raise FileNotFoundError(f"No TSV or Parquet manifest files found under {dataset_root}.")
 
     frame = pl.concat(frames, how="diagonal_relaxed").collect()
-    records: list[CV22Record] = []
+    records: list[CVRecord] = []
     for row in frame.iter_rows(named=True):
         try:
             transcript = _extract_transcript(row)
@@ -412,7 +412,7 @@ def load_cv22_records(
         else:
             estimated_frames = 0
         records.append(
-            CV22Record(
+            CVRecord(
                 audio_path=audio_path,
                 audio_bytes=audio_bytes,
                 transcript=transcript,
@@ -426,7 +426,7 @@ def load_cv22_records(
     if not records:
         raise RuntimeError("No usable records were found in the dataset manifests.")
 
-    selected: list[CV22Record] = []
+    selected: list[CVRecord] = []
     for record in records:
         split_key = record.speaker_id or record.utterance_id
         score = _hash_to_unit_interval(split_key, seed=seed)
@@ -479,7 +479,7 @@ def load_cv22_corpus_texts(
 class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
-        records: list[CV22Record],
+        records: list[CVRecord],
         tokenizer: Tokenizer,
         featurizer: AudioFeaturizer,
         specaugment: SpecAugment | None = None,
@@ -495,7 +495,7 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
         if self.feature_cache_dir is not None:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _feature_cache_path(self, record: CV22Record) -> Path | None:
+    def _feature_cache_path(self, record: CVRecord) -> Path | None:
         if self.feature_cache_dir is None:
             return None
         frontend_hash = hashlib.sha256(
@@ -535,7 +535,7 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
 
 
 class LengthBucketBatchSampler(BatchSampler):
-    def __init__(self, records: list[CV22Record], batch_size: int, shuffle: bool) -> None:
+    def __init__(self, records: list[CVRecord], batch_size: int, shuffle: bool) -> None:
         self.records = records
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -560,7 +560,7 @@ class LengthBucketBatchSampler(BatchSampler):
 class MaxFramesBatchSampler(BatchSampler):
     def __init__(
         self,
-        records: list[CV22Record],
+        records: list[CVRecord],
         max_batch_frames: int,
         shuffle: bool,
     ) -> None:
@@ -604,7 +604,7 @@ class MaxFramesBatchSampler(BatchSampler):
 class AdaptiveBatchSampler(BatchSampler):
     def __init__(
         self,
-        records: list[CV22Record],
+        records: list[CVRecord],
         target_batch_units: int,
         unit: str,
         shuffle: bool,
@@ -617,7 +617,7 @@ class AdaptiveBatchSampler(BatchSampler):
         self.shuffle = shuffle
         self._batches = self._build_batches()
 
-    def _record_units(self, record: CV22Record) -> int:
+    def _record_units(self, record: CVRecord) -> int:
         if self.unit == "frames":
             return max(1, record.estimated_frames)
         return max(1, len(record.transcript))
@@ -656,7 +656,7 @@ class AdaptiveBatchSampler(BatchSampler):
         return len(self._batches)
 
 
-def _record_is_valid(record: CV22Record) -> bool:
+def _record_is_valid(record: CVRecord) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
             try:
@@ -678,9 +678,9 @@ def _record_is_valid(record: CV22Record) -> bool:
 
 
 def prevalidate_records(
-    records: list[CV22Record],
+    records: list[CVRecord],
     num_workers: int = 4,
-) -> list[CV22Record]:
+) -> list[CVRecord]:
     if num_workers <= 1:
         return [record for record in records if _record_is_valid(record)]
 
@@ -689,7 +689,7 @@ def prevalidate_records(
     return [record for record, is_valid in zip(records, validity, strict=True) if is_valid]
 
 
-def estimate_record_frames(record: CV22Record, hop_length: int) -> int:
+def estimate_record_frames(record: CVRecord, hop_length: int) -> int:
     if record.estimated_frames > 0 and record.num_samples > 0 and record.sample_rate > 0:
         return record.estimated_frames
     num_samples, sample_rate = probe_audio_metadata(record.audio_path, record.audio_bytes)
@@ -703,11 +703,11 @@ def estimate_record_frames(record: CV22Record, hop_length: int) -> int:
 
 
 def materialize_record_metadata(
-    records: list[CV22Record],
+    records: list[CVRecord],
     hop_length: int,
     num_workers: int = 4,
-) -> list[CV22Record]:
-    def populate(record: CV22Record) -> CV22Record:
+) -> list[CVRecord]:
+    def populate(record: CVRecord) -> CVRecord:
         estimate_record_frames(record, hop_length=hop_length)
         return record
 
