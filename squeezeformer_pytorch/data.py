@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,12 +197,54 @@ def _resolve_audio(row: dict[str, Any], dataset_root: Path) -> tuple[str | None,
     raise KeyError(f"No audio source found in row. Tried {AUDIO_COLUMNS}.")
 
 
+def _load_wave_from_stdlib(source: str | io.BytesIO) -> tuple[Tensor, int]:
+    with wave.open(str(source) if isinstance(source, str) else source, "rb") as handle:
+        sample_rate = handle.getframerate()
+        num_channels = handle.getnchannels()
+        sample_width = handle.getsampwidth()
+        frames = handle.readframes(handle.getnframes())
+
+    if sample_width == 1:
+        tensor = torch.frombuffer(bytearray(frames), dtype=torch.uint8).to(torch.float32)
+        tensor = (tensor - 128.0) / 128.0
+    elif sample_width == 2:
+        tensor = torch.frombuffer(bytearray(frames), dtype=torch.int16).to(torch.float32) / 32768.0
+    elif sample_width == 4:
+        tensor = (
+            torch.frombuffer(bytearray(frames), dtype=torch.int32).to(torch.float32) / 2147483648.0
+        )
+    else:
+        raise ValueError(f"unsupported WAV sample width: {sample_width}")
+
+    waveform = tensor.view(-1, num_channels).transpose(0, 1).contiguous()
+    return waveform, sample_rate
+
+
+def load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[Tensor, int]:
+    try:
+        if audio_path is not None and Path(audio_path).exists():
+            return torchaudio.load(audio_path)
+        if audio_bytes is not None:
+            return torchaudio.load(io.BytesIO(audio_bytes))
+    except ImportError:
+        pass
+
+    if audio_path is not None and Path(audio_path).exists():
+        return _load_wave_from_stdlib(audio_path)
+    if audio_bytes is not None:
+        return _load_wave_from_stdlib(io.BytesIO(audio_bytes))
+    raise FileNotFoundError("Audio source is not available.")
+
+
 def download_cv22_dataset(
     repo_id: str,
     token: str | None,
     cache_dir: str | None = None,
     force_download: bool = False,
 ) -> Path:
+    local_path = Path(repo_id)
+    if local_path.exists():
+        return local_path.resolve()
     local_path = snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
@@ -274,6 +317,36 @@ def load_cv22_records(
     return selected
 
 
+def load_cv22_corpus_texts(
+    dataset_root: Path,
+    deduplicate: bool = False,
+    max_samples: int | None = None,
+) -> list[str]:
+    frames = _collect_manifest_frames(dataset_root)
+    if not frames:
+        raise FileNotFoundError(f"No TSV or Parquet manifest files found under {dataset_root}.")
+
+    frame = pl.concat(frames, how="diagonal_relaxed").collect()
+    texts: list[str] = []
+    seen: set[str] = set()
+    for row in frame.iter_rows(named=True):
+        try:
+            transcript = _extract_transcript(row)
+        except KeyError:
+            continue
+        if deduplicate:
+            if transcript in seen:
+                continue
+            seen.add(transcript)
+        texts.append(transcript)
+        if max_samples is not None and len(texts) >= max_samples:
+            break
+
+    if not texts:
+        raise RuntimeError("No usable transcripts were found in the dataset manifests.")
+    return texts
+
+
 class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
@@ -308,12 +381,7 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
         if cache_path is not None and cache_path.exists():
             features = torch.load(cache_path, map_location="cpu")
         else:
-            if record.audio_path is not None and Path(record.audio_path).exists():
-                waveform, sample_rate = torchaudio.load(record.audio_path)
-            elif record.audio_bytes is not None:
-                waveform, sample_rate = torchaudio.load(io.BytesIO(record.audio_bytes))
-            else:
-                raise FileNotFoundError(f"Audio for record {record.utterance_id} is not available.")
+            waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
             features = self.featurizer(waveform, sample_rate)
             if cache_path is not None:
                 torch.save(features, cache_path)
@@ -356,11 +424,17 @@ class LengthBucketBatchSampler(BatchSampler):
 def _record_is_valid(record: CV22Record) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
-            torchaudio.info(record.audio_path)
-            return True
+            try:
+                torchaudio.info(record.audio_path)
+            except ImportError:
+                _load_wave_from_stdlib(record.audio_path)
+                return True
         if record.audio_bytes is not None:
-            torchaudio.info(io.BytesIO(record.audio_bytes))
-            return True
+            try:
+                torchaudio.info(io.BytesIO(record.audio_bytes))
+            except ImportError:
+                _load_wave_from_stdlib(io.BytesIO(record.audio_bytes))
+                return True
     except Exception:
         return False
     return False

@@ -5,7 +5,7 @@ import json
 import os
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
@@ -32,6 +32,7 @@ from squeezeformer_pytorch.data import (
     load_cv22_records,
     prevalidate_records,
 )
+from squeezeformer_pytorch.lm import NGramLanguageModel
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import SqueezeformerConfig, squeezeformer_variant
 
@@ -381,6 +382,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beam-size", type=int, default=8)
     parser.add_argument("--lm-scorer", default=None)
     parser.add_argument("--lm-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--fit-shallow-fusion-lm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--shallow-fusion-lm-order", type=int, default=3)
+    parser.add_argument("--shallow-fusion-lm-alpha", type=float, default=0.1)
     parser.add_argument("--example-limit", type=int, default=5)
     return parser.parse_args()
 
@@ -617,6 +625,16 @@ def main() -> None:
         tokenizer = CharacterTokenizer.build(record.transcript for record in train_records)
     tokenizer_path = output_dir / "tokenizer.json"
     tokenizer.save(tokenizer_path)
+    if args.fit_shallow_fusion_lm:
+        shallow_fusion_lm = NGramLanguageModel.train(
+            (record.transcript for record in train_records),
+            order=args.shallow_fusion_lm_order,
+            alpha=args.shallow_fusion_lm_alpha,
+        )
+        shallow_fusion_lm_path = output_dir / "shallow_fusion_lm.json"
+        shallow_fusion_lm.save(shallow_fusion_lm_path)
+        if lm_scorer is None:
+            lm_scorer = shallow_fusion_lm.score_extension
 
     featurizer = AudioFeaturizer(
         preemphasis=args.preemphasis,
@@ -676,9 +694,11 @@ def main() -> None:
         else squeezeformer_variant(args.variant)
     )
     if checkpoint is None:
-        encoder_config = deepcopy(encoder_config)
-        encoder_config.block_pattern = _resolve_block_pattern(args.block_pattern)
-        encoder_config.activation_checkpointing = args.activation_checkpointing
+        encoder_config = replace(
+            deepcopy(encoder_config),
+            block_pattern=_resolve_block_pattern(args.block_pattern),
+            activation_checkpointing=args.activation_checkpointing,
+        )
     model = SqueezeformerCTC(encoder_config=encoder_config, vocab_size=tokenizer.vocab_size)
     device = torch.device(args.device)
     model.to(device)

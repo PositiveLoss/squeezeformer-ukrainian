@@ -219,11 +219,15 @@ class SqueezeformerCTC(nn.Module):
 def load_lm_scorer(spec: str | None) -> Callable[[str], float] | None:
     if spec is None:
         return None
-    module_name, function_name = spec.split(":", maxsplit=1)
+    module_name, function_name, *factory_args = spec.split(":", maxsplit=2)
     module = importlib.import_module(module_name)
     scorer = getattr(module, function_name)
     if not callable(scorer):
         raise TypeError(f"LM scorer '{spec}' is not callable.")
+    if factory_args:
+        scorer = scorer(factory_args[0])
+        if not callable(scorer):
+            raise TypeError(f"LM scorer factory '{spec}' did not return a callable scorer.")
     return scorer
 
 

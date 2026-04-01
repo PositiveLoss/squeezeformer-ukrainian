@@ -6,9 +6,12 @@ This repository contains a standalone PyTorch implementation of the Squeezeforme
 
 - [model.py](/workspace/squeezeformer_pytorch/model.py): encoder architecture and published size variants
 - [asr.py](/workspace/squeezeformer_pytorch/asr.py): CTC wrapper, tokenizer implementations, beam search, LM scorer hook
+- [lm.py](/workspace/squeezeformer_pytorch/lm.py): concrete character n-gram shallow-fusion LM
 - [data.py](/workspace/squeezeformer_pytorch/data.py): dataset download, Polars manifest loading, transcript normalization, featurization, caching, bucketing
 - [metrics.py](/workspace/squeezeformer_pytorch/metrics.py): CER and WER through `jiwer`
 - [train.py](/workspace/train.py): training entrypoint
+- [train_lm.py](/workspace/train_lm.py): train a shallow-fusion n-gram LM from newline-delimited text
+- [export_cv22_corpus.py](/workspace/export_cv22_corpus.py): export normalized cv22 transcripts as an LM corpus
 - [evaluate.py](/workspace/evaluate.py): evaluation entrypoint
 - [tests](/workspace/tests): architecture and training utility checks
 
@@ -58,6 +61,8 @@ export HF_TOKEN=your_huggingface_token
 ```
 
 The loader downloads the dataset snapshot with `huggingface_hub.snapshot_download()` and reads TSV or Parquet manifests with `polars`.
+
+For local development and smoke tests, `--dataset-repo` can also point at a local directory that contains Common Voice-style manifests and audio files.
 
 Important: the dataset itself exposes only a source train split. This repo creates deterministic internal `train`, `validation`, and `test` splits by hashing `speaker_id` or `client_id` with the provided seed and split fractions, so the default split is speaker-aware rather than record-only.
 
@@ -131,6 +136,7 @@ Relevant training flags:
 - checkpoint resume with optimizer, scheduler, scaler, EMA, and global step state
 - greedy or beam-search validation decoding
 - LM scorer hook for beam search
+- optional training-time fit of a concrete shallow-fusion n-gram LM
 - per-epoch decoded examples in `trackio`
 - WER/CER metrics broken out by utterance-length bucket
 
@@ -196,6 +202,12 @@ HF_TOKEN=... uv run python train.py \
   --output-dir artifacts/cv22-sm
 ```
 
+Local resumable smoke test:
+
+```bash
+uv run python scripts/smoke_resume_train.py
+```
+
 Evaluate:
 
 ```bash
@@ -247,7 +259,55 @@ uv run python evaluate.py \
   --lm-weight 0.2
 ```
 
-This is intentionally a hook, not a bundled language model implementation.
+This repo also includes a concrete character n-gram shallow-fusion LM in [lm.py](/workspace/squeezeformer_pytorch/lm.py).
+
+Train and save it automatically during ASR training:
+
+```bash
+HF_TOKEN=... uv run python train.py \
+  --output-dir artifacts/cv22-sm \
+  --fit-shallow-fusion-lm \
+  --decode-strategy beam \
+  --beam-size 8 \
+  --lm-weight 0.2
+```
+
+Train it from a standalone text corpus:
+
+```bash
+uv run python train_lm.py \
+  --corpus data/lm_corpus.txt \
+  --output artifacts/shallow_fusion_lm.json \
+  --order 3 \
+  --alpha 0.1
+```
+
+Build that corpus directly from cv22:
+
+```bash
+HF_TOKEN=... uv run python export_cv22_corpus.py \
+  --dataset-repo speech-uk/cv22 \
+  --output artifacts/cv22_corpus.txt \
+  --deduplicate
+```
+
+Then train the LM:
+
+```bash
+uv run python train_lm.py \
+  --corpus artifacts/cv22_corpus.txt \
+  --output artifacts/shallow_fusion_lm.json
+```
+
+Use a saved LM explicitly from the generic hook:
+
+```bash
+uv run python evaluate.py \
+  --checkpoint artifacts/cv22-sm/checkpoint_best.pt \
+  --decode-strategy beam \
+  --lm-scorer squeezeformer_pytorch.lm:load_saved_ngram_scorer:artifacts/cv22-sm/shallow_fusion_lm.json \
+  --lm-weight 0.2
+```
 
 ## Checkpoints
 

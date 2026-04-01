@@ -4,13 +4,15 @@ from pathlib import Path
 import torch
 
 from squeezeformer_pytorch import (
+    NGramLanguageModel,
     SentencePieceTokenizer,
     SqueezeformerCTC,
     build_squeezeformer_encoder,
     squeezeformer_variant,
     tokenizer_from_dict,
 )
-from squeezeformer_pytorch.data import SpecAugment
+from squeezeformer_pytorch.asr import load_lm_scorer
+from squeezeformer_pytorch.data import SpecAugment, load_cv22_corpus_texts
 from train import OptimizerChoice, _variant_defaults, build_optimizer, build_paper_scheduler
 
 
@@ -80,6 +82,45 @@ def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
     assert token_ids
     restored = tokenizer_from_dict(tokenizer.to_dict())
     assert restored.decode(token_ids)
+
+
+def test_ngram_lm_prefers_seen_extension(tmp_path: Path) -> None:
+    lm = NGramLanguageModel.train(
+        ["abba", "abba", "abbb"],
+        order=3,
+        alpha=0.1,
+    )
+    assert lm.score_extension("abb") > lm.score_extension("abz")
+    save_path = tmp_path / "shallow_fusion_lm.json"
+    lm.save(save_path)
+    loaded = NGramLanguageModel.load(save_path)
+    assert loaded.score_text("abba") > loaded.score_text("abza")
+
+
+def test_lm_scorer_factory_spec_loads_saved_model(tmp_path: Path) -> None:
+    lm = NGramLanguageModel.train(["це тест", "це ще тест"], order=2, alpha=0.1)
+    lm_path = tmp_path / "lm.json"
+    lm.save(lm_path)
+    scorer = load_lm_scorer(
+        f"squeezeformer_pytorch.lm:load_saved_ngram_scorer:{lm_path}"
+    )
+    assert scorer is not None
+    assert scorer("це") > scorer("цz")
+
+
+def test_load_cv22_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\n"
+        "a.wav\t Це   Тест \n"
+        "b.wav\tце тест\n"
+        "c.wav\tМовна   Модель\n",
+        encoding="utf-8",
+    )
+    texts = load_cv22_corpus_texts(tmp_path, deduplicate=False)
+    assert texts == ["це тест", "це тест", "мовна модель"]
+    deduped = load_cv22_corpus_texts(tmp_path, deduplicate=True)
+    assert deduped == ["це тест", "мовна модель"]
 
 
 def test_time_reduction_kernel_matches_paper() -> None:
