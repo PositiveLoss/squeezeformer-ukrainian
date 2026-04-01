@@ -1,53 +1,48 @@
 # Squeezeformer PyTorch
 
-This repository contains a standalone PyTorch implementation of the Squeezeformer encoder from the paper source in [arXiv-2206.00888v2](/workspace/arXiv-2206.00888v2), plus minimal training and evaluation scripts for CTC-based ASR on the gated Hugging Face dataset `speech-uk/cv22`.
+This repository contains a standalone PyTorch implementation of the Squeezeformer encoder described in the paper source under [arXiv-2206.00888v2](/workspace/arXiv-2206.00888v2), plus minimal CTC training and evaluation scripts for the gated Hugging Face dataset `speech-uk/cv22`.
 
-The code is intentionally small and explicit:
+## What Is In The Repo
 
-- `squeezeformer_pytorch/model.py`: encoder architecture
-- `squeezeformer_pytorch/asr.py`: CTC wrapper and character tokenizer
-- `squeezeformer_pytorch/data.py`: dataset download, Polars manifest loading, audio featurization, batching
-- `squeezeformer_pytorch/metrics.py`: CER and WER
-- `train.py`: training entrypoint
-- `evaluate.py`: evaluation entrypoint
-- `tests/`: forward-shape and variant checks
+- [model.py](/workspace/squeezeformer_pytorch/model.py): Squeezeformer encoder
+- [asr.py](/workspace/squeezeformer_pytorch/asr.py): CTC wrapper and tokenizer implementations
+- [data.py](/workspace/squeezeformer_pytorch/data.py): dataset download, Polars manifest loading, audio featurization, batching
+- [metrics.py](/workspace/squeezeformer_pytorch/metrics.py): CER and WER through `jiwer`
+- [train.py](/workspace/train.py): training entrypoint
+- [evaluate.py](/workspace/evaluate.py): evaluation entrypoint
+- [tests](/workspace/tests): basic model and tokenizer checks
 
-## What Is Implemented
+## Implemented Architecture
 
 The encoder follows the paper’s main architectural changes:
 
 - depthwise-separable 4x acoustic subsampling
-- Squeezeformer MF/CF block structure
+- MF/CF block layout
 - scaled post-LN residual modules
 - relative-position attention
-- Temporal U-Net style time reduction and time recovery
-- published model variants: `xs`, `s`, `sm`, `m`, `ml`, `l`
+- Temporal U-Net style time reduction and recovery
+- published size variants: `xs`, `s`, `sm`, `m`, `ml`, `l`
 
-This is an encoder-first implementation, not a full reproduction of the authors’ original training stack. In particular:
+Published variant table used in code:
 
-- decoding is greedy CTC only
-- tokenization is character-level, not SentencePiece
-- training defaults are practical local defaults, not the paper’s TPU-scale recipe
+- `xs`: 16 layers, 144 dim, 4 heads
+- `s`: 18 layers, 196 dim, 4 heads
+- `sm`: 16 layers, 256 dim, 4 heads
+- `m`: 20 layers, 324 dim, 4 heads
+- `ml`: 18 layers, 512 dim, 8 heads
+- `l`: 22 layers, 640 dim, 8 heads
 
-SentencePiece tokenization is also supported as a runtime option for the training and evaluation scripts.
+This is not a full paper reproduction. It is a practical encoder-first ASR stack with:
 
-## Requirements
+- greedy CTC decoding
+- either character or SentencePiece tokenization
+- local single-process training defaults
 
-The project uses a local `uv` environment.
+## Environment Setup
 
-Core runtime dependencies:
+The workflow uses a local `uv` environment.
 
-- `torch`
-- `torchaudio`
-- `polars`
-- `jiwer`
-- `sentencepiece`
-- `huggingface_hub`
-- `trackio`
-- `pytest`
-- `ruff`
-
-If `.venv` does not exist yet:
+Create the environment:
 
 ```bash
 uv venv .venv
@@ -62,77 +57,141 @@ uv pip install polars jiwer sentencepiece huggingface_hub trackio pytest ruff
 
 ## Dataset Access
 
-Training uses `speech-uk/cv22` from Hugging Face:
+The scripts use `speech-uk/cv22` from Hugging Face:
 
 - dataset page: `https://huggingface.co/datasets/speech-uk/cv22`
 - the dataset is gated
-- you must log in on Hugging Face, accept the access conditions, and provide a token
+- you must accept the access conditions on Hugging Face before the scripts can download it
 
-Export a token before training or evaluation:
+Set a token before training or evaluation:
 
 ```bash
 export HF_TOKEN=your_huggingface_token
 ```
 
-The loader downloads the dataset snapshot with `huggingface_hub.snapshot_download()` and uses `polars` to read the dataset manifests from TSV or Parquet files.
+The loader downloads the dataset snapshot with `huggingface_hub.snapshot_download()` and reads TSV or Parquet manifests with `polars`.
+
+Important: the dataset itself exposes only a train split. This repo creates deterministic internal `train`, `validation`, and `test` splits by hashing each utterance id with the provided seed and split fractions.
+
+Default split behavior:
+
+- `--val-fraction 0.1`
+- `--test-fraction 0.1`
+
+So the effective split is:
+
+- 80% train
+- 10% validation
+- 10% test
+
+This is record-based splitting, not speaker-aware splitting.
+
+## Tokenization
+
+Two tokenizer modes are supported:
+
+- `character`
+- `sentencepiece`
+
+Character mode builds a vocabulary directly from the training transcripts.
+
+SentencePiece mode trains a tokenizer during `train.py` and stores:
+
+- `tokenizer.json`
+- `tokenizer.model`
+
+Evaluation reloads the tokenizer from checkpoint metadata, so you do not need to pass the tokenizer type again.
 
 ## Quick Start
 
-Train a small run:
+Character tokenizer:
+
+```bash
+HF_TOKEN=... uv run python train.py \
+  --variant sm \
+  --tokenizer character \
+  --device cpu \
+  --output-dir artifacts/cv22-sm-char \
+  --batch-size 8 \
+  --epochs 10
+```
+
+SentencePiece tokenizer:
 
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant sm \
   --tokenizer sentencepiece \
-  --output-dir artifacts/cv22-sm \
+  --spm-vocab-size 256 \
+  --spm-model-type unigram \
+  --device cpu \
+  --output-dir artifacts/cv22-sm-spm \
   --batch-size 8 \
   --epochs 10
 ```
 
-Evaluate the best checkpoint:
+Evaluate:
 
 ```bash
 HF_TOKEN=... uv run python evaluate.py \
-  --checkpoint artifacts/cv22-sm/checkpoint_best.pt
+  --checkpoint artifacts/cv22-sm-spm/checkpoint_best.pt \
+  --split test \
+  --device cpu
 ```
 
 ## Training Script
 
-`train.py` does the following:
+[train.py](/workspace/train.py) does the following:
 
-1. downloads the dataset snapshot from Hugging Face
+1. downloads the dataset snapshot
 2. loads manifests with Polars
-3. creates deterministic train/validation/test splits using a hash of utterance id
-4. builds a character vocabulary from the training transcripts
+3. creates deterministic train/validation splits from the single source split
+4. builds either a character tokenizer or a SentencePiece tokenizer from training transcripts
 5. extracts 80-bin log-mel features with `torchaudio`
-6. trains a Squeezeformer encoder with a CTC head
+6. trains a Squeezeformer encoder plus CTC head
 7. logs metrics to `trackio`
-8. saves:
-   - `checkpoint_last.pt`
-   - `checkpoint_best.pt`
-   - `tokenizer.json`
-   - `train_summary.json`
+8. saves checkpoints and tokenizer artifacts
 
-Common options:
+Common arguments:
 
-- `--variant`: one of `xs`, `s`, `sm`, `m`, `ml`, `l`
-- `--output-dir`: checkpoint directory
+- `--dataset-repo`
+- `--hf-token`
+- `--cache-dir`
+- `--variant`
+- `--output-dir`
 - `--batch-size`
 - `--epochs`
 - `--learning-rate`
+- `--weight-decay`
+- `--num-workers`
+- `--seed`
+- `--val-fraction`
+- `--test-fraction`
 - `--max-train-samples`
 - `--max-val-samples`
+- `--device`
 - `--trackio-project`
 - `--trackio-space-id`
-- `--tokenizer`: `character` or `sentencepiece`
+- `--log-every`
+- `--tokenizer`
 - `--spm-vocab-size`
 - `--spm-model-type`
 
-Example with smaller subsets for a smoke test:
+Files written by training:
+
+- `checkpoint_last.pt`
+- `checkpoint_best.pt`
+- `tokenizer.json`
+- `tokenizer.model` when `--tokenizer sentencepiece`
+- `train_summary.json`
+
+Smoke-test example:
 
 ```bash
 HF_TOKEN=... uv run python train.py \
   --variant xs \
+  --tokenizer character \
+  --device cpu \
   --output-dir artifacts/smoke \
   --epochs 1 \
   --max-train-samples 64 \
@@ -141,62 +200,46 @@ HF_TOKEN=... uv run python train.py \
 
 ## Evaluation Script
 
-`evaluate.py` loads a saved checkpoint and computes:
+[evaluate.py](/workspace/evaluate.py) loads a checkpoint and computes:
 
 - loss
 - CER
 - WER
 
-It also logs the evaluation summary to `trackio`.
+It also logs the result to `trackio`.
 
-Example:
+Common arguments:
 
-```bash
-HF_TOKEN=... uv run python evaluate.py \
-  --checkpoint artifacts/cv22-sm/checkpoint_best.pt \
-  --split test
-```
+- `--checkpoint`
+- `--dataset-repo`
+- `--hf-token`
+- `--cache-dir`
+- `--split`
+- `--batch-size`
+- `--num-workers`
+- `--seed`
+- `--val-fraction`
+- `--test-fraction`
+- `--max-samples`
+- `--device`
+- `--trackio-project`
+- `--trackio-space-id`
 
-## Trackio Logging
+## Trackio
 
-Training and evaluation use `trackio` for experiment logging.
+Training and evaluation use `trackio` for metric logging.
 
-Local logging works out of the box:
-
-```python
-trackio.init(project="squeezeformer-cv22")
-trackio.log({"train_loss": 0.42})
-trackio.finish()
-```
-
-To view a local dashboard:
+Local dashboard:
 
 ```bash
 trackio show --project "squeezeformer-cv22"
 ```
 
-If you want logs to sync to a Hugging Face Space, pass:
+To sync logs to a Hugging Face Space, pass:
 
 - `--trackio-space-id username/space-name`
 
-## Architecture Notes
-
-The paper specifies the macro-architecture clearly, but some implementation details are only implicit in the text. This code resolves those gaps using the paper’s cited public reference implementation where needed, especially for:
-
-- exact block layout
-- variant-specific reduction and recovery indices
-- convolution module expansion behavior
-
-The implemented defaults align with the published variant table:
-
-- `xs`: 16 layers, 144 dim, 4 heads
-- `s`: 18 layers, 196 dim, 4 heads
-- `sm`: 16 layers, 256 dim, 4 heads
-- `m`: 20 layers, 324 dim, 4 heads
-- `ml`: 18 layers, 512 dim, 8 heads
-- `l`: 22 layers, 640 dim, 8 heads
-
-## Project Structure
+## Project Layout
 
 ```text
 /workspace
@@ -226,20 +269,16 @@ uv run pytest -q
 uv run python -c "import train, evaluate; print('imports_ok')"
 ```
 
-## Known Limitations
+## Known Limits
 
-- This is not a full paper reproduction.
-- The dataset loader is designed for Common Voice style manifests and should be considered correct-by-inspection until the first real gated dataset run confirms every column in `speech-uk/cv22`.
-- The tokenizer is character-based rather than SentencePiece.
-- No beam search or language model decoding is included.
-- No distributed training support is included.
+- This is not the original large-scale paper training recipe.
+- Decoding is greedy CTC only.
+- The dataset loader is written for Common Voice-style manifests and should still be treated as a practical integration, not a benchmark-grade data pipeline.
+- Splitting is record-based rather than speaker-aware.
+- There is no beam search, language model fusion, mixed precision training, resume logic, or distributed training support.
 
-## Next Steps
+## Sources
 
-Good follow-up improvements:
-
-- add SentencePiece tokenization
-- add checkpoint resume support
-- add mixed precision training
-- add beam search decoding
-- add explicit manifest schema tests once the gated dataset is available locally
+- Paper source: [arXiv-2206.00888v2](/workspace/arXiv-2206.00888v2)
+- Dataset card: `https://huggingface.co/datasets/speech-uk/cv22`
+- `trackio`: `https://pypi.org/project/trackio/`
