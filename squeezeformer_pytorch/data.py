@@ -31,6 +31,8 @@ class CV22Record:
     utterance_id: str
     speaker_id: str
     estimated_frames: int
+    num_samples: int = 0
+    sample_rate: int = 0
 
 
 class AudioFeaturizer(torch.nn.Module):
@@ -135,6 +137,79 @@ class SpecAugment(torch.nn.Module):
         return augmented
 
 
+class WaveformAugment(torch.nn.Module):
+    def __init__(
+        self,
+        speed_perturb_prob: float = 0.0,
+        speed_factors: tuple[float, ...] = (0.9, 1.0, 1.1),
+        noise_prob: float = 0.0,
+        noise_snr_db_range: tuple[float, float] = (10.0, 30.0),
+        reverb_prob: float = 0.0,
+        reverb_decay_range: tuple[float, float] = (0.15, 0.5),
+        reverb_delay_ms_range: tuple[float, float] = (8.0, 35.0),
+    ) -> None:
+        super().__init__()
+        self.speed_perturb_prob = speed_perturb_prob
+        self.speed_factors = speed_factors
+        self.noise_prob = noise_prob
+        self.noise_snr_db_range = noise_snr_db_range
+        self.reverb_prob = reverb_prob
+        self.reverb_decay_range = reverb_decay_range
+        self.reverb_delay_ms_range = reverb_delay_ms_range
+
+    def forward(self, waveform: Tensor, sample_rate: int) -> tuple[Tensor, int]:
+        augmented = waveform
+        current_sample_rate = sample_rate
+        if self.speed_perturb_prob > 0 and torch.rand(1).item() < self.speed_perturb_prob:
+            factor = self.speed_factors[int(torch.randint(0, len(self.speed_factors), (1,)).item())]
+            if factor != 1.0:
+                target_rate = max(1, int(round(current_sample_rate * factor)))
+                augmented = torchaudio.functional.resample(
+                    augmented,
+                    current_sample_rate,
+                    target_rate,
+                )
+                augmented = torchaudio.functional.resample(
+                    augmented,
+                    target_rate,
+                    current_sample_rate,
+                )
+        if self.noise_prob > 0 and torch.rand(1).item() < self.noise_prob:
+            augmented = self._add_noise(augmented)
+        if self.reverb_prob > 0 and torch.rand(1).item() < self.reverb_prob:
+            augmented = self._add_reverb(augmented, current_sample_rate)
+        return augmented, current_sample_rate
+
+    def _add_noise(self, waveform: Tensor) -> Tensor:
+        low, high = self.noise_snr_db_range
+        snr_db = float(torch.empty(1).uniform_(low, high).item())
+        signal_power = waveform.pow(2).mean().clamp_min(1e-8)
+        noise_power = signal_power / (10 ** (snr_db / 10.0))
+        noise = torch.randn_like(waveform) * noise_power.sqrt()
+        return (waveform + noise).clamp(-1.0, 1.0)
+
+    def _add_reverb(self, waveform: Tensor, sample_rate: int) -> Tensor:
+        low_decay, high_decay = self.reverb_decay_range
+        low_delay_ms, high_delay_ms = self.reverb_delay_ms_range
+        decay = float(torch.empty(1).uniform_(low_decay, high_decay).item())
+        delay_ms = float(torch.empty(1).uniform_(low_delay_ms, high_delay_ms).item())
+        delay_samples = max(1, int(sample_rate * delay_ms / 1000.0))
+        impulse_length = min(waveform.size(-1), max(delay_samples * 4, delay_samples + 1))
+        impulse = waveform.new_zeros(1, 1, impulse_length)
+        impulse[0, 0, 0] = 1.0
+        for tap in range(1, 4):
+            index = min(impulse_length - 1, tap * delay_samples)
+            impulse[0, 0, index] += decay**tap
+        impulse = impulse / impulse.abs().sum().clamp_min(1e-6)
+        reverberated = F.conv1d(
+            waveform.unsqueeze(0),
+            impulse.expand(waveform.size(0), -1, -1),
+            padding=impulse_length - 1,
+            groups=waveform.size(0),
+        )[0]
+        return reverberated[..., : waveform.size(-1)].clamp(-1.0, 1.0)
+
+
 def normalize_transcript(text: str) -> str:
     normalized = text.strip().lower()
     normalized = normalized.replace("’", "'").replace("`", "'").replace("ʼ", "'")
@@ -142,6 +217,26 @@ def normalize_transcript(text: str) -> str:
     normalized = re.sub(r"\s+", " ", normalized)
     normalized = re.sub(r"\s+([,.;:!?])", r"\1", normalized)
     return normalized
+
+
+def transcript_symbol_ratio(text: str) -> float:
+    if not text:
+        return 1.0
+    noisy = sum(1 for char in text if not (char.isalnum() or char.isspace() or char in {"'", "-"}))
+    return noisy / len(text)
+
+
+def transcript_is_usable(
+    text: str,
+    min_chars: int = 1,
+    max_chars: int = 400,
+    max_symbol_ratio: float = 0.5,
+) -> bool:
+    return (
+        min_chars <= len(text) <= max_chars
+        and transcript_symbol_ratio(text) <= max_symbol_ratio
+        and any(char.isalnum() for char in text)
+    )
 
 
 def _hash_to_unit_interval(value: str, seed: int) -> float:
@@ -220,6 +315,26 @@ def _load_wave_from_stdlib(source: str | io.BytesIO) -> tuple[Tensor, int]:
     return waveform, sample_rate
 
 
+def probe_audio_metadata(audio_path: str | None, audio_bytes: bytes | None) -> tuple[int, int]:
+    try:
+        if audio_path is not None and Path(audio_path).exists():
+            info = torchaudio.info(audio_path)
+            return int(info.num_frames), int(info.sample_rate)
+        if audio_bytes is not None:
+            info = torchaudio.info(io.BytesIO(audio_bytes))
+            return int(info.num_frames), int(info.sample_rate)
+    except ImportError:
+        pass
+    except Exception:
+        return 0, 0
+
+    try:
+        waveform, sample_rate = load_audio(audio_path, audio_bytes)
+    except Exception:
+        return 0, 0
+    return int(waveform.size(-1)), int(sample_rate)
+
+
 def load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[Tensor, int]:
     try:
         if audio_path is not None and Path(audio_path).exists():
@@ -262,6 +377,9 @@ def load_cv22_records(
     val_fraction: float,
     test_fraction: float,
     max_samples: int | None = None,
+    min_transcript_chars: int = 1,
+    max_transcript_chars: int = 400,
+    max_symbol_ratio: float = 0.5,
 ) -> list[CV22Record]:
     frames = _collect_manifest_frames(dataset_root)
     if not frames:
@@ -274,6 +392,13 @@ def load_cv22_records(
             transcript = _extract_transcript(row)
             audio_path, audio_bytes = _resolve_audio(row, dataset_root=dataset_root)
         except KeyError:
+            continue
+        if not transcript_is_usable(
+            transcript,
+            min_chars=min_transcript_chars,
+            max_chars=max_transcript_chars,
+            max_symbol_ratio=max_symbol_ratio,
+        ):
             continue
         utterance_id = str(row.get("id") or audio_path or len(records))
         speaker_id = str(row.get("client_id") or row.get("speaker_id") or utterance_id)
@@ -354,12 +479,14 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
         tokenizer: Tokenizer,
         featurizer: AudioFeaturizer,
         specaugment: SpecAugment | None = None,
+        waveform_augment: WaveformAugment | None = None,
         feature_cache_dir: str | Path | None = None,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
         self.featurizer = featurizer
         self.specaugment = specaugment
+        self.waveform_augment = waveform_augment
         self.feature_cache_dir = Path(feature_cache_dir) if feature_cache_dir is not None else None
         if self.feature_cache_dir is not None:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -378,12 +505,15 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         cache_path = self._feature_cache_path(record)
-        if cache_path is not None and cache_path.exists():
+        use_cache = cache_path is not None and self.waveform_augment is None
+        if use_cache and cache_path.exists():
             features = torch.load(cache_path, map_location="cpu")
         else:
             waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
+            if self.waveform_augment is not None:
+                waveform, sample_rate = self.waveform_augment(waveform, sample_rate)
             features = self.featurizer(waveform, sample_rate)
-            if cache_path is not None:
+            if use_cache:
                 torch.save(features, cache_path)
         if self.specaugment is not None:
             features = self.specaugment(features)
@@ -421,17 +551,63 @@ class LengthBucketBatchSampler(BatchSampler):
         return (len(self.records) + self.batch_size - 1) // self.batch_size
 
 
+class MaxFramesBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        records: list[CV22Record],
+        max_batch_frames: int,
+        shuffle: bool,
+    ) -> None:
+        self.records = records
+        self.max_batch_frames = max_batch_frames
+        self.shuffle = shuffle
+        self._batches = self._build_batches()
+
+    def _build_batches(self) -> list[list[int]]:
+        sorted_indices = sorted(
+            range(len(self.records)), key=lambda index: self.records[index].estimated_frames
+        )
+        batches: list[list[int]] = []
+        current_batch: list[int] = []
+        current_max = 0
+        for index in sorted_indices:
+            frames = max(1, self.records[index].estimated_frames)
+            proposed_size = len(current_batch) + 1
+            proposed_max = max(current_max, frames)
+            if current_batch and proposed_size * proposed_max > self.max_batch_frames:
+                batches.append(current_batch)
+                current_batch = []
+                current_max = 0
+            current_batch.append(index)
+            current_max = max(current_max, frames)
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def __iter__(self):
+        batches = list(self._batches)
+        if self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in order]
+        yield from batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
 def _record_is_valid(record: CV22Record) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
             try:
                 torchaudio.info(record.audio_path)
+                return True
             except ImportError:
                 _load_wave_from_stdlib(record.audio_path)
                 return True
         if record.audio_bytes is not None:
             try:
                 torchaudio.info(io.BytesIO(record.audio_bytes))
+                return True
             except ImportError:
                 _load_wave_from_stdlib(io.BytesIO(record.audio_bytes))
                 return True
@@ -453,15 +629,31 @@ def prevalidate_records(
 
 
 def estimate_record_frames(record: CV22Record, hop_length: int) -> int:
-    if record.estimated_frames > 0:
+    if record.estimated_frames > 0 and record.num_samples > 0 and record.sample_rate > 0:
         return record.estimated_frames
-    if record.audio_path is not None and Path(record.audio_path).exists():
-        try:
-            info = torchaudio.info(record.audio_path)
-            return max(1, int(info.num_frames / hop_length))
-        except Exception:
-            return 0
-    return 0
+    num_samples, sample_rate = probe_audio_metadata(record.audio_path, record.audio_bytes)
+    if num_samples <= 0 or sample_rate <= 0:
+        return 0
+    object.__setattr__(record, "num_samples", num_samples)
+    object.__setattr__(record, "sample_rate", sample_rate)
+    estimated_frames = max(1, int(num_samples / hop_length))
+    object.__setattr__(record, "estimated_frames", estimated_frames)
+    return estimated_frames
+
+
+def materialize_record_metadata(
+    records: list[CV22Record],
+    hop_length: int,
+    num_workers: int = 4,
+) -> list[CV22Record]:
+    def populate(record: CV22Record) -> CV22Record:
+        estimate_record_frames(record, hop_length=hop_length)
+        return record
+
+    if num_workers <= 1:
+        return [populate(record) for record in records]
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        return list(executor.map(populate, records))
 
 
 def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -498,17 +690,17 @@ def create_dataloader(
     shuffle: bool,
     num_workers: int,
     bucket_by_length: bool = False,
+    max_batch_frames: int | None = None,
     pin_memory: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
+    metadata_workers: int = 4,
 ) -> DataLoader[dict[str, Any]]:
-    for record in dataset.records:
-        if record.estimated_frames <= 0:
-            object.__setattr__(
-                record,
-                "estimated_frames",
-                estimate_record_frames(record, hop_length=dataset.featurizer.hop_length),
-            )
+    materialize_record_metadata(
+        dataset.records,
+        hop_length=dataset.featurizer.hop_length,
+        num_workers=metadata_workers,
+    )
     dataloader_kwargs = {
         "num_workers": num_workers,
         "collate_fn": collate_asr_batch,
@@ -517,6 +709,13 @@ def create_dataloader(
     }
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
+    if max_batch_frames is not None:
+        batch_sampler = MaxFramesBatchSampler(
+            dataset.records,
+            max_batch_frames=max_batch_frames,
+            shuffle=shuffle,
+        )
+        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     if bucket_by_length:
         batch_sampler = LengthBucketBatchSampler(
             dataset.records, batch_size=batch_size, shuffle=shuffle

@@ -12,7 +12,13 @@ from squeezeformer_pytorch import (
     tokenizer_from_dict,
 )
 from squeezeformer_pytorch.asr import load_lm_scorer
-from squeezeformer_pytorch.data import SpecAugment, load_cv22_corpus_texts
+from squeezeformer_pytorch.data import (
+    CV22Record,
+    MaxFramesBatchSampler,
+    SpecAugment,
+    load_cv22_corpus_texts,
+    transcript_is_usable,
+)
 from train import OptimizerChoice, _variant_defaults, build_optimizer, build_paper_scheduler
 
 
@@ -121,6 +127,34 @@ def test_load_cv22_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> N
     assert texts == ["це тест", "це тест", "мовна модель"]
     deduped = load_cv22_corpus_texts(tmp_path, deduplicate=True)
     assert deduped == ["це тест", "мовна модель"]
+
+
+def test_transcript_filter_rejects_pathological_rows() -> None:
+    assert transcript_is_usable(
+        "це нормальний рядок",
+        min_chars=3,
+        max_chars=40,
+        max_symbol_ratio=0.5,
+    )
+    assert not transcript_is_usable("", min_chars=1, max_chars=40, max_symbol_ratio=0.5)
+    assert not transcript_is_usable("а", min_chars=3, max_chars=40, max_symbol_ratio=0.5)
+    assert not transcript_is_usable("!" * 8, min_chars=1, max_chars=40, max_symbol_ratio=0.5)
+    assert not transcript_is_usable("дуже" * 20, min_chars=1, max_chars=10, max_symbol_ratio=0.5)
+
+
+def test_max_frames_batch_sampler_respects_frame_budget() -> None:
+    records = [
+        CV22Record(None, None, "a", "0", "s0", estimated_frames=20),
+        CV22Record(None, None, "b", "1", "s1", estimated_frames=25),
+        CV22Record(None, None, "c", "2", "s2", estimated_frames=40),
+        CV22Record(None, None, "d", "3", "s3", estimated_frames=45),
+    ]
+    sampler = MaxFramesBatchSampler(records, max_batch_frames=90, shuffle=False)
+    batches = list(iter(sampler))
+    assert batches
+    for batch in batches:
+        max_frames = max(records[index].estimated_frames for index in batch)
+        assert len(batch) * max_frames <= 90
 
 
 def test_time_reduction_kernel_matches_paper() -> None:

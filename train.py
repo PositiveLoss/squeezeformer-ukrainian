@@ -27,6 +27,7 @@ from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
     SpecAugment,
+    WaveformAugment,
     create_dataloader,
     download_cv22_dataset,
     load_cv22_records,
@@ -287,7 +288,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-fraction", type=float, default=0.1)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--min-transcript-chars", type=int, default=1)
+    parser.add_argument("--max-transcript-chars", type=int, default=400)
+    parser.add_argument("--max-symbol-ratio", type=float, default=0.5)
     parser.add_argument("--feature-cache-dir", default=None)
+    parser.add_argument("--max-batch-frames", type=int, default=None)
     parser.add_argument(
         "--bucket-by-length",
         action=argparse.BooleanOptionalAction,
@@ -304,6 +309,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
     )
     parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--metadata-workers", type=int, default=4)
     parser.add_argument(
         "--prevalidate-audio",
         action=argparse.BooleanOptionalAction,
@@ -373,6 +379,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freq-mask-param", type=int, default=27)
     parser.add_argument("--num-time-masks", type=int, default=None)
     parser.add_argument("--time-mask-max-ratio", type=float, default=0.05)
+    parser.add_argument("--speed-perturb-prob", type=float, default=0.0)
+    parser.add_argument("--speed-factors", default="0.9,1.0,1.1")
+    parser.add_argument("--noise-prob", type=float, default=0.0)
+    parser.add_argument("--noise-snr-db-min", type=float, default=10.0)
+    parser.add_argument("--noise-snr-db-max", type=float, default=30.0)
+    parser.add_argument("--reverb-prob", type=float, default=0.0)
+    parser.add_argument("--reverb-decay-min", type=float, default=0.15)
+    parser.add_argument("--reverb-decay-max", type=float, default=0.5)
+    parser.add_argument("--reverb-delay-ms-min", type=float, default=8.0)
+    parser.add_argument("--reverb-delay-ms-max", type=float, default=35.0)
     parser.add_argument(
         "--decode-strategy",
         type=DecodeStrategy,
@@ -532,6 +548,13 @@ def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
     return tokens
 
 
+def _resolve_float_tuple(values: str) -> tuple[float, ...]:
+    parsed = tuple(float(value.strip()) for value in values.split(",") if value.strip())
+    if not parsed:
+        raise ValueError("expected at least one float value")
+    return parsed
+
+
 def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, str]:
     payload: dict[str, str] = {}
     for index, example in enumerate(examples):
@@ -595,6 +618,9 @@ def main() -> None:
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         max_samples=args.max_train_samples,
+        min_transcript_chars=args.min_transcript_chars,
+        max_transcript_chars=args.max_transcript_chars,
+        max_symbol_ratio=args.max_symbol_ratio,
     )
     val_records = load_cv22_records(
         dataset_root=dataset_root,
@@ -603,6 +629,9 @@ def main() -> None:
         val_fraction=args.val_fraction,
         test_fraction=args.test_fraction,
         max_samples=args.max_val_samples,
+        min_transcript_chars=args.min_transcript_chars,
+        max_transcript_chars=args.max_transcript_chars,
+        max_symbol_ratio=args.max_symbol_ratio,
     )
     if args.prevalidate_audio:
         train_records = prevalidate_records(train_records, num_workers=args.prevalidate_workers)
@@ -648,6 +677,15 @@ def main() -> None:
         num_time_masks=args.num_time_masks or variant_defaults.num_time_masks,
         time_mask_max_ratio=args.time_mask_max_ratio,
     )
+    waveform_augment = WaveformAugment(
+        speed_perturb_prob=args.speed_perturb_prob,
+        speed_factors=_resolve_float_tuple(args.speed_factors),
+        noise_prob=args.noise_prob,
+        noise_snr_db_range=(args.noise_snr_db_min, args.noise_snr_db_max),
+        reverb_prob=args.reverb_prob,
+        reverb_decay_range=(args.reverb_decay_min, args.reverb_decay_max),
+        reverb_delay_ms_range=(args.reverb_delay_ms_min, args.reverb_delay_ms_max),
+    )
     train_feature_cache_dir = (
         Path(args.feature_cache_dir) / "train" if args.feature_cache_dir is not None else None
     )
@@ -659,6 +697,7 @@ def main() -> None:
         tokenizer=tokenizer,
         featurizer=featurizer,
         specaugment=specaugment,
+        waveform_augment=waveform_augment,
         feature_cache_dir=train_feature_cache_dir,
     )
     val_dataset = CV22ASRDataset(
@@ -673,9 +712,11 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         bucket_by_length=args.bucket_by_length,
+        max_batch_frames=args.max_batch_frames,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        metadata_workers=args.metadata_workers,
     )
     val_loader = create_dataloader(
         val_dataset,
@@ -683,9 +724,11 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         bucket_by_length=args.bucket_by_length,
+        max_batch_frames=args.max_batch_frames,
         pin_memory=args.pin_memory,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
+        metadata_workers=args.metadata_workers,
     )
 
     encoder_config = (

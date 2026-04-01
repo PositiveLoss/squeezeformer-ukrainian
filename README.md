@@ -103,6 +103,9 @@ The frontend is now configurable and closer to the paper’s recipe:
 - feature normalization, enabled by default
 - configurable per-frame normalization if you want it
 - configurable SpecAugment frequency and time masking
+- optional speed perturbation
+- optional additive noise
+- optional synthetic reverb
 
 Relevant training flags:
 
@@ -114,6 +117,16 @@ Relevant training flags:
 - `--freq-mask-param`
 - `--num-time-masks`
 - `--time-mask-max-ratio`
+- `--speed-perturb-prob`
+- `--speed-factors`
+- `--noise-prob`
+- `--noise-snr-db-min`
+- `--noise-snr-db-max`
+- `--reverb-prob`
+- `--reverb-decay-min`
+- `--reverb-decay-max`
+- `--reverb-delay-ms-min`
+- `--reverb-delay-ms-max`
 
 ## Training Features
 
@@ -129,9 +142,12 @@ Relevant training flags:
 - optional `torch.compile`
 - optional activation checkpointing inside encoder blocks
 - feature caching on disk
+- up-front audio metadata and frame-count materialization
 - length bucketing
+- optional max-frames batching instead of fixed utterance-count batches
 - dataloader tuning knobs for `pin_memory`, `persistent_workers`, and `prefetch_factor`
 - optional audio prevalidation before training
+- transcript filtering for too-short, too-long, empty, and symbol-heavy rows
 - top-k checkpoint retention
 - checkpoint resume with optimizer, scheduler, scaler, EMA, and global step state
 - greedy or beam-search validation decoding
@@ -150,6 +166,7 @@ Important defaults:
 - `--hold-epochs 160`
 - `--decay-exponent 1.0`
 - `--bucket-by-length`
+- `--metadata-workers 4`
 - `--pin-memory`
 - `--persistent-workers`
 - `--ema-decay 0.999`
@@ -187,12 +204,24 @@ HF_TOKEN=... uv run python train.py \
   --dtype bfloat16 \
   --gradient-accumulation-steps 4 \
   --feature-cache-dir artifacts/feature_cache \
+  --max-batch-frames 12000 \
+  --speed-perturb-prob 0.5 \
+  --noise-prob 0.2 \
+  --reverb-prob 0.1 \
   --decode-strategy beam \
   --beam-size 8 \
   --output-dir artifacts/cv22-sm \
   --batch-size 8 \
   --epochs 10
 ```
+
+Additional data-quality and batching controls:
+
+- `--min-transcript-chars`
+- `--max-transcript-chars`
+- `--max-symbol-ratio`
+- `--max-batch-frames`
+- `--metadata-workers`
 
 Resume training:
 
