@@ -43,7 +43,9 @@ from squeezeformer_pytorch.data import (
     create_dataloader,
     download_cv22_dataset,
     iter_cv22_records,
+    iter_cv22_records_from_source,
     probe_audio_metadata,
+    read_binary_source,
 )
 from squeezeformer_pytorch.lm import NGramLanguageModel
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
@@ -207,6 +209,24 @@ def _resolve_dataset_roots(args: argparse.Namespace) -> list[Path]:
     return dataset_roots
 
 
+def _resolve_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
+    sources = list(args.dataset_source or [])
+    if not sources:
+        sources = [args.dataset_repo]
+
+    resolved_sources: list[str | Path] = []
+    seen: set[str] = set()
+    for source in sources:
+        source_path = Path(source).expanduser()
+        resolved_source: str | Path = source_path.resolve() if source_path.exists() else source
+        dedupe_key = str(resolved_source)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        resolved_sources.append(resolved_source)
+    return resolved_sources
+
+
 class DiskBackedRecordStore:
     def __init__(
         self,
@@ -313,7 +333,7 @@ class DiskBackedRecordStore:
 
 
 def _build_disk_backed_record_store(
-    dataset_roots: list[Path],
+    dataset_sources: list[str | Path],
     *,
     split: str,
     seed: int,
@@ -325,6 +345,7 @@ def _build_disk_backed_record_store(
     max_symbol_ratio: float,
     lowercase_transcripts: bool,
     records_path: Path,
+    hf_token: str | None = None,
 ) -> DiskBackedRecordStore:
     records_path.parent.mkdir(parents=True, exist_ok=True)
     audio_blob_dir = records_path.parent / f"{records_path.stem}_audio_blobs"
@@ -332,34 +353,57 @@ def _build_disk_backed_record_store(
     estimated_frames = array.array("I")
     written = 0
     with records_path.open("wb") as handle:
-        for dataset_root in dataset_roots:
+        for dataset_source in dataset_sources:
             remaining_samples = None
             if max_samples is not None:
                 remaining_samples = max_samples - written
                 if remaining_samples <= 0:
                     break
-            for record in iter_cv22_records(
-                dataset_root=dataset_root,
-                split=split,
-                seed=seed,
-                val_fraction=val_fraction,
-                test_fraction=test_fraction,
-                max_samples=remaining_samples,
-                min_transcript_chars=min_transcript_chars,
-                max_transcript_chars=max_transcript_chars,
-                max_symbol_ratio=max_symbol_ratio,
-                lowercase_transcripts=lowercase_transcripts,
-            ):
-                preserve_audio_bytes = record.audio_bytes is not None and not (
+            record_iterator = (
+                iter_cv22_records(
+                    dataset_root=dataset_source,
+                    split=split,
+                    seed=seed,
+                    val_fraction=val_fraction,
+                    test_fraction=test_fraction,
+                    max_samples=remaining_samples,
+                    min_transcript_chars=min_transcript_chars,
+                    max_transcript_chars=max_transcript_chars,
+                    max_symbol_ratio=max_symbol_ratio,
+                    lowercase_transcripts=lowercase_transcripts,
+                )
+                if isinstance(dataset_source, Path) and dataset_source.exists() and dataset_source.is_dir()
+                else iter_cv22_records_from_source(
+                    dataset_source,
+                    split=split,
+                    seed=seed,
+                    val_fraction=val_fraction,
+                    test_fraction=test_fraction,
+                    max_samples=remaining_samples,
+                    min_transcript_chars=min_transcript_chars,
+                    max_transcript_chars=max_transcript_chars,
+                    max_symbol_ratio=max_symbol_ratio,
+                    lowercase_transcripts=lowercase_transcripts,
+                    hf_token=hf_token,
+                )
+            )
+            for record in record_iterator:
+                audio_bytes = record.audio_bytes
+                if audio_bytes is None and record.audio_path is not None:
+                    try:
+                        audio_bytes = read_binary_source(record.audio_path, token=hf_token)
+                    except Exception:
+                        audio_bytes = None
+                preserve_audio_bytes = audio_bytes is not None and not (
                     record.audio_path is not None and Path(record.audio_path).exists()
                 )
                 audio_blob_path: str | None = None
                 if preserve_audio_bytes:
                     audio_blob_dir.mkdir(parents=True, exist_ok=True)
-                    blob_name = hashlib.sha256(record.audio_bytes).hexdigest() + ".bin"
+                    blob_name = hashlib.sha256(audio_bytes).hexdigest() + ".bin"
                     blob_path = audio_blob_dir / blob_name
                     if not blob_path.exists():
-                        blob_path.write_bytes(record.audio_bytes)
+                        blob_path.write_bytes(audio_bytes)
                     audio_blob_path = str(blob_path.relative_to(records_path.parent))
                 offsets.append(handle.tell())
                 payload = json.dumps(
@@ -399,7 +443,7 @@ def _load_cached_audio_bytes(payload: dict[str, object], *, records_path: Path) 
 
 
 def _load_records_from_dataset_roots(
-    dataset_roots: list[Path],
+    dataset_sources: list[str | Path],
     *,
     split: str,
     seed: int,
@@ -410,17 +454,18 @@ def _load_records_from_dataset_roots(
     max_transcript_chars: int,
     max_symbol_ratio: float,
     lowercase_transcripts: bool,
+    hf_token: str | None = None,
 ) -> list:
     records = []
-    for dataset_root in dataset_roots:
+    for dataset_source in dataset_sources:
         remaining_samples = None
         if max_samples is not None:
             remaining_samples = max_samples - len(records)
             if remaining_samples <= 0:
                 break
-        records.extend(
+        iterator = (
             iter_cv22_records(
-                dataset_root=dataset_root,
+                dataset_root=dataset_source,
                 split=split,
                 seed=seed,
                 val_fraction=val_fraction,
@@ -431,7 +476,22 @@ def _load_records_from_dataset_roots(
                 max_symbol_ratio=max_symbol_ratio,
                 lowercase_transcripts=lowercase_transcripts,
             )
+            if isinstance(dataset_source, Path) and dataset_source.exists() and dataset_source.is_dir()
+            else iter_cv22_records_from_source(
+                dataset_source,
+                split=split,
+                seed=seed,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+                max_samples=remaining_samples,
+                min_transcript_chars=min_transcript_chars,
+                max_transcript_chars=max_transcript_chars,
+                max_symbol_ratio=max_symbol_ratio,
+                lowercase_transcripts=lowercase_transcripts,
+                hf_token=hf_token,
+            )
         )
+        records.extend(iterator)
     if not records:
         raise RuntimeError(
             f"Split '{split}' is empty after applying the current split fractions across "
@@ -1153,8 +1213,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Dataset source to load. Repeat to combine multiple sources. Each source may be a "
-            "Hugging Face dataset repo or a local directory with Common Voice-style TSV or "
-            "Parquet manifests plus audio files. If omitted, --dataset-repo is used."
+            "Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. "
+            "If omitted, --dataset-repo is used."
         ),
     )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
@@ -1814,7 +1875,7 @@ def main() -> None:
     variant_defaults = _variant_defaults(args.variant)
     lm_scorer = load_lm_scorer(args.lm_scorer)
 
-    dataset_roots = _resolve_dataset_roots(args)
+    dataset_sources = _resolve_dataset_sources(args)
     lowercase_transcripts = args.tokenizer != "sentencepiece"
     record_store_dir = (
         Path(args.record_cache_dir)
@@ -1822,7 +1883,7 @@ def main() -> None:
         else output_dir / "record_cache"
     )
     train_records = _build_disk_backed_record_store(
-        dataset_roots,
+        dataset_sources,
         split="train",
         seed=args.seed,
         val_fraction=args.val_fraction,
@@ -1833,9 +1894,10 @@ def main() -> None:
         max_symbol_ratio=args.max_symbol_ratio,
         lowercase_transcripts=lowercase_transcripts,
         records_path=record_store_dir / "train.jsonl",
+        hf_token=args.hf_token,
     )
     val_records = _build_disk_backed_record_store(
-        dataset_roots,
+        dataset_sources,
         split="validation",
         seed=args.seed,
         val_fraction=args.val_fraction,
@@ -1846,6 +1908,7 @@ def main() -> None:
         max_symbol_ratio=args.max_symbol_ratio,
         lowercase_transcripts=lowercase_transcripts,
         records_path=record_store_dir / "validation.jsonl",
+        hf_token=args.hf_token,
     )
     if args.prevalidate_audio:
         raise ValueError(
@@ -1860,7 +1923,7 @@ def main() -> None:
         )
         logger.info(
             "loaded dataset sources=%s train_samples=%s val_samples=%s speaker_balance_ratio=%.3f",
-            [str(dataset_root) for dataset_root in dataset_roots],
+            [str(dataset_source) for dataset_source in dataset_sources],
             len(train_records),
             len(val_records),
             float(split_audit["speaker_balance_ratio"]),

@@ -47,6 +47,7 @@ from train import (
     _build_fp8_recipe,
     _configure_console_logger,
     _load_records_from_dataset_roots,
+    _resolve_dataset_sources,
     _resolve_dataset_roots,
     _update_top_checkpoints,
     _validate_device_argument,
@@ -614,6 +615,24 @@ def test_resolve_dataset_roots_uses_dataset_source_list(
     assert _resolve_dataset_roots(args) == [first.resolve(), second.resolve()]
 
 
+def test_resolve_dataset_sources_preserves_remote_parquet_urls() -> None:
+    args = type(
+        "Args",
+        (),
+        {
+            "dataset_repo": "speech-uk/cv22",
+            "dataset_source": [
+                "https://huggingface.co/datasets/speech-uk/cv22/resolve/main/0.parquet",
+                "https://huggingface.co/datasets/speech-uk/cv22/resolve/main/0.parquet",
+            ],
+        },
+    )()
+
+    assert _resolve_dataset_sources(args) == [
+        "https://huggingface.co/datasets/speech-uk/cv22/resolve/main/0.parquet"
+    ]
+
+
 def test_load_records_from_dataset_roots_combines_sources_with_global_limit(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -683,6 +702,36 @@ def test_build_disk_backed_record_store_combines_sources_with_global_limit(tmp_p
     assert isinstance(store, DiskBackedRecordStore)
     assert len(store) == 3
     assert [record.utterance_id for record in store] == ["utt0", "utt1", "utt2"]
+
+
+def test_build_disk_backed_record_store_reads_parquet_manifest_file(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "train.parquet"
+    pl.DataFrame(
+        {
+            "path": ["a.wav", "b.wav"],
+            "sentence": ["перший запис", "другий запис"],
+            "id": ["utt0", "utt1"],
+            "duration": [0.3, 0.3],
+        }
+    ).write_parquet(manifest_path)
+
+    store = _build_disk_backed_record_store(
+        [manifest_path],
+        split="train",
+        seed=13,
+        val_fraction=0.0,
+        test_fraction=0.0,
+        max_samples=None,
+        min_transcript_chars=1,
+        max_transcript_chars=400,
+        max_symbol_ratio=0.5,
+        lowercase_transcripts=True,
+        records_path=tmp_path / "records" / "train.jsonl",
+    )
+
+    assert isinstance(store, DiskBackedRecordStore)
+    assert len(store) == 2
+    assert [record.utterance_id for record in store] == ["utt0", "utt1"]
 
 
 def test_disk_backed_record_store_shard_views_rows(tmp_path: Path) -> None:

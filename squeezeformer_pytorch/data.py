@@ -10,11 +10,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 import polars as pl
 import torch
 import torchaudio
-from huggingface_hub import list_repo_files, snapshot_download
+from huggingface_hub import hf_hub_url, list_repo_files, snapshot_download
 from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import BatchSampler, DataLoader, Dataset
@@ -108,6 +110,70 @@ def _iter_manifest_paths(dataset_root: Path) -> Iterable[Path]:
     return sorted(dataset_root.rglob("*.parquet"))
 
 
+def _is_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"}
+
+
+def _is_probable_hf_dataset_repo(value: str) -> bool:
+    if _is_url(value):
+        return False
+    if value.startswith(("/", "./", "../", "~/")):
+        return False
+    if value.endswith((".parquet", ".tsv")):
+        return False
+    return "/" in value
+
+
+def _auth_headers(token: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _read_remote_bytes(url: str, token: str | None = None) -> bytes:
+    request = Request(url, headers=_auth_headers(token))
+    with urlopen(request) as response:
+        return response.read()
+
+
+def read_binary_source(path_or_url: str, token: str | None = None) -> bytes:
+    if _is_url(path_or_url):
+        return _read_remote_bytes(path_or_url, token=token)
+    return Path(path_or_url).read_bytes()
+
+
+def _iter_remote_rows(source_url: str, *, token: str | None, batch_size: int) -> Iterable[dict[str, Any]]:
+    suffix = Path(urlparse(source_url).path).suffix.lower()
+    payload = io.BytesIO(_read_remote_bytes(source_url, token=token))
+    if suffix == ".tsv":
+        reader = pl.read_csv_batched(
+            payload,
+            separator="\t",
+            infer_schema_length=1000,
+            batch_size=batch_size,
+        )
+        while True:
+            batches = reader.next_batches(1)
+            if not batches:
+                break
+            yield from batches[0].iter_rows(named=True)
+        return
+    if suffix == ".parquet":
+        yield from pl.read_parquet(payload).iter_rows(named=True)
+        return
+    raise ValueError(f"Unsupported remote manifest format for {source_url}.")
+
+
+def _iter_repo_manifest_urls(repo_id: str, token: str | None) -> Iterable[str]:
+    repo_files = sorted(list_repo_files(repo_id, repo_type="dataset", token=token))
+    tsv_files = [repo_path for repo_path in repo_files if repo_path.endswith(".tsv")]
+    parquet_files = [repo_path for repo_path in repo_files if repo_path.endswith(".parquet")]
+    manifest_files = tsv_files or parquet_files
+    if not manifest_files:
+        raise FileNotFoundError(f"No TSV or Parquet manifest files found in dataset repo {repo_id}.")
+    for repo_path in manifest_files:
+        yield hf_hub_url(repo_id=repo_id, filename=repo_path, repo_type="dataset")
+
+
 def iter_manifest_rows(dataset_root: Path, batch_size: int = 8192) -> Iterable[dict[str, Any]]:
     manifest_paths = list(_iter_manifest_paths(dataset_root))
     if not manifest_paths:
@@ -130,6 +196,47 @@ def iter_manifest_rows(dataset_root: Path, batch_size: int = 8192) -> Iterable[d
 
         # Process Parquet files one at a time to avoid concatenating all manifests into memory.
         yield from pl.read_parquet(path).iter_rows(named=True)
+
+
+def iter_manifest_rows_from_source(
+    source: str | Path,
+    *,
+    hf_token: str | None = None,
+    batch_size: int = 8192,
+) -> Iterable[dict[str, Any]]:
+    source_path = Path(source).expanduser()
+    if source_path.exists():
+        if source_path.is_dir():
+            yield from iter_manifest_rows(source_path, batch_size=batch_size)
+            return
+        suffix = source_path.suffix.lower()
+        if suffix == ".tsv":
+            reader = pl.read_csv_batched(
+                source_path,
+                separator="\t",
+                infer_schema_length=1000,
+                batch_size=batch_size,
+            )
+            while True:
+                batches = reader.next_batches(1)
+                if not batches:
+                    break
+                yield from batches[0].iter_rows(named=True)
+            return
+        if suffix == ".parquet":
+            yield from pl.read_parquet(source_path).iter_rows(named=True)
+            return
+        raise ValueError(f"Unsupported manifest file: {source_path}")
+
+    source_text = str(source)
+    if _is_url(source_text):
+        yield from _iter_remote_rows(source_text, token=hf_token, batch_size=batch_size)
+        return
+    if _is_probable_hf_dataset_repo(source_text):
+        for manifest_url in _iter_repo_manifest_urls(source_text, token=hf_token):
+            yield from _iter_remote_rows(manifest_url, token=hf_token, batch_size=batch_size)
+        return
+    raise FileNotFoundError(f"Dataset source does not exist or is unsupported: {source_text}")
 
 
 def _extract_transcript(row: dict[str, Any], lowercase: bool = True) -> str:
@@ -158,6 +265,56 @@ def _resolve_audio(row: dict[str, Any], dataset_root: Path) -> tuple[str | None,
             if not path.is_absolute():
                 path = dataset_root / audio_path
             resolved_path = str(path)
+        if isinstance(audio_bytes, (bytes, bytearray)):
+            return resolved_path, bytes(audio_bytes)
+        if resolved_path is not None:
+            return resolved_path, None
+
+    raise KeyError(f"No audio source found in row. Tried {AUDIO_COLUMNS}.")
+
+
+def resolve_source_base(source: str | Path) -> Path | str:
+    source_path = Path(source).expanduser()
+    if source_path.exists():
+        return source_path if source_path.is_dir() else source_path.parent
+    source_text = str(source)
+    if _is_url(source_text):
+        return source_text.rsplit("/", 1)[0] + "/"
+    if _is_probable_hf_dataset_repo(source_text):
+        return source_text
+    return source_path.parent
+
+
+def resolve_audio_from_source(
+    row: dict[str, Any],
+    *,
+    source: str | Path,
+) -> tuple[str | None, bytes | None]:
+    source_base = resolve_source_base(source)
+
+    def resolve_path(path_value: str) -> str:
+        if _is_url(path_value):
+            return path_value
+        if isinstance(source_base, Path):
+            path = Path(path_value)
+            if not path.is_absolute():
+                path = source_base / path
+            return str(path)
+        if _is_probable_hf_dataset_repo(source_base):
+            return hf_hub_url(repo_id=source_base, filename=path_value, repo_type="dataset")
+        return urljoin(source_base, path_value)
+
+    path_value = row.get("path")
+    if isinstance(path_value, str) and path_value:
+        return resolve_path(path_value), None
+
+    audio_value = row.get("audio")
+    if isinstance(audio_value, dict):
+        audio_bytes = audio_value.get("bytes")
+        audio_path = audio_value.get("path")
+        resolved_path: str | None = None
+        if isinstance(audio_path, str) and audio_path:
+            resolved_path = resolve_path(audio_path)
         if isinstance(audio_bytes, (bytes, bytearray)):
             return resolved_path, bytes(audio_bytes)
         if resolved_path is not None:
@@ -298,6 +455,76 @@ def iter_cv22_records(
         try:
             transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
             audio_path, audio_bytes = _resolve_audio(row, dataset_root=dataset_root)
+        except KeyError:
+            continue
+        if not transcript_is_usable(
+            transcript,
+            min_chars=min_transcript_chars,
+            max_chars=max_transcript_chars,
+            max_symbol_ratio=max_symbol_ratio,
+        ):
+            continue
+        found_usable_record = True
+        utterance_id = str(row.get("id") or audio_path or scanned)
+        raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
+        speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
+        duration_seconds = (
+            row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
+        )
+        if isinstance(duration_seconds, (float, int)):
+            estimated_frames = max(1, int((float(duration_seconds) * 16000) / 160))
+        else:
+            estimated_frames = 0
+        record = CVRecord(
+            audio_path=audio_path,
+            audio_bytes=audio_bytes,
+            transcript=transcript,
+            utterance_id=utterance_id,
+            speaker_id=speaker_id,
+            has_speaker_id=speaker_id is not None,
+            estimated_frames=estimated_frames,
+        )
+        split_key = record.speaker_id or record.utterance_id
+        score = _hash_to_unit_interval(split_key, seed=seed)
+        if split == "train" and score >= train_cutoff:
+            continue
+        if split == "validation" and not (train_cutoff <= score < train_cutoff + val_fraction):
+            continue
+        if split == "test" and score < train_cutoff + val_fraction:
+            continue
+        yield record
+        selected += 1
+        if max_samples is not None and selected >= max_samples:
+            return
+
+    if not found_usable_record:
+        raise RuntimeError("No usable records were found in the dataset manifests.")
+
+
+def iter_cv22_records_from_source(
+    source: str | Path,
+    *,
+    split: str,
+    seed: int,
+    val_fraction: float,
+    test_fraction: float,
+    max_samples: int | None = None,
+    min_transcript_chars: int = 1,
+    max_transcript_chars: int = 400,
+    max_symbol_ratio: float = 0.5,
+    lowercase_transcripts: bool = True,
+    hf_token: str | None = None,
+) -> Iterable[CVRecord]:
+    selected = 0
+    found_usable_record = False
+    scanned = 0
+    train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
+
+    for row in iter_manifest_rows_from_source(source, hf_token=hf_token):
+        scanned += 1
+        try:
+            transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
+            audio_path, audio_bytes = resolve_audio_from_source(row, source=source)
         except KeyError:
             continue
         if not transcript_is_usable(
