@@ -62,7 +62,7 @@ except ImportError:
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import DelayedScaling, Format
-except ImportError:
+except (ImportError, OSError):
     te = None
     DelayedScaling = None
     Format = None
@@ -502,6 +502,7 @@ def _average_topk_checkpoints(output_dir: Path) -> Path | None:
                 logging.getLogger("train").warning(
                     "Skipping checkpoint %s during top-k averaging because parameter shapes do not match the template checkpoint.",
                     checkpoint_path,
+                    extra={"rank": 0},
                 )
                 continue
             for key, value in state_dict.items():

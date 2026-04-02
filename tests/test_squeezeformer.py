@@ -1,3 +1,5 @@
+import json
+import logging
 import math
 import sys
 from dataclasses import asdict
@@ -36,7 +38,9 @@ from squeezeformer_pytorch.data import (
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
 from train import (
     ExponentialMovingAverage,
+    _average_topk_checkpoints,
     _build_fp8_recipe,
+    _configure_console_logger,
     _validate_device_argument,
     _validate_fp8_runtime,
     _variant_defaults,
@@ -365,6 +369,48 @@ def test_load_cv22_records_preserves_case_when_lowercase_disabled(tmp_path: Path
         lowercase_transcripts=False,
     )
     assert [record.transcript for record in records] == ["Це Тест"]
+
+
+def test_average_topk_checkpoints_logs_shape_mismatch_without_rank_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logger = logging.getLogger("train")
+    logger.handlers.clear()
+    _configure_console_logger(rank=0, is_main_process=True)
+
+    topk_dir = tmp_path / "checkpoints_topk"
+    topk_dir.mkdir()
+    metadata = [
+        {"path": "ckpt_a.pt"},
+        {"path": "ckpt_b.pt"},
+    ]
+    (topk_dir / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    torch.save(
+        {
+            "model_state_dict": {"weight": torch.zeros(2, 2)},
+            "tokenizer": {"type": "character", "symbols": ["а"]},
+            "encoder_config": asdict(squeezeformer_variant("xs")),
+        },
+        topk_dir / "ckpt_a.pt",
+    )
+    torch.save(
+        {
+            "model_state_dict": {"weight": torch.zeros(3, 3)},
+            "tokenizer": {"type": "character", "symbols": ["а"]},
+            "encoder_config": asdict(squeezeformer_variant("xs")),
+        },
+        topk_dir / "ckpt_b.pt",
+    )
+    monkeypatch.setattr("train._export_inference_checkpoint", lambda checkpoint, path: path)
+
+    averaged_path = _average_topk_checkpoints(tmp_path)
+
+    assert averaged_path == tmp_path / "checkpoint_topk_avg.pt"
+    output = capsys.readouterr().out
+    assert "Skipping checkpoint" in output
+    assert "rank=0" in output
 
 
 def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
