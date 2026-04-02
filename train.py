@@ -182,36 +182,77 @@ def _variant_defaults(variant: str) -> SchedulerDefaults:
     return SchedulerDefaults(peak_lr=1e-3, num_time_masks=10)
 
 
-def _default_intermediate_ctc_layer(encoder_config: SqueezeformerConfig) -> int:
-    return max(0, (encoder_config.num_layers // 2) - 1)
+def _parse_intermediate_ctc_layers(value: object) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, int):
+        return (value,)
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return ()
+        return tuple(
+            int(part.strip())
+            for part in normalized.split(",")
+            if part.strip()
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(int(item) for item in value)
+    raise TypeError(f"Unsupported intermediate CTC layer specification: {type(value)!r}")
+
+
+def _dedupe_sorted_layers(layers: tuple[int, ...]) -> tuple[int, ...]:
+    return tuple(sorted(set(layers)))
+
+
+def _default_intermediate_ctc_layers(encoder_config: SqueezeformerConfig) -> tuple[int, ...]:
+    if encoder_config.num_layers < 4:
+        return (max(0, encoder_config.num_layers - 2),)
+    return _dedupe_sorted_layers(
+        (
+            max(0, (encoder_config.num_layers // 3) - 1),
+            max(0, ((2 * encoder_config.num_layers) // 3) - 1),
+        )
+    )
 
 
 def _resolve_intermediate_ctc_settings(
     args: argparse.Namespace,
     encoder_config: SqueezeformerConfig,
     checkpoint: dict[str, object] | None,
-) -> tuple[int | None, float]:
+) -> tuple[tuple[int, ...], float]:
     checkpoint_args = checkpoint.get("training_args", {}) if checkpoint is not None else {}
     checkpoint_weight = checkpoint_args.get("intermediate_ctc_weight")
+    checkpoint_layers = checkpoint_args.get("intermediate_ctc_layers")
     checkpoint_layer = checkpoint_args.get("intermediate_ctc_layer")
 
     if checkpoint_weight is not None:
         weight = float(checkpoint_weight)
-        layer = int(checkpoint_layer) if checkpoint_layer is not None else None
+        if checkpoint_layers is not None:
+            layers = _parse_intermediate_ctc_layers(checkpoint_layers)
+        else:
+            layers = _parse_intermediate_ctc_layers(checkpoint_layer)
     else:
         weight = float(args.intermediate_ctc_weight)
-        layer = args.intermediate_ctc_layer
+        if args.intermediate_ctc_layers is not None:
+            layers = _parse_intermediate_ctc_layers(args.intermediate_ctc_layers)
+        else:
+            layers = _parse_intermediate_ctc_layers(args.intermediate_ctc_layer)
 
     if weight <= 0.0:
-        return None, 0.0
-    if layer is None:
-        layer = _default_intermediate_ctc_layer(encoder_config)
-    if not 0 <= layer < encoder_config.num_layers:
+        return (), 0.0
+    if not layers:
+        layers = _default_intermediate_ctc_layers(encoder_config)
+    layers = _dedupe_sorted_layers(layers)
+    invalid_layers = [
+        layer for layer in layers if not 0 <= layer < encoder_config.num_layers
+    ]
+    if invalid_layers:
         raise ValueError(
-            "--intermediate-ctc-layer must be within encoder block range "
-            f"[0, {encoder_config.num_layers - 1}], got {layer}."
+            "--intermediate-ctc-layers must be within encoder block range "
+            f"[0, {encoder_config.num_layers - 1}], got {invalid_layers}."
         )
-    return layer, weight
+    return layers, weight
 
 
 def build_paper_scheduler(
@@ -727,6 +768,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hold-epochs", type=int, default=160)
     parser.add_argument("--decay-exponent", type=float, default=1.0)
     parser.add_argument("--intermediate-ctc-layer", type=int, default=None)
+    parser.add_argument("--intermediate-ctc-layers", default=None)
     parser.add_argument("--intermediate-ctc-weight", type=float, default=0.3)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)
@@ -1316,12 +1358,13 @@ def main() -> None:
             activation_checkpointing=args.activation_checkpointing,
             attention_backend=args.attention_backend,
         )
-    intermediate_ctc_layer, intermediate_ctc_weight = _resolve_intermediate_ctc_settings(
+    intermediate_ctc_layers, intermediate_ctc_weight = _resolve_intermediate_ctc_settings(
         args,
         encoder_config,
         checkpoint,
     )
-    args.intermediate_ctc_layer = intermediate_ctc_layer
+    args.intermediate_ctc_layers = list(intermediate_ctc_layers)
+    args.intermediate_ctc_layer = intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
     args.intermediate_ctc_weight = intermediate_ctc_weight
     fp8_recipe = _build_fp8_recipe(args)
     if distributed and requested_device.type == "cuda":
@@ -1338,7 +1381,7 @@ def main() -> None:
     model = SqueezeformerCTC(
         encoder_config=encoder_config,
         vocab_size=tokenizer.vocab_size,
-        intermediate_ctc_layer=intermediate_ctc_layer,
+        intermediate_ctc_layers=intermediate_ctc_layers,
         use_transformer_engine=args.dtype == DTypeChoice.FP8,
     )
     model.to(device)
@@ -1416,12 +1459,12 @@ def main() -> None:
         global_step = int(checkpoint.get("global_step", 0))
         best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
         logger.info(
-            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layer=%s intermediate_ctc_weight=%.3f",
+            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layers=%s intermediate_ctc_weight=%.3f",
             args.resume,
             start_epoch,
             global_step,
             best_val_wer,
-            intermediate_ctc_layer,
+            list(intermediate_ctc_layers),
             intermediate_ctc_weight,
         )
 
@@ -1437,7 +1480,10 @@ def main() -> None:
                 "active_optimizers": optimizer_names,
                 "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
                 "featurizer_config": featurizer.config_dict(),
-                "intermediate_ctc_layer": intermediate_ctc_layer,
+                "intermediate_ctc_layers": list(intermediate_ctc_layers),
+                "intermediate_ctc_layer": (
+                    intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
+                ),
                 "intermediate_ctc_weight": intermediate_ctc_weight,
                 "split_audit": split_audit,
                 "distributed": distributed,
@@ -1460,25 +1506,26 @@ def main() -> None:
             target_lengths = batch["target_lengths"].to(device)
 
             with _autocast_context(device, args.dtype, fp8_recipe=fp8_recipe):
-                (
-                    log_probs,
-                    output_lengths,
-                    intermediate_log_probs,
-                    intermediate_output_lengths,
-                ) = forward_model.log_probs_with_intermediate(features, feature_lengths)
+                log_probs, output_lengths, intermediate_log_probs, intermediate_output_lengths = (
+                    forward_model.log_probs_with_intermediate(features, feature_lengths)
+                )
                 main_ctc_loss = criterion(
                     log_probs.transpose(0, 1),
                     targets,
                     output_lengths,
                     target_lengths,
                 )
-                if intermediate_log_probs is not None and intermediate_output_lengths is not None:
-                    intermediate_ctc_loss = criterion(
-                        intermediate_log_probs.transpose(0, 1),
-                        targets,
-                        intermediate_output_lengths,
-                        target_lengths,
-                    )
+                if intermediate_log_probs and intermediate_output_lengths:
+                    intermediate_ctc_losses = [
+                        criterion(
+                            intermediate_log_probs[layer_index].transpose(0, 1),
+                            targets,
+                            intermediate_output_lengths[layer_index],
+                            target_lengths,
+                        )
+                        for layer_index in intermediate_ctc_layers
+                    ]
+                    intermediate_ctc_loss = torch.stack(intermediate_ctc_losses).mean()
                     loss = (
                         1.0 - intermediate_ctc_weight
                     ) * main_ctc_loss + intermediate_ctc_weight * intermediate_ctc_loss

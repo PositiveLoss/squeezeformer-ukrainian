@@ -103,15 +103,21 @@ def main() -> None:
     encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
     training_args = checkpoint.get("training_args", {})
     intermediate_ctc_weight = float(training_args.get("intermediate_ctc_weight", 0.0))
+    intermediate_ctc_layers = training_args.get("intermediate_ctc_layers")
     intermediate_ctc_layer = training_args.get("intermediate_ctc_layer")
+    if intermediate_ctc_weight > 0.0:
+        if intermediate_ctc_layers is not None:
+            resolved_intermediate_ctc_layers = tuple(int(layer) for layer in intermediate_ctc_layers)
+        elif intermediate_ctc_layer is not None:
+            resolved_intermediate_ctc_layers = (int(intermediate_ctc_layer),)
+        else:
+            resolved_intermediate_ctc_layers = ()
+    else:
+        resolved_intermediate_ctc_layers = ()
     model = SqueezeformerCTC(
         encoder_config=encoder_config,
         vocab_size=tokenizer.vocab_size,
-        intermediate_ctc_layer=(
-            int(intermediate_ctc_layer)
-            if intermediate_ctc_weight > 0.0 and intermediate_ctc_layer is not None
-            else None
-        ),
+        intermediate_ctc_layers=resolved_intermediate_ctc_layers,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     device = resolve_device(args.device)

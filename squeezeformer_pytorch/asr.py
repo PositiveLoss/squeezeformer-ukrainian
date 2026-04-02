@@ -206,12 +206,12 @@ class SqueezeformerCTC(nn.Module):
         self,
         encoder_config: SqueezeformerConfig,
         vocab_size: int,
-        intermediate_ctc_layer: int | None = None,
+        intermediate_ctc_layers: tuple[int, ...] = (),
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
-        self.intermediate_ctc_layer = intermediate_ctc_layer
+        self.intermediate_ctc_layers = tuple(intermediate_ctc_layers)
         self.use_transformer_engine = use_transformer_engine
         self.encoder = SqueezeformerEncoder(
             encoder_config,
@@ -222,14 +222,15 @@ class SqueezeformerCTC(nn.Module):
             vocab_size,
             use_transformer_engine=use_transformer_engine,
         )
-        self.intermediate_classifier = (
-            make_linear(
-                encoder_config.d_model,
-                vocab_size,
-                use_transformer_engine=use_transformer_engine,
-            )
-            if intermediate_ctc_layer is not None
-            else None
+        self.intermediate_classifiers = nn.ModuleDict(
+            {
+                str(layer_index): make_linear(
+                    encoder_config.d_model,
+                    vocab_size,
+                    use_transformer_engine=use_transformer_engine,
+                )
+                for layer_index in self.intermediate_ctc_layers
+            }
         )
 
     def forward(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
@@ -245,32 +246,57 @@ class SqueezeformerCTC(nn.Module):
         self,
         features: Tensor,
         feature_lengths: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
-        if self.intermediate_classifier is None or self.intermediate_ctc_layer is None:
+    ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
+        if not self.intermediate_classifiers or not self.intermediate_ctc_layers:
             log_probs, output_lengths = self.log_probs(features, feature_lengths)
-            return log_probs, output_lengths, None, None
+            return log_probs, output_lengths, {}, {}
 
         encoded, output_lengths, intermediate_encoded, intermediate_lengths = (
-            self.encoder.forward_with_intermediate(
+            self.encoder.forward_with_intermediates(
                 features,
                 feature_lengths,
-                intermediate_layer_index=self.intermediate_ctc_layer,
+                intermediate_layer_indices=self.intermediate_ctc_layers,
             )
         )
         logits = apply_linear_with_fp8_padding(self.classifier, encoded)
-        intermediate_logits = apply_linear_with_fp8_padding(
-            self.intermediate_classifier,
-            intermediate_encoded,
-        )
+        intermediate_log_probs = {
+            layer_index: F.log_softmax(
+                apply_linear_with_fp8_padding(
+                    self.intermediate_classifiers[str(layer_index)],
+                    intermediate_encoded[layer_index],
+                ),
+                dim=-1,
+            )
+            for layer_index in self.intermediate_ctc_layers
+        }
         return (
             F.log_softmax(logits, dim=-1),
             output_lengths,
-            F.log_softmax(intermediate_logits, dim=-1),
+            intermediate_log_probs,
             intermediate_lengths,
         )
 
     def to_config_dict(self) -> dict[str, object]:
         return asdict(self.encoder_config)
+
+    def load_state_dict(self, state_dict: dict[str, object], strict: bool = True):
+        # Backward-compatibility for checkpoints created with a single
+        # `intermediate_classifier.*` head before multi-head support landed.
+        if (
+            "intermediate_classifier.weight" in state_dict
+            and len(self.intermediate_ctc_layers) == 1
+            and f"intermediate_classifiers.{self.intermediate_ctc_layers[0]}.weight" not in state_dict
+        ):
+            remapped_state_dict = dict(state_dict)
+            layer_key = str(self.intermediate_ctc_layers[0])
+            for suffix in ("weight", "bias"):
+                old_key = f"intermediate_classifier.{suffix}"
+                if old_key in remapped_state_dict:
+                    remapped_state_dict[f"intermediate_classifiers.{layer_key}.{suffix}"] = (
+                        remapped_state_dict.pop(old_key)
+                    )
+            state_dict = remapped_state_dict
+        return super().load_state_dict(state_dict, strict=strict)
 
 
 def load_lm_scorer(spec: str | None) -> Callable[[str], float] | None:

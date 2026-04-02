@@ -53,7 +53,19 @@ class ASRInferenceSession:
         training_args = checkpoint_data.get("training_args", {})
         checkpoint_dtype = str(training_args.get("dtype", ""))
         intermediate_ctc_weight = float(training_args.get("intermediate_ctc_weight", 0.0))
+        intermediate_ctc_layers = training_args.get("intermediate_ctc_layers")
         intermediate_ctc_layer = training_args.get("intermediate_ctc_layer")
+        if intermediate_ctc_weight > 0.0:
+            if intermediate_ctc_layers is not None:
+                resolved_intermediate_ctc_layers = tuple(
+                    int(layer) for layer in intermediate_ctc_layers
+                )
+            elif intermediate_ctc_layer is not None:
+                resolved_intermediate_ctc_layers = (int(intermediate_ctc_layer),)
+            else:
+                resolved_intermediate_ctc_layers = ()
+        else:
+            resolved_intermediate_ctc_layers = ()
         use_transformer_engine = checkpoint_dtype == "fp8" or dtype == DTypeChoice.FP8
         if dtype == DTypeChoice.FP8:
             validate_fp8_inference_runtime(device, encoder_config)
@@ -61,11 +73,7 @@ class ASRInferenceSession:
         self.model = SqueezeformerCTC(
             encoder_config=encoder_config,
             vocab_size=self.tokenizer.vocab_size,
-            intermediate_ctc_layer=(
-                int(intermediate_ctc_layer)
-                if intermediate_ctc_weight > 0.0 and intermediate_ctc_layer is not None
-                else None
-            ),
+            intermediate_ctc_layers=resolved_intermediate_ctc_layers,
             use_transformer_engine=use_transformer_engine,
         )
         self.model.load_state_dict(checkpoint_data["model_state_dict"])

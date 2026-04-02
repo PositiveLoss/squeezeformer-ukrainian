@@ -783,18 +783,21 @@ class SqueezeformerEncoder(nn.Module):
         self,
         features: Tensor,
         lengths: Tensor,
-        intermediate_layer_index: int | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+        intermediate_layer_indices: tuple[int, ...] = (),
+    ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
         if features.dim() != 3:
             raise ValueError(
                 f"Expected features with shape [batch, time, mel], got {tuple(features.shape)}"
             )
-        if intermediate_layer_index is not None and not (
-            0 <= intermediate_layer_index < len(self.blocks)
-        ):
+        invalid_indices = [
+            layer_index
+            for layer_index in intermediate_layer_indices
+            if not 0 <= layer_index < len(self.blocks)
+        ]
+        if invalid_indices:
             raise ValueError(
-                "intermediate_layer_index must reference an encoder block within "
-                f"[0, {len(self.blocks) - 1}], got {intermediate_layer_index}."
+                "intermediate_layer_indices must reference encoder blocks within "
+                f"[0, {len(self.blocks) - 1}], got {invalid_indices}."
             )
 
         x = self.subsampling(features)
@@ -805,8 +808,8 @@ class SqueezeformerEncoder(nn.Module):
         x = self.input_norm(x)
 
         recover_stack: list[tuple[Tensor, Tensor]] = []
-        intermediate_x: Tensor | None = None
-        intermediate_lengths: Tensor | None = None
+        intermediate_xs: dict[int, Tensor] = {}
+        intermediate_lengths: dict[int, Tensor] = {}
         for layer_index, block in enumerate(self.blocks):
             if layer_index in self.config.time_reduce_idx:
                 recover_stack.append((x, lengths))
@@ -849,32 +852,38 @@ class SqueezeformerEncoder(nn.Module):
             else:
                 x = block(x, pos=pos, attn_mask=attn_mask, pad_mask=pad_mask)
             x = x[:, : int(lengths.max().item()), :]
-            if layer_index == intermediate_layer_index:
-                intermediate_x = x
-                intermediate_lengths = lengths
+            if layer_index in intermediate_layer_indices:
+                intermediate_xs[layer_index] = x
+                intermediate_lengths[layer_index] = lengths
 
-        return x, lengths, intermediate_x, intermediate_lengths
+        return x, lengths, intermediate_xs, intermediate_lengths
 
     def forward(self, features: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
         x, lengths, _, _ = self._forward_impl(features, lengths)
         return x, lengths
 
-    def forward_with_intermediate(
+    def forward_with_intermediates(
         self,
         features: Tensor,
         lengths: Tensor,
-        intermediate_layer_index: int,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        x, output_lengths, intermediate_x, intermediate_lengths = self._forward_impl(
+        intermediate_layer_indices: tuple[int, ...],
+    ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
+        x, output_lengths, intermediate_xs, intermediate_lengths = self._forward_impl(
             features,
             lengths,
-            intermediate_layer_index=intermediate_layer_index,
+            intermediate_layer_indices=intermediate_layer_indices,
         )
-        if intermediate_x is None or intermediate_lengths is None:
+        missing_indices = [
+            layer_index
+            for layer_index in intermediate_layer_indices
+            if layer_index not in intermediate_xs or layer_index not in intermediate_lengths
+        ]
+        if missing_indices:
             raise RuntimeError(
-                f"Failed to capture intermediate encoder output for layer {intermediate_layer_index}."
+                "Failed to capture intermediate encoder outputs for layers "
+                f"{missing_indices}."
             )
-        return x, output_lengths, intermediate_x, intermediate_lengths
+        return x, output_lengths, intermediate_xs, intermediate_lengths
 
 
 def build_squeezeformer_encoder(
