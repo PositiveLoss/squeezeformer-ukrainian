@@ -18,7 +18,7 @@ from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, Opt
 
 try:
     import transformer_engine.pytorch as te
-except ImportError, OSError:
+except (ImportError, OSError):
     te = None
 
 DTYPE_CHOICES = ("auto",) + tuple(choice.value for choice in DTypeChoice)
