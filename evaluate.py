@@ -28,6 +28,7 @@ from squeezeformer_pytorch.data import (
 from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
 from train import (
+    FrozenLibertaTeacher,
     _validate_device_argument,
     _validate_device_ready,
     evaluate,
@@ -125,7 +126,11 @@ def main() -> None:
     aed_decoder_layers = int(training_args.get("aed_decoder_layers", 1))
     aed_decoder_heads = int(training_args.get("aed_decoder_heads", 4))
     aed_decoder_dropout = float(training_args.get("aed_decoder_dropout", 0.1))
+    aed_loss_weight = float(training_args.get("aed_loss_weight", 0.3))
     liberta_distill_enabled = bool(training_args.get("liberta_distill", False))
+    liberta_model_name = str(training_args.get("liberta_model_name", "Yehor/Liberta"))
+    liberta_distill_weight = float(training_args.get("liberta_distill_weight", 0.05))
+    liberta_max_length = int(training_args.get("liberta_max_length", 256))
     if intermediate_ctc_weight > 0.0:
         if intermediate_ctc_layers is not None:
             resolved_intermediate_ctc_layers = tuple(int(layer) for layer in intermediate_ctc_layers)
@@ -209,6 +214,15 @@ def main() -> None:
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
     lm_scorer = load_lm_scorer(args.lm_scorer)
+    liberta_teacher = (
+        FrozenLibertaTeacher(
+            liberta_model_name,
+            device=device,
+            max_length=liberta_max_length,
+        )
+        if liberta_distill_enabled
+        else None
+    )
     result = evaluate(
         model=model,
         dataloader=dataloader,
@@ -221,6 +235,10 @@ def main() -> None:
         lm_scorer=lm_scorer,
         lm_weight=args.lm_weight,
         example_limit=args.example_limit,
+        intermediate_ctc_weight=intermediate_ctc_weight,
+        aed_loss_weight=aed_loss_weight,
+        liberta_teacher=liberta_teacher,
+        liberta_distill_weight=liberta_distill_weight,
     )
     metrics = result["metrics"] | {
         "split": args.split,
@@ -233,6 +251,20 @@ def main() -> None:
         "random_examples": result["random_examples"],
         "speaker_metrics": result["speaker_metrics"],
     }
+    print(
+        "losses:",
+        " ".join(
+            f"{name}={float(metrics[name]):.6f}"
+            for name in (
+                "loss",
+                "main_ctc_loss",
+                "intermediate_ctc_loss",
+                "combined_ctc_loss",
+                "aed_loss",
+                "liberta_distill_loss",
+            )
+        ),
+    )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     if args.report_path:
         report_path = Path(args.report_path)

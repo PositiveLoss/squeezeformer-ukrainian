@@ -1526,9 +1526,18 @@ def evaluate(
     lm_scorer=None,
     lm_weight: float = 0.0,
     example_limit: int = 5,
+    intermediate_ctc_weight: float = 0.0,
+    aed_loss_weight: float = 0.0,
+    liberta_teacher: FrozenLibertaTeacher | None = None,
+    liberta_distill_weight: float = 0.0,
 ) -> dict[str, object]:
     model.eval()
     total_loss = 0.0
+    total_main_ctc_loss = 0.0
+    total_intermediate_ctc_loss = 0.0
+    total_combined_ctc_loss = 0.0
+    total_aed_loss = 0.0
+    total_liberta_distill_loss = 0.0
     total_batches = 0
     references: list[str] = []
     hypotheses: list[str] = []
@@ -1541,11 +1550,90 @@ def evaluate(
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
+            if model.aed_decoder is not None:
+                decoder_inputs, decoder_targets, decoder_target_lengths = _build_aed_targets(
+                    targets,
+                    target_lengths,
+                    bos_id=model.aed_decoder.bos_id,
+                    eos_id=model.aed_decoder.eos_id,
+                    token_offset=model.aed_decoder.token_offset,
+                    pad_id=model.aed_decoder.pad_id,
+                )
+                decoder_inputs = decoder_inputs.to(device)
+                decoder_targets = decoder_targets.to(device)
+                decoder_target_lengths = decoder_target_lengths.to(device)
+            else:
+                decoder_inputs = None
+                decoder_targets = None
+                decoder_target_lengths = None
 
             with _autocast_context(device, dtype, fp8_recipe=fp8_recipe):
-                log_probs, output_lengths = model.log_probs(features, feature_lengths)
-                loss = criterion(log_probs.transpose(0, 1), targets, output_lengths, target_lengths)
+                log_probs, output_lengths, intermediate_log_probs, intermediate_output_lengths = (
+                    model.log_probs_with_intermediate(features, feature_lengths)
+                )
+                main_ctc_loss = criterion(
+                    log_probs.transpose(0, 1),
+                    targets,
+                    output_lengths,
+                    target_lengths,
+                )
+                if intermediate_log_probs and intermediate_output_lengths:
+                    intermediate_ctc_losses = [
+                        criterion(
+                            intermediate_log_probs[layer_index].transpose(0, 1),
+                            targets,
+                            intermediate_output_lengths[layer_index],
+                            target_lengths,
+                        )
+                        for layer_index in model.intermediate_ctc_layers
+                    ]
+                    intermediate_ctc_loss = torch.stack(intermediate_ctc_losses).mean()
+                    combined_ctc_loss = (
+                        (1.0 - intermediate_ctc_weight) * main_ctc_loss
+                        + intermediate_ctc_weight * intermediate_ctc_loss
+                    )
+                else:
+                    intermediate_ctc_loss = None
+                    combined_ctc_loss = main_ctc_loss
+                if decoder_inputs is not None and decoder_targets is not None:
+                    aed_logits, _, aed_hidden = model.aed_forward(
+                        features,
+                        feature_lengths,
+                        decoder_inputs,
+                    )
+                    aed_loss = _aed_cross_entropy_loss(
+                        aed_logits,
+                        decoder_targets,
+                        pad_id=model.aed_decoder.pad_id,
+                    )
+                    loss = (1.0 - aed_loss_weight) * combined_ctc_loss + aed_loss_weight * aed_loss
+                else:
+                    aed_loss = None
+                    aed_hidden = None
+                    loss = combined_ctc_loss
+            if liberta_teacher is not None and aed_hidden is not None and decoder_target_lengths is not None:
+                teacher_embeddings = liberta_teacher.encode(batch["transcripts"])
+                student_embeddings = model.project_aed_hidden_for_liberta(
+                    aed_hidden,
+                    decoder_target_lengths,
+                )
+                liberta_distill_loss = F.mse_loss(
+                    F.normalize(student_embeddings, dim=-1),
+                    F.normalize(teacher_embeddings, dim=-1),
+                )
+                loss = loss + (liberta_distill_weight * liberta_distill_loss)
+            else:
+                liberta_distill_loss = None
             total_loss += float(loss.item())
+            total_main_ctc_loss += float(main_ctc_loss.item())
+            total_intermediate_ctc_loss += float(
+                intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
+            )
+            total_combined_ctc_loss += float(combined_ctc_loss.item())
+            total_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
+            total_liberta_distill_loss += float(
+                liberta_distill_loss.item() if liberta_distill_loss is not None else 0.0
+            )
             total_batches += 1
             references.extend(batch["transcripts"])
             utterance_ids.extend(batch["utterance_ids"])
@@ -1563,6 +1651,11 @@ def evaluate(
             )
     metrics = {
         "loss": total_loss / max(1, total_batches),
+        "main_ctc_loss": total_main_ctc_loss / max(1, total_batches),
+        "intermediate_ctc_loss": total_intermediate_ctc_loss / max(1, total_batches),
+        "combined_ctc_loss": total_combined_ctc_loss / max(1, total_batches),
+        "aed_loss": total_aed_loss / max(1, total_batches),
+        "liberta_distill_loss": total_liberta_distill_loss / max(1, total_batches),
         "cer": char_error_rate(references, hypotheses),
         "wer": word_error_rate(references, hypotheses),
     }
@@ -2194,12 +2287,25 @@ def main() -> None:
                         for name, optimizer in zip(optimizer_names, optimizers, strict=True)
                     }
                     logger.info(
-                        "epoch=%s step=%s/%s global_step=%s train_loss=%.4f grad_norm=%.4f %s",
+                        (
+                            "epoch=%s step=%s/%s global_step=%s train_loss=%.4f "
+                            "train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f "
+                            "train_aed_loss=%.4f train_liberta_distill_loss=%.4f "
+                            "grad_norm=%.4f %s"
+                        ),
                         epoch,
                         batch_index,
                         len(train_loader),
                         global_step,
                         float(loss.item()),
+                        float(main_ctc_loss.item()),
+                        float(intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0),
+                        float(aed_loss.item() if aed_loss is not None else 0.0),
+                        float(
+                            liberta_distill_loss.item()
+                            if liberta_distill_loss is not None
+                            else 0.0
+                        ),
                         grad_norm,
                         " ".join(f"{name}={value:.6g}" for name, value in learning_rates.items()),
                     )
@@ -2255,6 +2361,10 @@ def main() -> None:
                 lm_scorer=lm_scorer,
                 lm_weight=args.lm_weight,
                 example_limit=args.example_limit,
+                intermediate_ctc_weight=intermediate_ctc_weight,
+                aed_loss_weight=args.aed_loss_weight,
+                liberta_teacher=liberta_teacher,
+                liberta_distill_weight=args.liberta_distill_weight,
             )
             if ema_backup is not None:
                 ExponentialMovingAverage.restore(model, ema_backup)
@@ -2330,13 +2440,20 @@ def main() -> None:
             averaged_path = _average_topk_checkpoints(output_dir)
             logger.info(
                 (
-                    "epoch %s complete train_loss=%.4f val_loss=%.4f val_cer=%.4f "
-                    "val_wer=%.4f best_val_wer=%.4f report=%s latest=%s best=%s "
-                    "averaged=%s"
+                    "epoch %s complete train_loss=%.4f val_loss=%.4f "
+                    "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
+                    "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
+                    "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
+                    "best_val_wer=%.4f report=%s latest=%s best=%s averaged=%s"
                 ),
                 epoch,
                 train_loss,
                 float(val_metrics["loss"]),
+                float(val_metrics["main_ctc_loss"]),
+                float(val_metrics["intermediate_ctc_loss"]),
+                float(val_metrics["combined_ctc_loss"]),
+                float(val_metrics["aed_loss"]),
+                float(val_metrics["liberta_distill_loss"]),
                 float(val_metrics["cer"]),
                 float(val_metrics["wer"]),
                 best_val_wer,
