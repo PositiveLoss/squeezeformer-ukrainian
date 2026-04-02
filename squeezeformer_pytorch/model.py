@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 try:
     import transformer_engine.pytorch as te
-except ImportError, OSError:
+except (ImportError, OSError):
     te = None
 
 
@@ -611,7 +611,7 @@ class TimeReductionLayer(nn.Module):
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = x.transpose(1, 2)
-        lengths = torch.div(lengths + self.stride - 1, self.stride, rounding_mode="floor")
+        lengths = torch.div(lengths, self.stride, rounding_mode="floor")
         return x, lengths
 
 
