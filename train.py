@@ -188,14 +188,9 @@ class DiskBackedRecordStore:
         handle = self._open_handle()
         handle.seek(self.offsets[global_index])
         payload = json.loads(handle.readline())
-        audio_bytes_payload = payload.get("audio_bytes")
         return CVRecord(
             audio_path=payload["audio_path"],
-            audio_bytes=(
-                base64.b64decode(audio_bytes_payload)
-                if isinstance(audio_bytes_payload, str) and audio_bytes_payload
-                else None
-            ),
+            audio_bytes=_load_cached_audio_bytes(payload, records_path=self.records_path),
             transcript=payload["transcript"],
             utterance_id=payload["utterance_id"],
             estimated_frames=int(self.estimated_frames[global_index]),
@@ -232,12 +227,7 @@ class DiskBackedRecordStore:
                 payload = json.loads(handle.readline())
             finally:
                 handle.close()
-            audio_bytes_payload = payload.get("audio_bytes")
-            audio_bytes = (
-                base64.b64decode(audio_bytes_payload)
-                if isinstance(audio_bytes_payload, str) and audio_bytes_payload
-                else None
-            )
+            audio_bytes = _load_cached_audio_bytes(payload, records_path=self.records_path)
             num_samples, sample_rate = probe_audio_metadata(payload["audio_path"], audio_bytes)
             frames = max(1, int(num_samples / hop_length)) if num_samples > 0 and sample_rate > 0 else 0
             return global_index, frames
@@ -266,6 +256,7 @@ def _build_disk_backed_record_store(
     records_path: Path,
 ) -> DiskBackedRecordStore:
     records_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_blob_dir = records_path.parent / f"{records_path.stem}_audio_blobs"
     offsets = array.array("Q")
     estimated_frames = array.array("I")
     written = 0
@@ -291,16 +282,20 @@ def _build_disk_backed_record_store(
                 preserve_audio_bytes = record.audio_bytes is not None and not (
                     record.audio_path is not None and Path(record.audio_path).exists()
                 )
+                audio_blob_path: str | None = None
+                if preserve_audio_bytes:
+                    audio_blob_dir.mkdir(parents=True, exist_ok=True)
+                    blob_name = hashlib.sha256(record.audio_bytes).hexdigest() + ".bin"
+                    blob_path = audio_blob_dir / blob_name
+                    if not blob_path.exists():
+                        blob_path.write_bytes(record.audio_bytes)
+                    audio_blob_path = str(blob_path.relative_to(records_path.parent))
                 offsets.append(handle.tell())
                 handle.write(
                     json.dumps(
                         {
                             "audio_path": record.audio_path,
-                            "audio_bytes": (
-                                base64.b64encode(record.audio_bytes).decode("ascii")
-                                if preserve_audio_bytes
-                                else None
-                            ),
+                            "audio_blob_path": audio_blob_path,
                             "transcript": record.transcript,
                             "utterance_id": record.utterance_id,
                             "speaker_id": record.speaker_id,
@@ -318,6 +313,19 @@ def _build_disk_backed_record_store(
             "all dataset sources."
         )
     return DiskBackedRecordStore(records_path, offsets, estimated_frames)
+
+
+def _load_cached_audio_bytes(payload: dict[str, object], *, records_path: Path) -> bytes | None:
+    audio_blob_path = payload.get("audio_blob_path")
+    if isinstance(audio_blob_path, str) and audio_blob_path:
+        blob_path = Path(audio_blob_path)
+        if not blob_path.is_absolute():
+            blob_path = records_path.parent / blob_path
+        return blob_path.read_bytes()
+    audio_bytes_payload = payload.get("audio_bytes")
+    if isinstance(audio_bytes_payload, str) and audio_bytes_payload:
+        return base64.b64decode(audio_bytes_payload)
+    return None
 
 
 def _load_records_from_dataset_roots(
