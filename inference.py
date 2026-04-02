@@ -13,13 +13,15 @@ from squeezeformer_pytorch.asr import SqueezeformerCTC, tokenizer_from_dict
 from squeezeformer_pytorch.checkpoints import load_checkpoint
 from squeezeformer_pytorch.frontend import AudioFeaturizer
 from squeezeformer_pytorch.model import SqueezeformerConfig
+from squeezeformer_pytorch.runtime_types import DTypeChoice
 
 DEFAULT_CHECKPOINT = "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
 
 
 class ASRInferenceSession:
-    def __init__(self, checkpoint: str, device: torch.device) -> None:
+    def __init__(self, checkpoint: str, device: torch.device, dtype: DTypeChoice) -> None:
         self.device = device
+        self.dtype = dtype
         self.checkpoint_path = resolve_checkpoint_path(checkpoint)
 
         checkpoint_data = load_checkpoint(self.checkpoint_path, map_location="cpu")
@@ -47,7 +49,7 @@ class ASRInferenceSession:
         features = self.featurizer(waveform, sample_rate).unsqueeze(0).to(self.device)
         feature_lengths = torch.tensor([features.size(1)], device=self.device)
 
-        with torch.inference_mode():
+        with torch.inference_mode(), inference_autocast_context(self.device, self.dtype):
             log_probs, _ = self.model.log_probs(features, feature_lengths)
 
         token_ids = log_probs.argmax(dim=-1)[0].cpu().tolist()
@@ -91,6 +93,13 @@ def parse_args() -> argparse.Namespace:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Execution device, for example 'cpu' or 'cuda:0'.",
     )
+    parser.add_argument(
+        "--dtype",
+        type=DTypeChoice,
+        choices=list(DTypeChoice),
+        default=DTypeChoice.BFLOAT16 if torch.cuda.is_available() else DTypeChoice.FLOAT32,
+        help="Inference autocast dtype.",
+    )
     return parser.parse_args()
 
 
@@ -99,6 +108,22 @@ def resolve_device(device_arg: str) -> torch.device:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA was requested, but torch.cuda.is_available() is false.")
     return device
+
+
+def inference_autocast_context(device: torch.device, dtype: DTypeChoice):
+    if dtype == DTypeChoice.FLOAT32:
+        return torch.autocast(device_type=device.type, enabled=False)
+    if dtype == DTypeChoice.FLOAT16:
+        if device.type == "cpu":
+            raise ValueError("float16 inference is not supported on CPU. Use bfloat16 or float32.")
+        return torch.autocast(device_type=device.type, dtype=torch.float16)
+    if dtype == DTypeChoice.BFLOAT16:
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+    if dtype == DTypeChoice.FP8:
+        raise ValueError(
+            "FP8 inference is not supported by inference.py. Use float32, float16, or bfloat16."
+        )
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 def build_app(session: ASRInferenceSession) -> gr.Blocks:
@@ -134,7 +159,7 @@ def build_app(session: ASRInferenceSession) -> gr.Blocks:
 def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
-    session = ASRInferenceSession(args.checkpoint, device)
+    session = ASRInferenceSession(args.checkpoint, device, args.dtype)
 
     if args.gradio:
         app = build_app(session)
