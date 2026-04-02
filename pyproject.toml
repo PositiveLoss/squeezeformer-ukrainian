@@ -14,6 +14,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+jax = [
+    "flax>=0.11.0",
+    "jax>=0.6.0",
+    "optax>=0.2.5",
+    "orbax-checkpoint>=0.11.0",
+]
 train = [
     "jiwer>=4.0.0",
     "nvidia-npp>=13.1.0.44",
