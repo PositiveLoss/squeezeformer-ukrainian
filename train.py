@@ -174,7 +174,18 @@ def _configure_console_logger(rank: int, is_main_process: bool) -> logging.Logge
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO if is_main_process else logging.WARNING)
     if not logger.handlers:
+        class _RankFilter(logging.Filter):
+            def __init__(self, default_rank: int) -> None:
+                super().__init__()
+                self.default_rank = default_rank
+
+            def filter(self, record: logging.LogRecord) -> bool:
+                if not hasattr(record, "rank"):
+                    record.rank = self.default_rank
+                return True
+
         handler = logging.StreamHandler(sys.stdout)
+        handler.addFilter(_RankFilter(rank))
         handler.setFormatter(
             logging.Formatter("%(asctime)s | %(levelname)s | rank=%(rank)s | %(message)s")
         )
