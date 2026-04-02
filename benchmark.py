@@ -7,7 +7,10 @@ import time
 import torch
 
 from squeezeformer_pytorch import SqueezeformerCTC, squeezeformer_variant, tokenizer_from_dict
-from squeezeformer_pytorch.checkpoints import load_checkpoint
+from squeezeformer_pytorch.checkpoints import (
+    load_checkpoint,
+    should_use_transformer_engine_for_checkpoint,
+)
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
 from train import (
     _autocast_context,
@@ -68,7 +71,14 @@ def _load_model(args: argparse.Namespace) -> tuple[SqueezeformerCTC, object]:
             from squeezeformer_pytorch.model import SqueezeformerConfig
 
             config = SqueezeformerConfig(**checkpoint["encoder_config"])
-        model = SqueezeformerCTC(encoder_config=config, vocab_size=tokenizer.vocab_size)
+        model = SqueezeformerCTC(
+            encoder_config=config,
+            vocab_size=tokenizer.vocab_size,
+            use_transformer_engine=should_use_transformer_engine_for_checkpoint(
+                checkpoint,
+                requested_dtype=args.dtype,
+            ),
+        )
         model.load_state_dict(checkpoint["model_state_dict"])
         return model, tokenizer
     config = squeezeformer_variant(args.variant)

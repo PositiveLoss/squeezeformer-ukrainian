@@ -13,7 +13,10 @@ from squeezeformer_pytorch.asr import (
     load_lm_scorer,
     tokenizer_from_dict,
 )
-from squeezeformer_pytorch.checkpoints import load_checkpoint
+from squeezeformer_pytorch.checkpoints import (
+    load_checkpoint,
+    should_use_transformer_engine_for_checkpoint,
+)
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
@@ -138,6 +141,10 @@ def main() -> None:
         aed_decoder_heads=aed_decoder_heads,
         aed_decoder_dropout=aed_decoder_dropout,
         liberta_distill_enabled=liberta_distill_enabled,
+        use_transformer_engine=should_use_transformer_engine_for_checkpoint(
+            checkpoint,
+            requested_dtype=args.dtype,
+        ),
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     device = resolve_device(args.device)

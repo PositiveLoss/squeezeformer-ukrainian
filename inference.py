@@ -12,7 +12,11 @@ import torchaudio
 from huggingface_hub import hf_hub_download
 
 from squeezeformer_pytorch.asr import SqueezeformerCTC, tokenizer_from_dict
-from squeezeformer_pytorch.checkpoints import load_checkpoint
+from squeezeformer_pytorch.checkpoints import (
+    is_torchao_quantized_checkpoint,
+    load_checkpoint,
+    should_use_transformer_engine_for_checkpoint,
+)
 from squeezeformer_pytorch.frontend import AudioFeaturizer
 from squeezeformer_pytorch.model import (
     FP8_SHAPE_ALIGNMENT,
@@ -24,7 +28,7 @@ from squeezeformer_pytorch.runtime_types import DTypeChoice
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import DelayedScaling, Format
-except ImportError:
+except (ImportError, OSError):
     te = None
     DelayedScaling = None
     Format = None
@@ -32,13 +36,6 @@ except ImportError:
 DEFAULT_CHECKPOINT = (
     "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
 )
-
-
-def _is_torchao_quantized_checkpoint(checkpoint_data: dict[str, Any]) -> bool:
-    quantization = checkpoint_data.get("quantization")
-    return isinstance(quantization, dict) and quantization.get("backend") == "torchao"
-
-
 class ASRInferenceSession:
     def __init__(
         self,
@@ -57,7 +54,6 @@ class ASRInferenceSession:
         self.tokenizer = tokenizer_from_dict(checkpoint_data["tokenizer"])
         encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
         training_args = checkpoint_data.get("training_args", {})
-        checkpoint_dtype = str(training_args.get("dtype", ""))
         intermediate_ctc_weight = float(training_args.get("intermediate_ctc_weight", 0.0))
         intermediate_ctc_layers = training_args.get("intermediate_ctc_layers")
         intermediate_ctc_layer = training_args.get("intermediate_ctc_layer")
@@ -69,7 +65,7 @@ class ASRInferenceSession:
         aed_decoder_heads = int(training_args.get("aed_decoder_heads", 4))
         aed_decoder_dropout = float(training_args.get("aed_decoder_dropout", 0.1))
         liberta_distill_enabled = bool(training_args.get("liberta_distill", False))
-        is_torchao_quantized = _is_torchao_quantized_checkpoint(checkpoint_data)
+        is_torchao_quantized = is_torchao_quantized_checkpoint(checkpoint_data)
         if intermediate_ctc_weight > 0.0:
             if intermediate_ctc_layers is not None:
                 resolved_intermediate_ctc_layers = tuple(
@@ -81,8 +77,9 @@ class ASRInferenceSession:
                 resolved_intermediate_ctc_layers = ()
         else:
             resolved_intermediate_ctc_layers = ()
-        use_transformer_engine = not is_torchao_quantized and (
-            checkpoint_dtype == "fp8" or dtype == DTypeChoice.FP8
+        use_transformer_engine = should_use_transformer_engine_for_checkpoint(
+            checkpoint_data,
+            requested_dtype=dtype,
         )
         if dtype == DTypeChoice.FP8:
             if is_torchao_quantized:

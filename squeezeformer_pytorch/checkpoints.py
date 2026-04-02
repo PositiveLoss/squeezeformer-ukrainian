@@ -4,7 +4,7 @@ import json
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 from safetensors.torch import load_file, save_file
@@ -43,6 +43,24 @@ def load_checkpoint(
     checkpoint = json.loads(metadata_path.read_text(encoding="utf-8"))
     checkpoint["model_state_dict"] = load_file(str(checkpoint_path), device=str(map_location))
     return checkpoint
+
+
+def is_torchao_quantized_checkpoint(checkpoint: Mapping[str, Any]) -> bool:
+    quantization = checkpoint.get("quantization")
+    return isinstance(quantization, Mapping) and quantization.get("backend") == "torchao"
+
+
+def should_use_transformer_engine_for_checkpoint(
+    checkpoint: Mapping[str, Any],
+    requested_dtype: DTypeChoice | None = None,
+) -> bool:
+    if is_torchao_quantized_checkpoint(checkpoint):
+        return False
+    training_args = checkpoint.get("training_args")
+    checkpoint_dtype = ""
+    if isinstance(training_args, Mapping):
+        checkpoint_dtype = str(training_args.get("dtype", ""))
+    return checkpoint_dtype == DTypeChoice.FP8.value or requested_dtype == DTypeChoice.FP8
 
 
 def save_checkpoint(checkpoint: dict[str, Any], checkpoint_path: str | Path) -> None:
