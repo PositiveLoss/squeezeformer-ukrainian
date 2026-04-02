@@ -79,6 +79,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Launch the Gradio app instead of transcribing one file and exiting.",
     )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Create a public Gradio share link.",
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Host for the Gradio server.")
     parser.add_argument("--port", type=int, default=7860, help="Port for the Gradio server.")
     parser.add_argument(
@@ -133,7 +138,7 @@ def main() -> None:
 
     if args.gradio:
         app = build_app(session)
-        app.launch(server_name=args.host, server_port=args.port)
+        app.launch(server_name=args.host, server_port=args.port, share=args.share)
         return
 
     if not args.audio:
