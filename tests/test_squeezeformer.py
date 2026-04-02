@@ -1,6 +1,6 @@
-from dataclasses import asdict
 import math
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import polars as pl

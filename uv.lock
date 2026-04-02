@@ -1411,13 +1411,17 @@ source = { virtual = "." }
 dependencies = [
     { name = "gradio" },
     { name = "huggingface-hub" },
-    { name = "jiwer" },
-    { name = "nvidia-npp" },
-    { name = "polars" },
     { name = "safetensors" },
     { name = "sentencepiece" },
     { name = "torch" },
     { name = "torchaudio" },
+]
+
+[package.optional-dependencies]
+train = [
+    { name = "jiwer" },
+    { name = "nvidia-npp" },
+    { name = "polars" },
     { name = "torchcodec" },
     { name = "trackio" },
     { name = "transformer-engine", extra = ["pytorch"] },
@@ -1433,17 +1437,18 @@ dev = [
 requires-dist = [
     { name = "gradio", specifier = ">=5.38.0" },
     { name = "huggingface-hub", specifier = ">=0.34.0" },
-    { name = "jiwer", specifier = ">=4.0.0" },
-    { name = "nvidia-npp", specifier = ">=13.1.0.44" },
-    { name = "polars", specifier = ">=1.30.0" },
+    { name = "jiwer", marker = "extra == 'train'", specifier = ">=4.0.0" },
+    { name = "nvidia-npp", marker = "extra == 'train'", specifier = ">=13.1.0.44" },
+    { name = "polars", marker = "extra == 'train'", specifier = ">=1.30.0" },
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "sentencepiece", specifier = ">=0.2.0" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "torchaudio", specifier = ">=2.11.0" },
-    { name = "torchcodec", specifier = ">=0.11.0" },
-    { name = "trackio", specifier = ">=0.20.2" },
-    { name = "transformer-engine", extras = ["pytorch"], specifier = ">=2.13.0" },
+    { name = "torchcodec", marker = "extra == 'train'", specifier = ">=0.11.0" },
+    { name = "trackio", marker = "extra == 'train'", specifier = ">=0.20.2" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'train'", specifier = ">=2.13.0" },
 ]
+provides-extras = ["train"]
 
 [package.metadata.requires-dev]
 dev = [

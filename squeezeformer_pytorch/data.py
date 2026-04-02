@@ -16,6 +16,7 @@ import torch
 import torchaudio
 from huggingface_hub import list_repo_files, snapshot_download
 from torch import Tensor
+from torch.nn import functional as F
 from torch.utils.data import BatchSampler, DataLoader, Dataset
 
 from .asr import Tokenizer

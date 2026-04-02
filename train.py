@@ -28,6 +28,7 @@ from squeezeformer_pytorch.asr import (
     load_lm_scorer,
     tokenizer_from_dict,
 )
+from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
     CV22ASRDataset,
@@ -38,7 +39,6 @@ from squeezeformer_pytorch.data import (
     load_cv22_records,
     prevalidate_records,
 )
-from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.lm import NGramLanguageModel
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import (
@@ -49,8 +49,8 @@ from squeezeformer_pytorch.model import (
 )
 from squeezeformer_pytorch.runtime_types import (
     AdaptiveBatchUnit,
-    DTypeChoice,
     DecodeStrategy,
+    DTypeChoice,
     OptimizerChoice,
 )
 

@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 
-import torch
 import trackio
 from torch import nn
 

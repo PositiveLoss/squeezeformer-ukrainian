@@ -15,7 +15,9 @@ from squeezeformer_pytorch.frontend import AudioFeaturizer
 from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DTypeChoice
 
-DEFAULT_CHECKPOINT = "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
+DEFAULT_CHECKPOINT = (
+    "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
+)
 
 
 class ASRInferenceSession:

@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
-from .runtime_types import AdaptiveBatchUnit, DTypeChoice, DecodeStrategy, OptimizerChoice
+from .runtime_types import AdaptiveBatchUnit, DecodeStrategy, DTypeChoice, OptimizerChoice
 
 
 def _register_legacy_main_aliases() -> None:

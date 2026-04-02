@@ -50,9 +50,7 @@ def transformer_engine_available() -> bool:
 
 
 def _is_fp8_compatible_linear_shape(in_features: int, out_features: int) -> bool:
-    return (
-        in_features % FP8_SHAPE_ALIGNMENT == 0 and out_features % FP8_SHAPE_ALIGNMENT == 0
-    )
+    return in_features % FP8_SHAPE_ALIGNMENT == 0 and out_features % FP8_SHAPE_ALIGNMENT == 0
 
 
 def _pad_tensor_along_dim(x: Tensor, dim: int, target_size: int) -> Tensor:
@@ -90,8 +88,10 @@ def make_linear(
     bias: bool = True,
     use_transformer_engine: bool = False,
 ) -> nn.Module:
-    if use_transformer_engine and te is not None and _is_fp8_compatible_linear_shape(
-        in_features, out_features
+    if (
+        use_transformer_engine
+        and te is not None
+        and _is_fp8_compatible_linear_shape(in_features, out_features)
     ):
         return te.Linear(in_features, out_features, bias=bias)
     return nn.Linear(in_features, out_features, bias=bias)
