@@ -105,6 +105,9 @@ def main() -> None:
     intermediate_ctc_weight = float(training_args.get("intermediate_ctc_weight", 0.0))
     intermediate_ctc_layers = training_args.get("intermediate_ctc_layers")
     intermediate_ctc_layer = training_args.get("intermediate_ctc_layer")
+    blank_prune_threshold = float(training_args.get("blank_prune_threshold", 0.0))
+    blank_prune_layer = training_args.get("blank_prune_layer")
+    blank_prune_min_keep_frames = int(training_args.get("blank_prune_min_keep_frames", 1))
     if intermediate_ctc_weight > 0.0:
         if intermediate_ctc_layers is not None:
             resolved_intermediate_ctc_layers = tuple(int(layer) for layer in intermediate_ctc_layers)
@@ -118,6 +121,13 @@ def main() -> None:
         encoder_config=encoder_config,
         vocab_size=tokenizer.vocab_size,
         intermediate_ctc_layers=resolved_intermediate_ctc_layers,
+        blank_prune_layer=(
+            int(blank_prune_layer)
+            if blank_prune_threshold > 0.0 and blank_prune_layer is not None
+            else None
+        ),
+        blank_prune_threshold=blank_prune_threshold,
+        blank_prune_min_keep_frames=blank_prune_min_keep_frames,
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     device = resolve_device(args.device)

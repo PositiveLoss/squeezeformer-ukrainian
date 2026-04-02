@@ -201,17 +201,60 @@ def load_tokenizer(path: str | Path) -> Tokenizer:
     return tokenizer_from_dict(payload)
 
 
+def prune_encoder_frames_by_blank_probability(
+    x: Tensor,
+    lengths: Tensor,
+    blank_probabilities: Tensor,
+    *,
+    threshold: float,
+    min_keep_frames: int = 1,
+) -> tuple[Tensor, Tensor]:
+    batch_size, _, hidden_dim = x.shape
+    pruned_sequences: list[Tensor] = []
+    pruned_lengths: list[int] = []
+
+    for batch_index in range(batch_size):
+        valid_length = int(lengths[batch_index].item())
+        valid_states = x[batch_index, :valid_length]
+        valid_blank_probs = blank_probabilities[batch_index, :valid_length]
+        keep_mask = valid_blank_probs < threshold
+        keep_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+
+        if keep_indices.numel() < min_keep_frames:
+            topk = min(valid_length, max(1, min_keep_frames))
+            keep_indices = torch.topk(
+                -valid_blank_probs,
+                k=topk,
+                largest=True,
+            ).indices.sort().values
+
+        pruned_sequences.append(valid_states.index_select(0, keep_indices))
+        pruned_lengths.append(int(keep_indices.numel()))
+
+    max_pruned_length = max(pruned_lengths)
+    pruned_batch = x.new_zeros((batch_size, max_pruned_length, hidden_dim))
+    for batch_index, sequence in enumerate(pruned_sequences):
+        pruned_batch[batch_index, : sequence.size(0)] = sequence
+    return pruned_batch, lengths.new_tensor(pruned_lengths)
+
+
 class SqueezeformerCTC(nn.Module):
     def __init__(
         self,
         encoder_config: SqueezeformerConfig,
         vocab_size: int,
         intermediate_ctc_layers: tuple[int, ...] = (),
+        blank_prune_layer: int | None = None,
+        blank_prune_threshold: float = 0.0,
+        blank_prune_min_keep_frames: int = 1,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
         self.intermediate_ctc_layers = tuple(intermediate_ctc_layers)
+        self.blank_prune_layer = blank_prune_layer
+        self.blank_prune_threshold = blank_prune_threshold
+        self.blank_prune_min_keep_frames = blank_prune_min_keep_frames
         self.use_transformer_engine = use_transformer_engine
         self.encoder = SqueezeformerEncoder(
             encoder_config,
@@ -222,6 +265,9 @@ class SqueezeformerCTC(nn.Module):
             vocab_size,
             use_transformer_engine=use_transformer_engine,
         )
+        ctc_head_layers = set(self.intermediate_ctc_layers)
+        if self.blank_prune_layer is not None and self.blank_prune_threshold > 0.0:
+            ctc_head_layers.add(self.blank_prune_layer)
         self.intermediate_classifiers = nn.ModuleDict(
             {
                 str(layer_index): make_linear(
@@ -229,12 +275,47 @@ class SqueezeformerCTC(nn.Module):
                     vocab_size,
                     use_transformer_engine=use_transformer_engine,
                 )
-                for layer_index in self.intermediate_ctc_layers
+                for layer_index in sorted(ctc_head_layers)
             }
         )
 
+    def _post_block_transforms(self) -> dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]]:
+        post_block_transforms: dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]] = {}
+        if self.blank_prune_layer is None or self.blank_prune_threshold <= 0.0:
+            return post_block_transforms
+
+        prune_layer_key = str(self.blank_prune_layer)
+        if prune_layer_key not in self.intermediate_classifiers:
+            raise RuntimeError(f"Missing CTC head for blank pruning layer {self.blank_prune_layer}.")
+
+        def blank_prune_transform(x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
+            prune_logits = apply_linear_with_fp8_padding(
+                self.intermediate_classifiers[prune_layer_key],
+                x,
+            )
+            prune_log_probs = F.log_softmax(prune_logits, dim=-1)
+            blank_probabilities = prune_log_probs[..., 0].exp()
+            return prune_encoder_frames_by_blank_probability(
+                x,
+                lengths,
+                blank_probabilities,
+                threshold=self.blank_prune_threshold,
+                min_keep_frames=self.blank_prune_min_keep_frames,
+            )
+
+        post_block_transforms[self.blank_prune_layer] = blank_prune_transform
+        return post_block_transforms
+
     def forward(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
-        encoded, output_lengths = self.encoder(features, feature_lengths)
+        if self.blank_prune_layer is not None and self.blank_prune_threshold > 0.0:
+            encoded, output_lengths, _, _ = self.encoder.forward_with_intermediates(
+                features,
+                feature_lengths,
+                intermediate_layer_indices=(),
+                post_block_transforms=self._post_block_transforms(),
+            )
+        else:
+            encoded, output_lengths = self.encoder(features, feature_lengths)
         logits = apply_linear_with_fp8_padding(self.classifier, encoded)
         return logits, output_lengths
 
@@ -247,7 +328,10 @@ class SqueezeformerCTC(nn.Module):
         features: Tensor,
         feature_lengths: Tensor,
     ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
-        if not self.intermediate_classifiers or not self.intermediate_ctc_layers:
+        if (
+            not self.intermediate_classifiers
+            and (self.blank_prune_layer is None or self.blank_prune_threshold <= 0.0)
+        ):
             log_probs, output_lengths = self.log_probs(features, feature_lengths)
             return log_probs, output_lengths, {}, {}
 
@@ -256,6 +340,7 @@ class SqueezeformerCTC(nn.Module):
                 features,
                 feature_lengths,
                 intermediate_layer_indices=self.intermediate_ctc_layers,
+                post_block_transforms=self._post_block_transforms(),
             )
         )
         logits = apply_linear_with_fp8_padding(self.classifier, encoded)

@@ -255,6 +255,36 @@ def _resolve_intermediate_ctc_settings(
     return layers, weight
 
 
+def _resolve_blank_pruning_settings(
+    args: argparse.Namespace,
+    encoder_config: SqueezeformerConfig,
+    checkpoint: dict[str, object] | None,
+) -> tuple[int | None, float, int]:
+    checkpoint_args = checkpoint.get("training_args", {}) if checkpoint is not None else {}
+    if "blank_prune_threshold" in checkpoint_args:
+        threshold = float(checkpoint_args.get("blank_prune_threshold", 0.0))
+        layer = checkpoint_args.get("blank_prune_layer")
+        min_keep_frames = int(checkpoint_args.get("blank_prune_min_keep_frames", 1))
+    else:
+        threshold = float(args.blank_prune_threshold)
+        layer = args.blank_prune_layer
+        min_keep_frames = int(args.blank_prune_min_keep_frames)
+
+    if threshold <= 0.0:
+        return None, 0.0, max(1, min_keep_frames)
+    if layer is None:
+        raise ValueError("--blank-prune-layer is required when --blank-prune-threshold > 0.")
+    layer = int(layer)
+    if not 0 <= layer < encoder_config.num_layers:
+        raise ValueError(
+            "--blank-prune-layer must be within encoder block range "
+            f"[0, {encoder_config.num_layers - 1}], got {layer}."
+        )
+    if min_keep_frames < 1:
+        raise ValueError("--blank-prune-min-keep-frames must be at least 1.")
+    return layer, threshold, min_keep_frames
+
+
 def build_paper_scheduler(
     optimizer: torch.optim.Optimizer,
     steps_per_epoch: int,
@@ -770,6 +800,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intermediate-ctc-layer", type=int, default=None)
     parser.add_argument("--intermediate-ctc-layers", default=None)
     parser.add_argument("--intermediate-ctc-weight", type=float, default=0.3)
+    parser.add_argument("--blank-prune-layer", type=int, default=None)
+    parser.add_argument("--blank-prune-threshold", type=float, default=0.0)
+    parser.add_argument("--blank-prune-min-keep-frames", type=int, default=1)
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)
     parser.add_argument("--muon-warmup-epochs", type=int, default=None)
@@ -1363,9 +1396,15 @@ def main() -> None:
         encoder_config,
         checkpoint,
     )
+    blank_prune_layer, blank_prune_threshold, blank_prune_min_keep_frames = (
+        _resolve_blank_pruning_settings(args, encoder_config, checkpoint)
+    )
     args.intermediate_ctc_layers = list(intermediate_ctc_layers)
     args.intermediate_ctc_layer = intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
     args.intermediate_ctc_weight = intermediate_ctc_weight
+    args.blank_prune_layer = blank_prune_layer
+    args.blank_prune_threshold = blank_prune_threshold
+    args.blank_prune_min_keep_frames = blank_prune_min_keep_frames
     fp8_recipe = _build_fp8_recipe(args)
     if distributed and requested_device.type == "cuda":
         if requested_device.index not in {None, local_rank}:
@@ -1382,6 +1421,9 @@ def main() -> None:
         encoder_config=encoder_config,
         vocab_size=tokenizer.vocab_size,
         intermediate_ctc_layers=intermediate_ctc_layers,
+        blank_prune_layer=blank_prune_layer,
+        blank_prune_threshold=blank_prune_threshold,
+        blank_prune_min_keep_frames=blank_prune_min_keep_frames,
         use_transformer_engine=args.dtype == DTypeChoice.FP8,
     )
     model.to(device)
@@ -1459,13 +1501,15 @@ def main() -> None:
         global_step = int(checkpoint.get("global_step", 0))
         best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
         logger.info(
-            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layers=%s intermediate_ctc_weight=%.3f",
+            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layers=%s intermediate_ctc_weight=%.3f blank_prune_layer=%s blank_prune_threshold=%.3f",
             args.resume,
             start_epoch,
             global_step,
             best_val_wer,
             list(intermediate_ctc_layers),
             intermediate_ctc_weight,
+            blank_prune_layer,
+            blank_prune_threshold,
         )
 
     if is_main_process:
@@ -1485,6 +1529,9 @@ def main() -> None:
                     intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
                 ),
                 "intermediate_ctc_weight": intermediate_ctc_weight,
+                "blank_prune_layer": blank_prune_layer,
+                "blank_prune_threshold": blank_prune_threshold,
+                "blank_prune_min_keep_frames": blank_prune_min_keep_frames,
                 "split_audit": split_audit,
                 "distributed": distributed,
                 "world_size": world_size,

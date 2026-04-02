@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
+from typing import Callable
 
 import torch
 from torch import Tensor, nn
@@ -784,6 +785,7 @@ class SqueezeformerEncoder(nn.Module):
         features: Tensor,
         lengths: Tensor,
         intermediate_layer_indices: tuple[int, ...] = (),
+        post_block_transforms: dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]] | None = None,
     ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
         if features.dim() != 3:
             raise ValueError(
@@ -810,6 +812,7 @@ class SqueezeformerEncoder(nn.Module):
         recover_stack: list[tuple[Tensor, Tensor]] = []
         intermediate_xs: dict[int, Tensor] = {}
         intermediate_lengths: dict[int, Tensor] = {}
+        post_block_transforms = post_block_transforms or {}
         for layer_index, block in enumerate(self.blocks):
             if layer_index in self.config.time_reduce_idx:
                 recover_stack.append((x, lengths))
@@ -855,6 +858,9 @@ class SqueezeformerEncoder(nn.Module):
             if layer_index in intermediate_layer_indices:
                 intermediate_xs[layer_index] = x
                 intermediate_lengths[layer_index] = lengths
+            if layer_index in post_block_transforms:
+                x, lengths = post_block_transforms[layer_index](x, lengths)
+                x = x[:, : int(lengths.max().item()), :]
 
         return x, lengths, intermediate_xs, intermediate_lengths
 
@@ -867,11 +873,13 @@ class SqueezeformerEncoder(nn.Module):
         features: Tensor,
         lengths: Tensor,
         intermediate_layer_indices: tuple[int, ...],
+        post_block_transforms: dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]] | None = None,
     ) -> tuple[Tensor, Tensor, dict[int, Tensor], dict[int, Tensor]]:
         x, output_lengths, intermediate_xs, intermediate_lengths = self._forward_impl(
             features,
             lengths,
             intermediate_layer_indices=intermediate_layer_indices,
+            post_block_transforms=post_block_transforms,
         )
         missing_indices = [
             layer_index

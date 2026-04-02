@@ -18,6 +18,7 @@ from squeezeformer_pytorch import (
     tokenizer_from_dict,
 )
 from squeezeformer_pytorch.asr import load_lm_scorer
+from squeezeformer_pytorch.asr import prune_encoder_frames_by_blank_probability
 from squeezeformer_pytorch.checkpoints import load_checkpoint, save_checkpoint
 from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
@@ -208,6 +209,61 @@ def test_ctc_model_can_emit_intermediate_log_probs_for_multiple_heads(tmp_path: 
     assert torch.isfinite(log_probs).all()
     assert torch.isfinite(intermediate_log_probs[4]).all()
     assert torch.isfinite(intermediate_log_probs[7]).all()
+
+
+def test_blank_probability_pruning_keeps_minimum_frames() -> None:
+    x = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3)
+    lengths = torch.tensor([4, 3], dtype=torch.int64)
+    blank_probabilities = torch.tensor(
+        [
+            [0.99, 0.98, 0.10, 0.97],
+            [0.95, 0.94, 0.93, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+
+    pruned_x, pruned_lengths = prune_encoder_frames_by_blank_probability(
+        x,
+        lengths,
+        blank_probabilities,
+        threshold=0.5,
+        min_keep_frames=2,
+    )
+
+    assert torch.equal(pruned_lengths, torch.tensor([2, 2]))
+    assert pruned_x.shape == (2, 2, 3)
+    assert torch.equal(pruned_x[0, 0], x[0, 0])
+    assert torch.equal(pruned_x[0, 1], x[0, 2])
+    assert torch.equal(pruned_x[1, 0], x[1, 1])
+    assert torch.equal(pruned_x[1, 1], x[1, 2])
+
+
+@torch.no_grad()
+def test_ctc_blank_pruning_shortens_reduced_region() -> None:
+    model = SqueezeformerCTC(
+        encoder_config=squeezeformer_variant("xs"),
+        vocab_size=6,
+        blank_prune_layer=7,
+        blank_prune_threshold=0.6,
+        blank_prune_min_keep_frames=1,
+    )
+    model.eval()
+    blank_head = model.intermediate_classifiers["7"]
+    blank_head.weight.zero_()
+    blank_head.bias.fill_(-5.0)
+    blank_head.bias[0] = 5.0
+
+    lengths = torch.tensor([160, 123], dtype=torch.int64)
+    features = torch.randn(2, int(lengths.max().item()), 80)
+    _, _, intermediate_xs, intermediate_lengths = model.encoder.forward_with_intermediates(
+        features,
+        lengths,
+        intermediate_layer_indices=(8,),
+        post_block_transforms=model._post_block_transforms(),
+    )
+
+    assert intermediate_xs[8].shape[1] == 1
+    assert torch.equal(intermediate_lengths[8], torch.tensor([1, 1]))
 
 
 def test_variant_table_matches_paper() -> None:
