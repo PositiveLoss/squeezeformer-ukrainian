@@ -937,6 +937,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
+    parser.add_argument(
+        "--record-cache-dir",
+        default=None,
+        help=(
+            "Directory for disk-backed train/validation record indexes. Defaults to "
+            "OUTPUT_DIR/record_cache."
+        ),
+    )
     parser.add_argument("--resume", default=None)
     parser.add_argument(
         "--distributed",
@@ -1476,7 +1484,11 @@ def main() -> None:
 
     dataset_roots = _resolve_dataset_roots(args)
     lowercase_transcripts = args.tokenizer != "sentencepiece"
-    record_store_dir = output_dir / "record_cache"
+    record_store_dir = (
+        Path(args.record_cache_dir)
+        if args.record_cache_dir is not None
+        else output_dir / "record_cache"
+    )
     train_records = _build_disk_backed_record_store(
         dataset_roots,
         split="train",

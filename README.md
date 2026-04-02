@@ -124,7 +124,7 @@ To combine multiple sources during training, repeat `--dataset-source`. Each ent
 When `--dataset-source` is present, `train.py` uses that list instead of `--dataset-repo`.
 
 For large runs, `train.py` now streams selected split records into on-disk JSONL indexes under
-`OUTPUT_DIR/record_cache` instead of keeping the full combined manifest in RAM. That makes
+`OUTPUT_DIR/record_cache` by default, or under `--record-cache-dir` if you provide it, instead of keeping the full combined manifest in RAM. That makes
 multi-source training practical even when the backing audio spans hundreds of GB, as long as the
 manifests and cache files fit on disk.
 
@@ -136,6 +136,7 @@ Example: mix two Google Drive folders in Colab
 ```bash
 uv run python train.py \
   --device cuda \
+  --record-cache-dir /content/drive/MyDrive/asr/record_cache \
   --dataset-source /content/drive/MyDrive/asr/source_a \
   --dataset-source /content/drive/MyDrive/asr/source_b
 ```
