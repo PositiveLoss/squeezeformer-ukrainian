@@ -38,6 +38,7 @@ from squeezeformer_pytorch.data import (
     transcript_is_usable,
 )
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
+from squeezeformer_pytorch.secrets import REDACTED, sanitize_for_serialization
 from train import (
     DiskBackedRecordStore,
     ExponentialMovingAverage,
@@ -335,6 +336,60 @@ def test_safetensors_checkpoint_roundtrip(tmp_path: Path) -> None:
     assert restored["training_args"] == checkpoint["training_args"]
     for key, value in checkpoint["model_state_dict"].items():
         assert torch.equal(restored["model_state_dict"][key], value)
+
+
+def test_safetensors_checkpoint_metadata_redacts_hf_tokens(tmp_path: Path) -> None:
+    tokenizer = SentencePieceTokenizer.train(
+        ["привіт світе", "це короткий тест", "мовна модель"],
+        model_prefix=tmp_path / "spm_scrub_ckpt",
+        vocab_size=24,
+    )
+    model = SqueezeformerCTC(
+        encoder_config=squeezeformer_variant("xs"),
+        vocab_size=tokenizer.vocab_size,
+    )
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "encoder_config": asdict(model.encoder_config),
+        "tokenizer": tokenizer.to_dict(),
+        "training_args": {
+            "hf_token": "hf_abcdefghijklmnopqrstuvwxyz123456",
+            "nested": {
+                "authorization": "Bearer hf_abcdefghijklmnopqrstuvwxyz123456",
+            },
+        },
+    }
+
+    checkpoint_path = tmp_path / "checkpoint_last.safetensors"
+    save_checkpoint(checkpoint, checkpoint_path)
+
+    metadata = json.loads(checkpoint_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert metadata["training_args"]["hf_token"] == REDACTED
+    assert REDACTED in metadata["training_args"]["nested"]["authorization"]
+    assert "hf_abcdefghijklmnopqrstuvwxyz123456" not in json.dumps(metadata)
+
+
+def test_sanitize_for_serialization_redacts_recursive_secret_fields() -> None:
+    payload = {
+        "hf_token": "hf_abcdefghijklmnopqrstuvwxyz123456",
+        "training_args": {
+            "api_key": "hf_abcdefghijklmnopqrstuvwxyz123456",
+            "dataset_repo": "speech-uk/squeezeformer-sm",
+            "nested": [
+                {"authorization": "Bearer hf_abcdefghijklmnopqrstuvwxyz123456"},
+                "hf_abcdefghijklmnopqrstuvwxyz123456",
+            ],
+        },
+        "tokenizer": {"type": "sentencepiece"},
+    }
+
+    sanitized = sanitize_for_serialization(payload)
+
+    assert sanitized["hf_token"] == REDACTED
+    assert sanitized["training_args"]["api_key"] == REDACTED
+    assert REDACTED in sanitized["training_args"]["nested"][0]["authorization"]
+    assert sanitized["training_args"]["nested"][1] == REDACTED
+    assert sanitized["tokenizer"] == payload["tokenizer"]
 
 
 def test_ngram_lm_prefers_seen_extension(tmp_path: Path) -> None:

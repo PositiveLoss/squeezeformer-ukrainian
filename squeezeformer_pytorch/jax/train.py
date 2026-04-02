@@ -41,6 +41,7 @@ from squeezeformer_pytorch.data import (
 )
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.runtime_types import AdaptiveBatchUnit
+from squeezeformer_pytorch.secrets import sanitize_for_serialization
 
 from .model import SqueezeformerConfig, SqueezeformerCTC, squeezeformer_variant
 from .training import (
@@ -296,11 +297,13 @@ def _save_checkpoint(path: Path, checkpoint: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as handle:
         pickle.dump(checkpoint, handle)
-    metadata = {
-        key: value
-        for key, value in checkpoint.items()
-        if key not in {"params", "batch_stats", "opt_state"}
-    }
+    metadata = sanitize_for_serialization(
+        {
+            key: value
+            for key, value in checkpoint.items()
+            if key not in {"params", "batch_stats", "opt_state"}
+        }
+    )
     path.with_suffix(".json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",

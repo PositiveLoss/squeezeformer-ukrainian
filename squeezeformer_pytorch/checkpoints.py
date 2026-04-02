@@ -10,6 +10,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from .runtime_types import AdaptiveBatchUnit, DecodeStrategy, DTypeChoice, OptimizerChoice
+from .secrets import sanitize_for_serialization
 
 
 def _register_legacy_main_aliases() -> None:
@@ -59,7 +60,9 @@ def save_checkpoint(checkpoint: dict[str, Any], checkpoint_path: str | Path) -> 
     }
     save_file(state_dict, str(checkpoint_path), metadata={"format": "squeezeformer-pytorch"})
 
-    metadata = {key: value for key, value in checkpoint.items() if key != "model_state_dict"}
+    metadata = sanitize_for_serialization(
+        {key: value for key, value in checkpoint.items() if key != "model_state_dict"}
+    )
     metadata_path = checkpoint_path.with_suffix(".json")
     metadata_path.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False, default=_json_default),
