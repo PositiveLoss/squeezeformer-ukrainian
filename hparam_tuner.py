@@ -98,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variant", default="sm", choices=VARIANT_CHOICES)
     parser.add_argument("--optimizer", default="muon", choices=OPTIMIZER_CHOICES)
     parser.add_argument("--tokenizer", default="sentencepiece", choices=TOKENIZER_CHOICES)
-    parser.add_argument("--spm-vocab-size", type=int, default=128)
+    parser.add_argument("--spm-vocab-size", type=int, default=4096)
     parser.add_argument("--device", type=_validate_device_argument, required=True)
     parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES)
     parser.add_argument("--feature-cache-dir", default=None)
