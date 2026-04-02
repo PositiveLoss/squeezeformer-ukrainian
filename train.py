@@ -229,10 +229,12 @@ def _resolve_dataset_roots(args: argparse.Namespace) -> list[Path]:
     return dataset_roots
 
 
-def _resolve_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
-    sources = list(args.dataset_source or [])
+def _resolve_sources(raw_sources: list[str] | None, *, fallback: str | None = None) -> list[str | Path]:
+    sources = list(raw_sources or [])
     if not sources:
-        sources = [args.dataset_repo]
+        if fallback is None:
+            return []
+        sources = [fallback]
 
     resolved_sources: list[str | Path] = []
     seen: set[str] = set()
@@ -245,6 +247,14 @@ def _resolve_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
         seen.add(dedupe_key)
         resolved_sources.append(resolved_source)
     return resolved_sources
+
+
+def _resolve_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
+    return _resolve_sources(args.dataset_source, fallback=args.dataset_repo)
+
+
+def _resolve_validation_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
+    return _resolve_sources(args.validation_dataset_source)
 
 
 class DiskBackedRecordStore:
@@ -534,11 +544,17 @@ def _prevalidate_loaded_records(
 
 def _load_train_val_records(
     args: argparse.Namespace,
-    dataset_sources: list[str | Path],
+    train_dataset_sources: list[str | Path],
+    validation_dataset_sources: list[str | Path],
     *,
     lowercase_transcripts: bool,
     output_dir: Path,
 ) -> tuple[list[CVRecord] | DiskBackedRecordStore, list[CVRecord] | DiskBackedRecordStore]:
+    use_external_validation = bool(validation_dataset_sources)
+    validation_split = "train" if use_external_validation else "validation"
+    validation_val_fraction = 0.0 if use_external_validation else args.val_fraction
+    validation_test_fraction = 0.0 if use_external_validation else args.test_fraction
+
     if args.record_cache:
         record_store_dir = (
             Path(args.record_cache_dir)
@@ -546,7 +562,7 @@ def _load_train_val_records(
             else output_dir / "record_cache"
         )
         train_records = _build_disk_backed_record_store(
-            dataset_sources,
+            train_dataset_sources,
             split="train",
             seed=args.seed,
             val_fraction=args.val_fraction,
@@ -560,11 +576,11 @@ def _load_train_val_records(
             hf_token=args.hf_token,
         )
         val_records = _build_disk_backed_record_store(
-            dataset_sources,
-            split="validation",
+            validation_dataset_sources or train_dataset_sources,
+            split=validation_split,
             seed=args.seed,
-            val_fraction=args.val_fraction,
-            test_fraction=args.test_fraction,
+            val_fraction=validation_val_fraction,
+            test_fraction=validation_test_fraction,
             max_samples=args.max_val_samples,
             min_transcript_chars=args.min_transcript_chars,
             max_transcript_chars=args.max_transcript_chars,
@@ -581,7 +597,7 @@ def _load_train_val_records(
         return train_records, val_records
 
     train_records = _load_records_from_dataset_roots(
-        dataset_sources,
+        train_dataset_sources,
         split="train",
         seed=args.seed,
         val_fraction=args.val_fraction,
@@ -594,11 +610,11 @@ def _load_train_val_records(
         hf_token=args.hf_token,
     )
     val_records = _load_records_from_dataset_roots(
-        dataset_sources,
-        split="validation",
+        validation_dataset_sources or train_dataset_sources,
+        split=validation_split,
         seed=args.seed,
-        val_fraction=args.val_fraction,
-        test_fraction=args.test_fraction,
+        val_fraction=validation_val_fraction,
+        test_fraction=validation_test_fraction,
         max_samples=args.max_val_samples,
         min_transcript_chars=args.min_transcript_chars,
         max_transcript_chars=args.max_transcript_chars,
@@ -1351,6 +1367,18 @@ def parse_args() -> argparse.Namespace:
             "If omitted, --dataset-repo is used."
         ),
     )
+    parser.add_argument(
+        "--validation-dataset-source",
+        action="append",
+        default=None,
+        help=(
+            "Validation-only dataset source. Repeat to combine multiple sources. Each source may "
+            "be a Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. When "
+            "provided, the full set of records from these sources is used for validation instead "
+            "of sampling a validation split from --dataset-source."
+        ),
+    )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
@@ -2027,22 +2055,30 @@ def main() -> None:
 
     stage_start_time = time.perf_counter()
     logger.info("resolving dataset sources")
-    dataset_sources = _resolve_dataset_sources(args)
+    train_dataset_sources = _resolve_dataset_sources(args)
+    validation_dataset_sources = _resolve_validation_dataset_sources(args)
     lowercase_transcripts = args.tokenizer != "sentencepiece"
     logger.info(
-        "dataset sources resolved count=%s elapsed=%s",
-        len(dataset_sources),
+        "dataset sources resolved train_count=%s validation_count=%s elapsed=%s",
+        len(train_dataset_sources),
+        len(validation_dataset_sources),
         _format_elapsed_seconds(time.perf_counter() - stage_start_time),
     )
     stage_start_time = time.perf_counter()
     logger.info(
-        "loading dataset records splits=train,validation record_cache=%s prevalidate_audio=%s",
+        "loading dataset records train_sources=%s validation_sources=%s validation_mode=%s record_cache=%s prevalidate_audio=%s",
+        [str(dataset_source) for dataset_source in train_dataset_sources],
+        [str(dataset_source) for dataset_source in validation_dataset_sources]
+        if validation_dataset_sources
+        else [str(dataset_source) for dataset_source in train_dataset_sources],
+        "external" if validation_dataset_sources else "split",
         args.record_cache,
         args.prevalidate_audio,
     )
     train_records, val_records = _load_train_val_records(
         args,
-        dataset_sources,
+        train_dataset_sources,
+        validation_dataset_sources,
         lowercase_transcripts=lowercase_transcripts,
         output_dir=output_dir,
     )
@@ -2053,8 +2089,11 @@ def main() -> None:
             encoding="utf-8",
         )
         logger.info(
-            "loaded dataset sources=%s train_samples=%s val_samples=%s speaker_balance_ratio=%.3f elapsed=%s",
-            [str(dataset_source) for dataset_source in dataset_sources],
+            "loaded datasets train_sources=%s validation_sources=%s train_samples=%s val_samples=%s speaker_balance_ratio=%.3f elapsed=%s",
+            [str(dataset_source) for dataset_source in train_dataset_sources],
+            [str(dataset_source) for dataset_source in validation_dataset_sources]
+            if validation_dataset_sources
+            else [str(dataset_source) for dataset_source in train_dataset_sources],
             len(train_records),
             len(val_records),
             float(split_audit["speaker_balance_ratio"]),
