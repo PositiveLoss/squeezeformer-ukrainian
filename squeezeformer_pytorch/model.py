@@ -98,8 +98,9 @@ def make_linear(
 
 
 def make_layer_norm(dim: int, *, use_transformer_engine: bool = False) -> nn.Module:
-    if use_transformer_engine and te is not None:
-        return te.LayerNorm(dim)
+    # Keep LayerNorm on PyTorch kernels. Transformer Engine FP8 support is still
+    # applied through TE Linear modules, while TE LayerNorm has shown unstable
+    # kernel launch behavior on this model's [batch, time, hidden] activations.
     return nn.LayerNorm(dim)
 
 
