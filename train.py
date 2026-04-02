@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import array
+import base64
 import hashlib
 import json
 import logging
@@ -187,9 +188,14 @@ class DiskBackedRecordStore:
         handle = self._open_handle()
         handle.seek(self.offsets[global_index])
         payload = json.loads(handle.readline())
+        audio_bytes_payload = payload.get("audio_bytes")
         return CVRecord(
             audio_path=payload["audio_path"],
-            audio_bytes=None,
+            audio_bytes=(
+                base64.b64decode(audio_bytes_payload)
+                if isinstance(audio_bytes_payload, str) and audio_bytes_payload
+                else None
+            ),
             transcript=payload["transcript"],
             utterance_id=payload["utterance_id"],
             estimated_frames=int(self.estimated_frames[global_index]),
@@ -226,7 +232,13 @@ class DiskBackedRecordStore:
                 payload = json.loads(handle.readline())
             finally:
                 handle.close()
-            num_samples, sample_rate = probe_audio_metadata(payload["audio_path"], None)
+            audio_bytes_payload = payload.get("audio_bytes")
+            audio_bytes = (
+                base64.b64decode(audio_bytes_payload)
+                if isinstance(audio_bytes_payload, str) and audio_bytes_payload
+                else None
+            )
+            num_samples, sample_rate = probe_audio_metadata(payload["audio_path"], audio_bytes)
             frames = max(1, int(num_samples / hop_length)) if num_samples > 0 and sample_rate > 0 else 0
             return global_index, frames
 
@@ -276,11 +288,19 @@ def _build_disk_backed_record_store(
                 max_symbol_ratio=max_symbol_ratio,
                 lowercase_transcripts=lowercase_transcripts,
             ):
+                preserve_audio_bytes = record.audio_bytes is not None and not (
+                    record.audio_path is not None and Path(record.audio_path).exists()
+                )
                 offsets.append(handle.tell())
                 handle.write(
                     json.dumps(
                         {
                             "audio_path": record.audio_path,
+                            "audio_bytes": (
+                                base64.b64encode(record.audio_bytes).decode("ascii")
+                                if preserve_audio_bytes
+                                else None
+                            ),
                             "transcript": record.transcript,
                             "utterance_id": record.utterance_id,
                             "speaker_id": record.speaker_id,
