@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import re
 import tempfile
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
@@ -44,10 +46,16 @@ class ASRInferenceSession:
         dtype: DTypeChoice,
         *,
         fp8_recipe=None,
+        chunk_duration_seconds: float = 30.0,
+        chunk_overlap_seconds: float = 5.0,
+        long_form_threshold_seconds: float = 45.0,
     ) -> None:
         self.device = device
         self.dtype = dtype
         self.fp8_recipe = fp8_recipe
+        self.chunk_duration_seconds = float(chunk_duration_seconds)
+        self.chunk_overlap_seconds = float(chunk_overlap_seconds)
+        self.long_form_threshold_seconds = float(long_form_threshold_seconds)
         self.checkpoint_path = resolve_checkpoint_path(checkpoint)
 
         checkpoint_data = load_checkpoint(self.checkpoint_path, map_location="cpu")
@@ -118,6 +126,11 @@ class ASRInferenceSession:
         return self.transcribe_waveform(waveform, sample_rate)
 
     def transcribe_waveform(self, waveform: torch.Tensor, sample_rate: int) -> str:
+        if self._should_use_chunked_long_form(waveform, sample_rate):
+            return self.transcribe_waveform_chunked(waveform, sample_rate)
+        return self._transcribe_waveform_single_pass(waveform, sample_rate)
+
+    def _transcribe_waveform_single_pass(self, waveform: torch.Tensor, sample_rate: int) -> str:
         features = self.featurizer(waveform, sample_rate).unsqueeze(0).to(self.device)
         feature_lengths = torch.tensor([features.size(1)], device=self.device)
 
@@ -133,6 +146,96 @@ class ASRInferenceSession:
 
         token_ids = log_probs.argmax(dim=-1)[0].cpu().tolist()
         return self.tokenizer.decode_ctc(token_ids)
+
+    def transcribe_waveform_chunked(self, waveform: torch.Tensor, sample_rate: int) -> str:
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        if waveform.dim() != 2:
+            raise ValueError(f"Expected waveform with shape [channels, time], got {tuple(waveform.shape)}")
+
+        target_sample_rate = self.featurizer.sample_rate
+        if sample_rate != target_sample_rate:
+            waveform = torchaudio.functional.resample(waveform, sample_rate, target_sample_rate)
+            sample_rate = target_sample_rate
+
+        if waveform.size(0) > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        total_samples = waveform.size(-1)
+        chunk_samples = max(1, int(round(self.chunk_duration_seconds * sample_rate)))
+        overlap_samples = max(0, int(round(self.chunk_overlap_seconds * sample_rate)))
+        if chunk_samples <= overlap_samples:
+            raise ValueError("--chunk-duration-seconds must be greater than --chunk-overlap-seconds.")
+        if total_samples <= chunk_samples:
+            return self._transcribe_waveform_single_pass(waveform, sample_rate)
+
+        stride_samples = chunk_samples - overlap_samples
+        chunk_transcripts: list[str] = []
+        chunk_count = max(1, math.ceil(max(0, total_samples - overlap_samples) / stride_samples))
+        for chunk_index in range(chunk_count):
+            start = chunk_index * stride_samples
+            end = min(total_samples, start + chunk_samples)
+            if start >= total_samples:
+                break
+            chunk_waveform = waveform[:, start:end]
+            chunk_text = self._transcribe_waveform_single_pass(chunk_waveform, sample_rate).strip()
+            if chunk_text:
+                chunk_transcripts.append(chunk_text)
+            if end >= total_samples:
+                break
+
+        merged = ""
+        for chunk_text in chunk_transcripts:
+            merged = _merge_chunk_transcript(merged, chunk_text)
+        return merged.strip()
+
+    def _should_use_chunked_long_form(self, waveform: torch.Tensor, sample_rate: int) -> bool:
+        total_samples = waveform.size(-1)
+        if sample_rate <= 0:
+            return False
+        duration_seconds = total_samples / float(sample_rate)
+        return duration_seconds > self.long_form_threshold_seconds
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _join_transcripts(left: str, right: str) -> str:
+    if not left:
+        return right
+    if not right:
+        return left
+    if left.endswith((" ", "\n")) or right.startswith((" ", "\n", ",", ".", "!", "?", ":", ";")):
+        return f"{left}{right}"
+    return f"{left} {right}"
+
+
+def _merge_chunk_transcript(existing: str, new: str) -> str:
+    existing = _normalize_whitespace(existing)
+    new = _normalize_whitespace(new)
+    if not existing:
+        return new
+    if not new:
+        return existing
+    if new in existing:
+        return existing
+    if existing in new:
+        return new
+
+    existing_words = existing.split(" ")
+    new_words = new.split(" ")
+    max_word_overlap = min(len(existing_words), len(new_words), 20)
+    for overlap in range(max_word_overlap, 0, -1):
+        if existing_words[-overlap:] == new_words[:overlap]:
+            return " ".join(existing_words + new_words[overlap:])
+
+    max_char_overlap = min(len(existing), len(new), 120)
+    for overlap in range(max_char_overlap, 8, -1):
+        if existing[-overlap:] == new[:overlap]:
+            return f"{existing}{new[overlap:]}"
+
+    return _join_transcripts(existing, new)
 
 
 def resolve_checkpoint_path(checkpoint: str) -> str:
@@ -196,6 +299,24 @@ def parse_args() -> argparse.Namespace:
         default="max",
         choices=["max", "most_recent"],
         help="Transformer Engine FP8 amax reduction algorithm.",
+    )
+    parser.add_argument(
+        "--chunk-duration-seconds",
+        type=float,
+        default=30.0,
+        help="Chunk size for long-form inference.",
+    )
+    parser.add_argument(
+        "--chunk-overlap-seconds",
+        type=float,
+        default=5.0,
+        help="Overlap between neighboring long-form chunks.",
+    )
+    parser.add_argument(
+        "--long-form-threshold-seconds",
+        type=float,
+        default=45.0,
+        help="Use chunked inference automatically above this duration.",
     )
     return parser.parse_args()
 
@@ -288,6 +409,9 @@ def build_app(session: ASRInferenceSession) -> gr.Blocks:
             session.device,
             session.dtype,
             fp8_recipe=session.fp8_recipe,
+            chunk_duration_seconds=session.chunk_duration_seconds,
+            chunk_overlap_seconds=session.chunk_overlap_seconds,
+            long_form_threshold_seconds=session.long_form_threshold_seconds,
         )
         return f"Loaded checkpoint: {current_session['value'].checkpoint_path}"
 
@@ -339,7 +463,15 @@ def main() -> None:
     args = parse_args()
     device = resolve_device(args.device)
     fp8_recipe = build_fp8_recipe(args)
-    session = ASRInferenceSession(args.checkpoint, device, args.dtype, fp8_recipe=fp8_recipe)
+    session = ASRInferenceSession(
+        args.checkpoint,
+        device,
+        args.dtype,
+        fp8_recipe=fp8_recipe,
+        chunk_duration_seconds=args.chunk_duration_seconds,
+        chunk_overlap_seconds=args.chunk_overlap_seconds,
+        long_form_threshold_seconds=args.long_form_threshold_seconds,
+    )
 
     if args.gradio:
         app = build_app(session)
