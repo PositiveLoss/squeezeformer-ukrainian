@@ -10,6 +10,36 @@ pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_
 pip install -U flax optax orbax-checkpoint
 ```
 
+Verify that JAX actually sees the TPU before running the model:
+
+```python
+import jax
+print(jax.default_backend())
+print(jax.devices())
+```
+
+You should see `tpu` as the backend. If you see `cpu` together with a message like
+`A Google TPU may be present ... Falling back to cpu`, your JAX install is not
+using the TPU runtime. In Colab, the most reliable fix is:
+
+```bash
+pip uninstall -y jax jaxlib libtpu-nightly
+pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+pip install -U flax optax orbax-checkpoint
+```
+
+If TPU initialization fails with an error like
+`open(/dev/vfio/0): Device or resource busy`, the TPU VM is usually in a bad
+state or already attached elsewhere. The fix is normally:
+
+1. Switch Colab to a TPU runtime.
+2. Run `Runtime -> Factory reset runtime`.
+3. Reinstall the JAX TPU packages in the fresh session.
+4. Re-run the backend check above before importing repo code.
+
+The `transparent hugepages` warning is not the blocker here; it is only a
+performance/startup warning.
+
 Minimal usage:
 
 ```python
@@ -65,6 +95,15 @@ Training entrypoint:
 
 ```bash
 python -m squeezeformer_pytorch.jax.train --variant xs --batch-size 16 --epochs 10
+```
+
+If you just want to test the code path without TPU, force CPU before importing
+JAX:
+
+```python
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+import jax
 ```
 
 The training helpers expect precomputed feature tensors of shape
