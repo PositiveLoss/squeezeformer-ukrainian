@@ -10,7 +10,6 @@ from collections import defaultdict
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
-from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -47,6 +46,12 @@ from squeezeformer_pytorch.model import (
     SqueezeformerConfig,
     squeezeformer_variant,
     transformer_engine_available,
+)
+from squeezeformer_pytorch.runtime_types import (
+    AdaptiveBatchUnit,
+    DTypeChoice,
+    DecodeStrategy,
+    OptimizerChoice,
 )
 
 try:
@@ -95,28 +100,6 @@ def _export_inference_checkpoint(checkpoint: dict[str, object], checkpoint_path:
 class SchedulerDefaults(NamedTuple):
     peak_lr: float
     num_time_masks: int
-
-
-class DTypeChoice(StrEnum):
-    FLOAT32 = "float32"
-    FLOAT16 = "float16"
-    BFLOAT16 = "bfloat16"
-    FP8 = "fp8"
-
-
-class OptimizerChoice(StrEnum):
-    MUON = "muon"
-    ADAMW = "adamw"
-
-
-class DecodeStrategy(StrEnum):
-    GREEDY = "greedy"
-    BEAM = "beam"
-
-
-class AdaptiveBatchUnit(StrEnum):
-    FRAMES = "frames"
-    TOKENS = "tokens"
 
 
 def _configure_console_logger(rank: int, is_main_process: bool) -> logging.Logger:

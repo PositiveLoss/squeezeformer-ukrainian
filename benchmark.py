@@ -8,9 +8,8 @@ import torch
 
 from squeezeformer_pytorch import SqueezeformerCTC, squeezeformer_variant, tokenizer_from_dict
 from squeezeformer_pytorch.checkpoints import load_checkpoint
+from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
 from train import (
-    DecodeStrategy,
-    DTypeChoice,
     _autocast_context,
     _validate_device_argument,
     decode_batch,

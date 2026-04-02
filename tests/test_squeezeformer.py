@@ -32,10 +32,9 @@ from squeezeformer_pytorch.data import (
     load_cv22_records,
     transcript_is_usable,
 )
+from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
 from train import (
-    DTypeChoice,
     ExponentialMovingAverage,
-    OptimizerChoice,
     _build_fp8_recipe,
     _validate_device_argument,
     _validate_fp8_runtime,

@@ -9,14 +9,14 @@ from typing import Any
 import torch
 from safetensors.torch import load_file, save_file
 
+from .runtime_types import AdaptiveBatchUnit, DTypeChoice, DecodeStrategy, OptimizerChoice
+
 
 def _register_legacy_main_aliases() -> None:
-    """Expose train.py enums on the current __main__ module for legacy checkpoints."""
+    """Expose historical enum symbols on __main__ for older torch checkpoints."""
     main_module = sys.modules.get("__main__")
     if main_module is None:
         return
-
-    from train import AdaptiveBatchUnit, DTypeChoice, DecodeStrategy, OptimizerChoice
 
     for cls in (AdaptiveBatchUnit, DTypeChoice, DecodeStrategy, OptimizerChoice):
         if not hasattr(main_module, cls.__name__):

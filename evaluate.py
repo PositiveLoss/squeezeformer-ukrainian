@@ -24,9 +24,8 @@ from squeezeformer_pytorch.data import (
     prevalidate_records,
 )
 from squeezeformer_pytorch.model import SqueezeformerConfig
+from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
 from train import (
-    DecodeStrategy,
-    DTypeChoice,
     _validate_device_argument,
     _validate_device_ready,
     evaluate,

@@ -11,7 +11,7 @@ from huggingface_hub import hf_hub_download
 
 from squeezeformer_pytorch.asr import SqueezeformerCTC, tokenizer_from_dict
 from squeezeformer_pytorch.checkpoints import load_checkpoint
-from squeezeformer_pytorch.data import AudioFeaturizer
+from squeezeformer_pytorch.frontend import AudioFeaturizer
 from squeezeformer_pytorch.model import SqueezeformerConfig
 
 DEFAULT_CHECKPOINT = "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
