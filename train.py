@@ -131,8 +131,17 @@ class FrozenLibertaTeacher:
             )
         self.device = device
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        tokenizer_kwargs = {"trust_remote_code": True}
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, **tokenizer_kwargs)
+        except ValueError:
+            # Some Ukrainian checkpoints expose only custom slow tokenizer code.
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                use_fast=False,
+                **tokenizer_kwargs,
+            )
+        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
         self.model.to(device)
         self.model.eval()
         for parameter in self.model.parameters():
