@@ -662,7 +662,7 @@ def parse_args() -> argparse.Namespace:
         default="sentencepiece",
         choices=["character", "sentencepiece"],
     )
-    parser.add_argument("--spm-vocab-size", type=int, default=128)
+    parser.add_argument("--spm-vocab-size", type=int, default=4096)
     parser.add_argument(
         "--spm-model-type",
         default="unigram",
