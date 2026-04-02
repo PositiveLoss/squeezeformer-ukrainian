@@ -122,9 +122,7 @@ def inference_autocast_context(device: torch.device, dtype: DTypeChoice):
     if dtype == DTypeChoice.BFLOAT16:
         return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     if dtype == DTypeChoice.FP8:
-        raise ValueError(
-            "FP8 inference is not supported by inference.py. Use float32, float16, or bfloat16."
-        )
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
