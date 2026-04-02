@@ -221,33 +221,57 @@ def prune_encoder_frames_by_blank_probability(
     threshold: float,
     min_keep_frames: int = 1,
 ) -> tuple[Tensor, Tensor]:
-    batch_size, _, hidden_dim = x.shape
-    pruned_sequences: list[Tensor] = []
-    pruned_lengths: list[int] = []
+    batch_size, max_time, hidden_dim = x.shape
+    valid_mask = torch.arange(max_time, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+    threshold_keep_mask = (blank_probabilities < threshold) & valid_mask
+    pruned_lengths = threshold_keep_mask.sum(dim=1)
 
-    for batch_index in range(batch_size):
-        valid_length = int(lengths[batch_index].item())
-        valid_states = x[batch_index, :valid_length]
-        valid_blank_probs = blank_probabilities[batch_index, :valid_length]
-        keep_mask = valid_blank_probs < threshold
-        keep_indices = torch.nonzero(keep_mask, as_tuple=False).squeeze(-1)
+    required_keep = lengths.clamp(min=0, max=max(1, min_keep_frames))
+    needs_fallback = pruned_lengths < min_keep_frames
+    if needs_fallback.any():
+        masked_blank_probabilities = blank_probabilities.masked_fill(~valid_mask, float("inf"))
+        global_topk = min(max_time, max(1, min_keep_frames))
+        topk_indices = torch.topk(
+            masked_blank_probabilities,
+            k=global_topk,
+            dim=1,
+            largest=False,
+        ).indices
+        topk_rank_mask = (
+            torch.arange(global_topk, device=lengths.device).unsqueeze(0)
+            < required_keep.unsqueeze(1)
+        )
+        fallback_keep_mask = torch.zeros_like(valid_mask)
+        fallback_keep_mask.scatter_(1, topk_indices, topk_rank_mask)
+        threshold_keep_mask = torch.where(
+            needs_fallback.unsqueeze(1),
+            fallback_keep_mask,
+            threshold_keep_mask,
+        )
+        pruned_lengths = torch.where(needs_fallback, required_keep, pruned_lengths)
 
-        if keep_indices.numel() < min_keep_frames:
-            topk = min(valid_length, max(1, min_keep_frames))
-            keep_indices = torch.topk(
-                -valid_blank_probs,
-                k=topk,
-                largest=True,
-            ).indices.sort().values
+    max_pruned_length = int(pruned_lengths.max().item()) if batch_size > 0 else 0
+    if max_pruned_length == 0:
+        return x.new_zeros((batch_size, 0, hidden_dim)), pruned_lengths.to(dtype=lengths.dtype)
 
-        pruned_sequences.append(valid_states.index_select(0, keep_indices))
-        pruned_lengths.append(int(keep_indices.numel()))
-
-    max_pruned_length = max(pruned_lengths)
-    pruned_batch = x.new_zeros((batch_size, max_pruned_length, hidden_dim))
-    for batch_index, sequence in enumerate(pruned_sequences):
-        pruned_batch[batch_index, : sequence.size(0)] = sequence
-    return pruned_batch, lengths.new_tensor(pruned_lengths)
+    time_indices = torch.arange(max_time, device=lengths.device).unsqueeze(0).expand(batch_size, -1)
+    sort_keys = torch.where(
+        threshold_keep_mask,
+        time_indices,
+        torch.full_like(time_indices, max_time),
+    )
+    sorted_time_indices = torch.argsort(sort_keys, dim=1)
+    pruned_batch = torch.gather(
+        x,
+        dim=1,
+        index=sorted_time_indices[:, :max_pruned_length].unsqueeze(-1).expand(-1, -1, hidden_dim),
+    )
+    output_mask = (
+        torch.arange(max_pruned_length, device=lengths.device).unsqueeze(0)
+        < pruned_lengths.unsqueeze(1)
+    )
+    pruned_batch = pruned_batch * output_mask.unsqueeze(-1).to(dtype=x.dtype)
+    return pruned_batch, pruned_lengths.to(dtype=lengths.dtype)
 
 
 class TrainingOnlyAEDDecoder(nn.Module):
