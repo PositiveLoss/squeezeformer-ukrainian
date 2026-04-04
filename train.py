@@ -17,6 +17,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 import torch
 import torch.distributed as dist
@@ -45,6 +46,7 @@ from squeezeformer_pytorch.data import (
     download_cv22_dataset,
     iter_cv22_records,
     iter_cv22_records_from_source,
+    load_audio,
     prevalidate_records,
     probe_audio_metadata,
     read_binary_source,
@@ -470,6 +472,96 @@ def _load_cached_audio_bytes(payload: dict[str, object], *, records_path: Path) 
     if isinstance(audio_bytes_payload, str) and audio_bytes_payload:
         return base64.b64decode(audio_bytes_payload)
     return None
+
+
+_OPUS_HEADER_SCAN_BYTES = 64 * 1024
+
+
+def _audio_header_looks_like_opus(header: bytes) -> bool:
+    return b"OpusHead" in header[:_OPUS_HEADER_SCAN_BYTES]
+
+
+def _read_header_from_path(audio_path: str | None) -> bytes:
+    if not audio_path:
+        return b""
+    try:
+        path = Path(audio_path)
+    except OSError:
+        return b""
+    if not path.exists():
+        return b""
+    try:
+        with path.open("rb") as handle:
+            return handle.read(_OPUS_HEADER_SCAN_BYTES)
+    except OSError:
+        return b""
+
+
+def _path_declares_opus(audio_path: str | None) -> bool:
+    if not audio_path:
+        return False
+    return Path(urlparse(audio_path).path).suffix.lower() == ".opus"
+
+
+def _record_looks_like_opus(record: CVRecord) -> bool:
+    if _path_declares_opus(record.audio_path):
+        return True
+    if record.audio_bytes is not None and _audio_header_looks_like_opus(record.audio_bytes):
+        return True
+    return _audio_header_looks_like_opus(_read_header_from_path(record.audio_path))
+
+
+def _find_opus_probe_record(
+    records: list[CVRecord] | DiskBackedRecordStore,
+) -> tuple[str | None, bytes | None, str] | None:
+    if isinstance(records, DiskBackedRecordStore):
+        with records.records_path.open("rb") as handle:
+            for global_index in range(records.start, len(records.offsets), records.step):
+                handle.seek(records.offsets[global_index])
+                payload = json.loads(handle.readline().decode("utf-8"))
+                audio_path = payload.get("audio_path")
+                if not isinstance(audio_path, str):
+                    audio_path = None
+                audio_blob_path = payload.get("audio_blob_path")
+                header = b""
+                if isinstance(audio_blob_path, str) and audio_blob_path:
+                    blob_path = Path(audio_blob_path)
+                    if not blob_path.is_absolute():
+                        blob_path = records.records_path.parent / blob_path
+                    header = _read_header_from_path(str(blob_path))
+                elif audio_path is not None:
+                    header = _read_header_from_path(audio_path)
+                if _path_declares_opus(audio_path) or _audio_header_looks_like_opus(header):
+                    return (
+                        audio_path,
+                        _load_cached_audio_bytes(payload, records_path=records.records_path),
+                        audio_path or f"blob:{audio_blob_path}",
+                    )
+        return None
+
+    for record in records:
+        if _record_looks_like_opus(record):
+            return record.audio_path, record.audio_bytes, record.audio_path or record.utterance_id
+    return None
+
+
+def _ensure_opus_decode_support(
+    records: list[CVRecord] | DiskBackedRecordStore,
+    *,
+    split: str,
+) -> None:
+    probe = _find_opus_probe_record(records)
+    if probe is None:
+        return
+    audio_path, audio_bytes, description = probe
+    try:
+        load_audio(audio_path, audio_bytes)
+    except Exception as error:
+        raise RuntimeError(
+            f"Split '{split}' contains Opus audio ({description}), but this runtime cannot decode "
+            "it with torchaudio. Install torchaudio with Opus/FFmpeg support or convert those "
+            "files to WAV before training."
+        ) from error
 
 
 def _load_records_from_dataset_roots(
@@ -2082,6 +2174,8 @@ def main() -> None:
         lowercase_transcripts=lowercase_transcripts,
         output_dir=output_dir,
     )
+    _ensure_opus_decode_support(train_records, split="train")
+    _ensure_opus_decode_support(val_records, split="validation")
     split_audit = _build_split_audit({"train": train_records, "validation": val_records})
     if is_main_process:
         (output_dir / "split_audit.json").write_text(

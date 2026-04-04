@@ -46,6 +46,7 @@ from train import (
     _build_disk_backed_record_store,
     _build_fp8_recipe,
     _configure_console_logger,
+    _ensure_opus_decode_support,
     _load_train_val_records,
     _load_records_from_dataset_roots,
     _resolve_dataset_sources,
@@ -838,6 +839,57 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
     assert calls == ["train", "validation"]
     assert train_records == train_rows
     assert val_records == val_rows
+
+
+def test_ensure_opus_decode_support_fails_fast_for_in_memory_opus_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = [
+        CVRecord(
+            audio_path="sample.opus",
+            audio_bytes=None,
+            transcript="приклад",
+            utterance_id="utt0",
+            estimated_frames=10,
+        )
+    ]
+
+    def fake_load_audio(audio_path: str | None, audio_bytes: bytes | None):
+        del audio_path, audio_bytes
+        raise RuntimeError("missing opus decoder")
+
+    monkeypatch.setattr("train.load_audio", fake_load_audio)
+
+    with pytest.raises(RuntimeError, match="contains Opus audio"):
+        _ensure_opus_decode_support(records, split="train")
+
+
+def test_ensure_opus_decode_support_checks_disk_backed_record_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records_path = tmp_path / "train.jsonl"
+    payload = {
+        "audio_path": "sample.opus",
+        "audio_blob_path": None,
+        "transcript": "приклад",
+        "utterance_id": "utt0",
+        "speaker_id": None,
+        "has_speaker_id": False,
+    }
+    records_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+    store = DiskBackedRecordStore(records_path, array.array("Q", [0]), array.array("I", [1]))
+    observed: list[tuple[str | None, bytes | None]] = []
+
+    def fake_load_audio(audio_path: str | None, audio_bytes: bytes | None):
+        observed.append((audio_path, audio_bytes))
+        return torch.zeros(1, 16), 16_000
+
+    monkeypatch.setattr("train.load_audio", fake_load_audio)
+
+    _ensure_opus_decode_support(store, split="train")
+
+    assert observed == [("sample.opus", None)]
 
 
 def test_shard_records_for_rank_slices_in_memory_records() -> None:
