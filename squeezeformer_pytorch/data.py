@@ -10,7 +10,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
@@ -111,6 +111,15 @@ def _audio_duration_rejection_reason(
     if duration_seconds > max_duration_seconds:
         return "too_long"
     return None
+
+
+def _increment_summary_field(
+    summary: LoaderSummary,
+    reason: str,
+    *,
+    prefix: str = "skipped_",
+) -> None:
+    setattr(summary, f"{prefix}{reason}", getattr(summary, f"{prefix}{reason}") + 1)
 
 
 @dataclass(frozen=True)
@@ -251,6 +260,27 @@ def _iter_remote_rows(
     raise ValueError(f"Unsupported remote manifest format for {source_url}.")
 
 
+def _iter_manifest_file_rows(path: Path, *, batch_size: int) -> Iterable[dict[str, Any]]:
+    if path.suffix == ".tsv":
+        reader = pl.read_csv_batched(
+            path,
+            separator="\t",
+            infer_schema_length=1000,
+            batch_size=batch_size,
+        )
+        while True:
+            batches = reader.next_batches(1)
+            if not batches:
+                break
+            yield from batches[0].iter_rows(named=True)
+        return
+    if path.suffix == ".parquet":
+        logger.info("loading parquet manifest %s", path)
+        yield from pl.read_parquet(path).iter_rows(named=True)
+        return
+    raise ValueError(f"Unsupported manifest file: {path}")
+
+
 def _iter_repo_manifest_urls(repo_id: str, token: str | None) -> Iterable[str]:
     repo_files = sorted(list_repo_files(repo_id, repo_type="dataset", token=token))
     tsv_files = [repo_path for repo_path in repo_files if repo_path.endswith(".tsv")]
@@ -284,23 +314,7 @@ def iter_manifest_rows(dataset_root: Path, batch_size: int = 8192) -> Iterable[d
         )
 
     for path in manifest_paths:
-        if path.suffix == ".tsv":
-            reader = pl.read_csv_batched(
-                path,
-                separator="\t",
-                infer_schema_length=1000,
-                batch_size=batch_size,
-            )
-            while True:
-                batches = reader.next_batches(1)
-                if not batches:
-                    break
-                yield from batches[0].iter_rows(named=True)
-            continue
-
-        # Process Parquet files one at a time to avoid concatenating all manifests into memory.
-        logger.info("loading parquet manifest %s", path)
-        yield from pl.read_parquet(path).iter_rows(named=True)
+        yield from _iter_manifest_file_rows(path, batch_size=batch_size)
 
 
 def iter_manifest_rows_from_source(
@@ -314,25 +328,8 @@ def iter_manifest_rows_from_source(
         if source_path.is_dir():
             yield from iter_manifest_rows(source_path, batch_size=batch_size)
             return
-        suffix = source_path.suffix.lower()
-        if suffix == ".tsv":
-            reader = pl.read_csv_batched(
-                source_path,
-                separator="\t",
-                infer_schema_length=1000,
-                batch_size=batch_size,
-            )
-            while True:
-                batches = reader.next_batches(1)
-                if not batches:
-                    break
-                yield from batches[0].iter_rows(named=True)
-            return
-        if suffix == ".parquet":
-            logger.info("loading parquet manifest %s", source_path)
-            yield from pl.read_parquet(source_path).iter_rows(named=True)
-            return
-        raise ValueError(f"Unsupported manifest file: {source_path}")
+        yield from _iter_manifest_file_rows(source_path, batch_size=batch_size)
+        return
 
     source_text = str(source)
     if _is_url(source_text):
@@ -427,6 +424,92 @@ def resolve_audio_from_source(
             return resolved_path, None
 
     raise KeyError(f"No audio source found in row. Tried {AUDIO_COLUMNS}.")
+
+
+def _record_split_matches(
+    record: CVRecord,
+    *,
+    split: str,
+    seed: int,
+    val_fraction: float,
+    test_fraction: float,
+) -> bool:
+    train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
+    split_key = record.speaker_id or record.utterance_id
+    score = _hash_to_unit_interval(split_key, seed=seed)
+    if split == "train":
+        return score < train_cutoff
+    if split == "validation":
+        return train_cutoff <= score < train_cutoff + val_fraction
+    if split == "test":
+        return score >= train_cutoff + val_fraction
+    raise ValueError(f"Unsupported split: {split}")
+
+
+def _build_cv_record(
+    row: dict[str, Any],
+    *,
+    resolve_audio: Callable[[dict[str, Any]], tuple[str | None, bytes | None]],
+    scanned_rows: int,
+    summary: LoaderSummary,
+    min_transcript_chars: int,
+    max_transcript_chars: int,
+    max_symbol_ratio: float,
+    min_audio_duration_sec: float,
+    max_audio_duration_sec: float,
+    lowercase_transcripts: bool,
+) -> CVRecord | None:
+    try:
+        transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
+    except KeyError:
+        summary.skipped_missing_transcript += 1
+        return None
+    try:
+        audio_path, audio_bytes = resolve_audio(row)
+    except KeyError:
+        summary.skipped_missing_audio += 1
+        return None
+
+    duration_seconds = (
+        row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
+    )
+    if not isinstance(duration_seconds, (float, int)):
+        summary.skipped_missing_duration += 1
+        return None
+    duration_seconds = float(duration_seconds)
+
+    duration_rejection_reason = _audio_duration_rejection_reason(
+        duration_seconds,
+        min_duration_seconds=min_audio_duration_sec,
+        max_duration_seconds=max_audio_duration_sec,
+    )
+    if duration_rejection_reason is not None:
+        _increment_summary_field(summary, duration_rejection_reason, prefix="skipped_audio_")
+        return None
+
+    transcript_rejection_reason = _transcript_rejection_reason(
+        transcript,
+        min_chars=min_transcript_chars,
+        max_chars=max_transcript_chars,
+        max_symbol_ratio=max_symbol_ratio,
+    )
+    if transcript_rejection_reason is not None:
+        _increment_summary_field(summary, transcript_rejection_reason)
+        return None
+
+    utterance_id = str(row.get("id") or audio_path or scanned_rows)
+    raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
+    speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
+    estimated_frames = max(1, int((duration_seconds * 16000) / 160))
+    return CVRecord(
+        audio_path=audio_path,
+        audio_bytes=audio_bytes,
+        transcript=transcript,
+        utterance_id=utterance_id,
+        speaker_id=speaker_id,
+        has_speaker_id=speaker_id is not None,
+        estimated_frames=estimated_frames,
+    )
 
 
 def _load_wave_from_stdlib(source: str | io.BytesIO) -> tuple[Tensor, int]:
@@ -555,78 +638,35 @@ def iter_cv22_records(
 ) -> Iterable[CVRecord]:
     summary = LoaderSummary()
     found_usable_record = False
-    train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
 
     try:
         for row in iter_manifest_rows(dataset_root):
             summary.scanned += 1
-            try:
-                transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
-            except KeyError:
-                summary.skipped_missing_transcript += 1
-                continue
-            try:
-                audio_path, audio_bytes = _resolve_audio(row, dataset_root=dataset_root)
-            except KeyError:
-                summary.skipped_missing_audio += 1
-                continue
-            duration_seconds = (
-                row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
-            )
-            if not isinstance(duration_seconds, (float, int)):
-                summary.skipped_missing_duration += 1
-                continue
-            duration_seconds = float(duration_seconds)
-            duration_rejection_reason = _audio_duration_rejection_reason(
-                duration_seconds,
-                min_duration_seconds=min_audio_duration_sec,
-                max_duration_seconds=max_audio_duration_sec,
-            )
-            if duration_rejection_reason is not None:
-                if duration_rejection_reason == "too_short":
-                    summary.skipped_audio_too_short += 1
-                elif duration_rejection_reason == "too_long":
-                    summary.skipped_audio_too_long += 1
-                continue
-            rejection_reason = _transcript_rejection_reason(
-                transcript,
-                min_chars=min_transcript_chars,
-                max_chars=max_transcript_chars,
+            record = _build_cv_record(
+                row,
+                resolve_audio=lambda manifest_row: _resolve_audio(
+                    manifest_row,
+                    dataset_root=dataset_root,
+                ),
+                scanned_rows=summary.scanned,
+                summary=summary,
+                min_transcript_chars=min_transcript_chars,
+                max_transcript_chars=max_transcript_chars,
                 max_symbol_ratio=max_symbol_ratio,
+                min_audio_duration_sec=min_audio_duration_sec,
+                max_audio_duration_sec=max_audio_duration_sec,
+                lowercase_transcripts=lowercase_transcripts,
             )
-            if rejection_reason is not None:
-                if rejection_reason == "too_short":
-                    summary.skipped_too_short += 1
-                elif rejection_reason == "too_long":
-                    summary.skipped_too_long += 1
-                elif rejection_reason == "symbol_ratio":
-                    summary.skipped_symbol_ratio += 1
-                elif rejection_reason == "no_alnum":
-                    summary.skipped_no_alnum += 1
+            if record is None:
                 continue
             found_usable_record = True
-            utterance_id = str(row.get("id") or audio_path or summary.scanned)
-            raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
-            speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
-            estimated_frames = max(1, int((duration_seconds * 16000) / 160))
-            record = CVRecord(
-                audio_path=audio_path,
-                audio_bytes=audio_bytes,
-                transcript=transcript,
-                utterance_id=utterance_id,
-                speaker_id=speaker_id,
-                has_speaker_id=speaker_id is not None,
-                estimated_frames=estimated_frames,
-            )
-            split_key = record.speaker_id or record.utterance_id
-            score = _hash_to_unit_interval(split_key, seed=seed)
-            if split == "train" and score >= train_cutoff:
-                summary.skipped_split += 1
-                continue
-            if split == "validation" and not (train_cutoff <= score < train_cutoff + val_fraction):
-                summary.skipped_split += 1
-                continue
-            if split == "test" and score < train_cutoff + val_fraction:
+            if not _record_split_matches(
+                record,
+                split=split,
+                seed=seed,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+            ):
                 summary.skipped_split += 1
                 continue
             yield record
@@ -663,78 +703,35 @@ def iter_cv22_records_from_source(
 ) -> Iterable[CVRecord]:
     summary = LoaderSummary()
     found_usable_record = False
-    train_cutoff = max(0.0, 1.0 - val_fraction - test_fraction)
 
     try:
         for row in iter_manifest_rows_from_source(source, hf_token=hf_token):
             summary.scanned += 1
-            try:
-                transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
-            except KeyError:
-                summary.skipped_missing_transcript += 1
-                continue
-            try:
-                audio_path, audio_bytes = resolve_audio_from_source(row, source=source)
-            except KeyError:
-                summary.skipped_missing_audio += 1
-                continue
-            duration_seconds = (
-                row.get("duration") or row.get("duration_seconds") or row.get("audio_duration")
-            )
-            if not isinstance(duration_seconds, (float, int)):
-                summary.skipped_missing_duration += 1
-                continue
-            duration_seconds = float(duration_seconds)
-            duration_rejection_reason = _audio_duration_rejection_reason(
-                duration_seconds,
-                min_duration_seconds=min_audio_duration_sec,
-                max_duration_seconds=max_audio_duration_sec,
-            )
-            if duration_rejection_reason is not None:
-                if duration_rejection_reason == "too_short":
-                    summary.skipped_audio_too_short += 1
-                elif duration_rejection_reason == "too_long":
-                    summary.skipped_audio_too_long += 1
-                continue
-            rejection_reason = _transcript_rejection_reason(
-                transcript,
-                min_chars=min_transcript_chars,
-                max_chars=max_transcript_chars,
+            record = _build_cv_record(
+                row,
+                resolve_audio=lambda manifest_row: resolve_audio_from_source(
+                    manifest_row,
+                    source=source,
+                ),
+                scanned_rows=summary.scanned,
+                summary=summary,
+                min_transcript_chars=min_transcript_chars,
+                max_transcript_chars=max_transcript_chars,
                 max_symbol_ratio=max_symbol_ratio,
+                min_audio_duration_sec=min_audio_duration_sec,
+                max_audio_duration_sec=max_audio_duration_sec,
+                lowercase_transcripts=lowercase_transcripts,
             )
-            if rejection_reason is not None:
-                if rejection_reason == "too_short":
-                    summary.skipped_too_short += 1
-                elif rejection_reason == "too_long":
-                    summary.skipped_too_long += 1
-                elif rejection_reason == "symbol_ratio":
-                    summary.skipped_symbol_ratio += 1
-                elif rejection_reason == "no_alnum":
-                    summary.skipped_no_alnum += 1
+            if record is None:
                 continue
             found_usable_record = True
-            utterance_id = str(row.get("id") or audio_path or summary.scanned)
-            raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
-            speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
-            estimated_frames = max(1, int((duration_seconds * 16000) / 160))
-            record = CVRecord(
-                audio_path=audio_path,
-                audio_bytes=audio_bytes,
-                transcript=transcript,
-                utterance_id=utterance_id,
-                speaker_id=speaker_id,
-                has_speaker_id=speaker_id is not None,
-                estimated_frames=estimated_frames,
-            )
-            split_key = record.speaker_id or record.utterance_id
-            score = _hash_to_unit_interval(split_key, seed=seed)
-            if split == "train" and score >= train_cutoff:
-                summary.skipped_split += 1
-                continue
-            if split == "validation" and not (train_cutoff <= score < train_cutoff + val_fraction):
-                summary.skipped_split += 1
-                continue
-            if split == "test" and score < train_cutoff + val_fraction:
+            if not _record_split_matches(
+                record,
+                split=split,
+                seed=seed,
+                val_fraction=val_fraction,
+                test_fraction=test_fraction,
+            ):
                 summary.skipped_split += 1
                 continue
             yield record

@@ -9,6 +9,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
+from .masking import make_attention_mask, make_sequence_mask
+
 try:
     import transformer_engine.pytorch as te
 except ImportError, OSError:
@@ -32,18 +34,6 @@ def _subsample_length(
             )
         output = torch.div(output, stride, rounding_mode="floor")
     return output
-
-
-def _make_pad_mask(lengths: Tensor, max_length: int | None = None) -> Tensor:
-    if max_length is None:
-        max_length = int(lengths.max().item())
-    positions = torch.arange(max_length, device=lengths.device)
-    return positions.unsqueeze(0) < lengths.unsqueeze(1)
-
-
-def _make_attn_mask(lengths: Tensor, max_length: int) -> Tensor:
-    pad_mask = _make_pad_mask(lengths, max_length=max_length)
-    return pad_mask.unsqueeze(1) & pad_mask.unsqueeze(2)
 
 
 def transformer_engine_available() -> bool:
@@ -606,7 +596,7 @@ class TimeReductionLayer(nn.Module):
 
     def forward(self, x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
         x = x.transpose(1, 2)
-        pad_mask = _make_pad_mask(lengths, max_length=x.size(-1))
+        pad_mask = make_sequence_mask(lengths, max_length=x.size(-1))
         x = x * pad_mask.unsqueeze(1).to(dtype=x.dtype)
         x = F.pad(x, (0, max(0, self.kernel_size - self.stride)))
         x = self.depthwise(x)
@@ -833,17 +823,17 @@ class SqueezeformerEncoder(nn.Module):
                 x = _pad_tensor_along_dim(x, dim=1, target_size=padded_time)
                 pos = self.positional_encoding(x)
                 attn_mask = _pad_attn_mask_to_length(
-                    _make_attn_mask(lengths, max_length=x.size(1)),
+                    make_attention_mask(lengths, max_length=x.size(1)),
                     target_length=padded_time,
                 )
                 pad_mask = _pad_mask_to_length(
-                    _make_pad_mask(lengths, max_length=x.size(1)),
+                    make_sequence_mask(lengths, max_length=x.size(1)),
                     target_length=padded_time,
                 )
             else:
                 pos = self.positional_encoding(x)
-                attn_mask = _make_attn_mask(lengths, max_length=x.size(1))
-                pad_mask = _make_pad_mask(lengths, max_length=x.size(1))
+                attn_mask = make_attention_mask(lengths, max_length=x.size(1))
+                pad_mask = make_sequence_mask(lengths, max_length=x.size(1))
             if self.config.activation_checkpointing and self.training:
                 x = activation_checkpoint(
                     lambda a, b, c, d: block(a, pos=b, attn_mask=c, pad_mask=d),

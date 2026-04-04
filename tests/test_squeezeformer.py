@@ -31,10 +31,17 @@ from squeezeformer_pytorch.data import (
     create_dataloader,
     iter_cv22_corpus_texts,
     iter_cv22_records,
+    iter_cv22_records_from_source,
+    iter_manifest_rows_from_source,
     load_cv22_corpus_texts,
     load_cv22_records,
     normalize_transcript,
     transcript_is_usable,
+)
+from squeezeformer_pytorch.masking import (
+    make_attention_mask,
+    make_padding_mask,
+    make_sequence_mask,
 )
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
 from squeezeformer_pytorch.secrets import REDACTED, sanitize_for_serialization
@@ -280,6 +287,25 @@ def test_blank_probability_pruning_keeps_minimum_frames() -> None:
     assert torch.equal(pruned_x[0, 1], x[0, 2])
     assert torch.equal(pruned_x[1, 0], x[1, 1])
     assert torch.equal(pruned_x[1, 1], x[1, 2])
+
+
+def test_sequence_mask_helpers_share_consistent_semantics() -> None:
+    lengths = torch.tensor([3, 1], dtype=torch.int64)
+
+    sequence_mask = make_sequence_mask(lengths, max_length=4)
+    padding_mask = make_padding_mask(lengths, max_length=4)
+    attention_mask = make_attention_mask(lengths, max_length=4)
+
+    assert torch.equal(
+        sequence_mask,
+        torch.tensor([[True, True, True, False], [True, False, False, False]]),
+    )
+    assert torch.equal(padding_mask, ~sequence_mask)
+    assert torch.equal(
+        attention_mask[0],
+        sequence_mask[0].unsqueeze(0) & sequence_mask[0].unsqueeze(1),
+    )
+    assert not attention_mask[1, 1, 1]
 
 
 @torch.no_grad()
@@ -1052,6 +1078,57 @@ def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
         record.utterance_id for record in loaded
     ]
     assert len(streamed) <= 2
+
+
+def test_iter_manifest_rows_from_source_reads_single_manifest_file(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tduration\na.wav\tце тест\t0.3\nb.wav\tмовна модель\t0.4\n",
+        encoding="utf-8",
+    )
+
+    rows = list(iter_manifest_rows_from_source(manifest))
+
+    assert rows == [
+        {"path": "a.wav", "sentence": "це тест", "duration": 0.3},
+        {"path": "b.wav", "sentence": "мовна модель", "duration": 0.4},
+    ]
+
+
+def test_iter_cv22_records_from_source_matches_local_loader(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tid\tspeaker_id\tduration\n"
+        "a.wav\tце тест\tutt0\tspk0\t0.3\n"
+        "b.wav\tмовна модель\tutt1\tspk1\t0.3\n"
+        "c.wav\tще приклад\tutt2\tspk2\t0.3\n",
+        encoding="utf-8",
+    )
+
+    from_source = list(
+        iter_cv22_records_from_source(
+            manifest,
+            split="train",
+            seed=13,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            max_samples=2,
+        )
+    )
+    from_root = list(
+        iter_cv22_records(
+            dataset_root=tmp_path,
+            split="train",
+            seed=13,
+            val_fraction=0.2,
+            test_fraction=0.2,
+            max_samples=2,
+        )
+    )
+
+    assert [record.utterance_id for record in from_source] == [
+        record.utterance_id for record in from_root
+    ]
 
 
 def test_transcript_filter_rejects_pathological_rows() -> None:

@@ -13,6 +13,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .masking import make_padding_mask, make_sequence_mask
 from .model import (
     SqueezeformerConfig,
     SqueezeformerEncoder,
@@ -21,13 +22,8 @@ from .model import (
 )
 
 
-def _lengths_to_padding_mask(lengths: Tensor, max_length: int) -> Tensor:
-    positions = torch.arange(max_length, device=lengths.device)
-    return positions.unsqueeze(0) >= lengths.unsqueeze(1)
-
-
 def mean_pool_sequence(x: Tensor, lengths: Tensor) -> Tensor:
-    mask = ~_lengths_to_padding_mask(lengths, x.size(1))
+    mask = make_sequence_mask(lengths, x.size(1))
     masked = x * mask.unsqueeze(-1).to(dtype=x.dtype)
     denom = mask.sum(dim=1, keepdim=True).clamp_min(1).to(dtype=x.dtype)
     return masked.sum(dim=1) / denom
@@ -325,7 +321,7 @@ class TrainingOnlyAEDDecoder(nn.Module):
             diagonal=1,
         )
         target_padding_mask = decoder_inputs.eq(self.pad_id)
-        memory_padding_mask = _lengths_to_padding_mask(memory_lengths, memory.size(1))
+        memory_padding_mask = make_padding_mask(memory_lengths, memory.size(1))
         hidden = self.decoder(
             x,
             memory,
