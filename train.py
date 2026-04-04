@@ -177,6 +177,31 @@ def _configure_console_logger(rank: int, is_main_process: bool) -> logging.Logge
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO if is_main_process else logging.WARNING)
     if not logger.handlers:
+        class _ColorFormatter(logging.Formatter):
+            _RESET = "\033[0m"
+            _LEVEL_COLORS = {
+                logging.DEBUG: "\033[36m",
+                logging.INFO: "\033[32m",
+                logging.WARNING: "\033[33m",
+                logging.ERROR: "\033[31m",
+                logging.CRITICAL: "\033[35m",
+            }
+
+            def __init__(self, fmt: str, *, use_color: bool) -> None:
+                super().__init__(fmt)
+                self.use_color = use_color
+
+            def format(self, record: logging.LogRecord) -> str:
+                original_levelname = record.levelname
+                if self.use_color:
+                    color = self._LEVEL_COLORS.get(record.levelno)
+                    if color is not None:
+                        record.levelname = f"{color}{record.levelname}{self._RESET}"
+                try:
+                    return super().format(record)
+                finally:
+                    record.levelname = original_levelname
+
         class _RankFilter(logging.Filter):
             def __init__(self, default_rank: int) -> None:
                 super().__init__()
@@ -190,7 +215,10 @@ def _configure_console_logger(rank: int, is_main_process: bool) -> logging.Logge
         handler = logging.StreamHandler(sys.stdout)
         handler.addFilter(_RankFilter(rank))
         handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)s | rank=%(rank)s | %(message)s")
+            _ColorFormatter(
+                "%(asctime)s | %(levelname)s | rank=%(rank)s | %(message)s",
+                use_color=sys.stdout.isatty(),
+            )
         )
         logger.addHandler(handler)
     logger.propagate = False
