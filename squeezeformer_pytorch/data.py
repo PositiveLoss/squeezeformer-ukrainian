@@ -945,38 +945,39 @@ class MaxFramesBatchSampler(BatchSampler):
         self.records = records
         self.max_batch_frames = max_batch_frames
         self.shuffle = shuffle
-        self._batches = self._build_batches()
-
-    def _build_batches(self) -> list[list[int]]:
-        sorted_indices = sorted(
+        self._sorted_indices = sorted(
             range(len(self.records)), key=lambda index: self.records[index].estimated_frames
         )
-        batches: list[list[int]] = []
+        self._num_batches = self._count_batches()
+
+    def _iter_batches(self) -> Iterable[list[int]]:
         current_batch: list[int] = []
         current_max = 0
-        for index in sorted_indices:
+        for index in self._sorted_indices:
             frames = max(1, self.records[index].estimated_frames)
             proposed_size = len(current_batch) + 1
             proposed_max = max(current_max, frames)
             if current_batch and proposed_size * proposed_max > self.max_batch_frames:
-                batches.append(current_batch)
+                yield current_batch
                 current_batch = []
                 current_max = 0
             current_batch.append(index)
             current_max = max(current_max, frames)
         if current_batch:
-            batches.append(current_batch)
-        return batches
+            yield current_batch
+
+    def _count_batches(self) -> int:
+        return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
-        batches = list(self._batches)
+        batches = list(self._iter_batches())
         if self.shuffle:
             order = torch.randperm(len(batches)).tolist()
             batches = [batches[index] for index in order]
         yield from batches
 
     def __len__(self) -> int:
-        return len(self._batches)
+        return self._num_batches
 
 
 class AdaptiveBatchSampler(BatchSampler):
@@ -993,45 +994,46 @@ class AdaptiveBatchSampler(BatchSampler):
         self.target_batch_units = target_batch_units
         self.unit = unit
         self.shuffle = shuffle
-        self._batches = self._build_batches()
-
-    def _record_units(self, record: CVRecord) -> int:
-        if self.unit == "frames":
-            return max(1, record.estimated_frames)
-        return max(1, len(record.transcript))
-
-    def _build_batches(self) -> list[list[int]]:
-        sorted_indices = sorted(
+        self._sorted_indices = sorted(
             range(len(self.records)),
             key=lambda index: (
                 self.records[index].estimated_frames,
                 len(self.records[index].transcript),
             ),
         )
-        batches: list[list[int]] = []
+        self._num_batches = self._count_batches()
+
+    def _record_units(self, record: CVRecord) -> int:
+        if self.unit == "frames":
+            return max(1, record.estimated_frames)
+        return max(1, len(record.transcript))
+
+    def _iter_batches(self) -> Iterable[list[int]]:
         current_batch: list[int] = []
         current_units = 0
-        for index in sorted_indices:
+        for index in self._sorted_indices:
             units = self._record_units(self.records[index])
             if current_batch and current_units + units > self.target_batch_units:
-                batches.append(current_batch)
+                yield current_batch
                 current_batch = []
                 current_units = 0
             current_batch.append(index)
             current_units += units
         if current_batch:
-            batches.append(current_batch)
-        return batches
+            yield current_batch
+
+    def _count_batches(self) -> int:
+        return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
-        batches = list(self._batches)
+        batches = list(self._iter_batches())
         if self.shuffle:
             order = torch.randperm(len(batches)).tolist()
             batches = [batches[index] for index in order]
         yield from batches
 
     def __len__(self) -> int:
-        return len(self._batches)
+        return self._num_batches
 
 
 def _record_is_valid(record: CVRecord) -> bool:

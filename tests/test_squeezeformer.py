@@ -745,6 +745,8 @@ def test_build_disk_backed_record_store_combines_sources_with_global_limit(tmp_p
     assert isinstance(store, DiskBackedRecordStore)
     assert len(store) == 3
     assert [record.utterance_id for record in store] == ["utt0", "utt1", "utt2"]
+    assert (tmp_path / "records" / "train.jsonl.offsets.u64").exists()
+    assert (tmp_path / "records" / "train.jsonl.estimated_frames.u32").exists()
 
 
 def test_build_disk_backed_record_store_reads_parquet_manifest_file(tmp_path: Path) -> None:

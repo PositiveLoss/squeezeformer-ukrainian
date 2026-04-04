@@ -6,8 +6,10 @@ import base64
 import hashlib
 import json
 import logging
+import mmap
 import os
 import random
+import struct
 import sys
 import time
 from collections import defaultdict
@@ -70,7 +72,7 @@ from squeezeformer_pytorch.runtime_types import (
 try:
     import transformer_engine.pytorch as te
     from transformer_engine.common.recipe import DelayedScaling, Format
-except ImportError, OSError:
+except (ImportError, OSError):
     te = None
     DelayedScaling = None
     Format = None
@@ -491,6 +493,73 @@ class DiskBackedRecordStore:
             self.estimated_frames[global_index] = max(0, int(frames))
 
 
+class _BinaryIndexView:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        item_size: int,
+        fmt: str,
+        writable: bool = False,
+    ) -> None:
+        self.path = path
+        self.item_size = item_size
+        self.fmt = fmt
+        self.writable = writable
+        self._length = path.stat().st_size // item_size if path.exists() else 0
+        self._handle = None
+        self._mmap = None
+        self._pid: int | None = None
+
+    def _ensure_open(self):
+        current_pid = os.getpid()
+        if self._pid != current_pid:
+            self.close()
+        if self._mmap is None:
+            mode = "r+b" if self.writable else "rb"
+            self._handle = self.path.open(mode)
+            access = mmap.ACCESS_WRITE if self.writable else mmap.ACCESS_READ
+            self._mmap = mmap.mmap(self._handle.fileno(), length=0, access=access)
+            self._pid = current_pid
+        return self._mmap
+
+    def close(self) -> None:
+        if self._mmap is not None:
+            self._mmap.close()
+        if self._handle is not None and not self._handle.closed:
+            self._handle.close()
+        self._mmap = None
+        self._handle = None
+        self._pid = None
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int) -> int:
+        if index < 0:
+            index += self._length
+        if not 0 <= index < self._length:
+            raise IndexError(index)
+        return int(struct.unpack_from(self.fmt, self._ensure_open(), index * self.item_size)[0])
+
+    def __setitem__(self, index: int, value: int) -> None:
+        if not self.writable:
+            raise TypeError("Index view is read-only.")
+        if index < 0:
+            index += self._length
+        if not 0 <= index < self._length:
+            raise IndexError(index)
+        struct.pack_into(self.fmt, self._ensure_open(), index * self.item_size, int(value))
+
+    def __iter__(self):
+        for index in range(self._length):
+            yield self[index]
+
+
+def _record_index_path(records_path: Path, suffix: str) -> Path:
+    return records_path.with_suffix(records_path.suffix + suffix)
+
+
 def _build_disk_backed_record_store(
     dataset_sources: list[str | Path],
     *,
@@ -510,10 +579,14 @@ def _build_disk_backed_record_store(
 ) -> DiskBackedRecordStore:
     records_path.parent.mkdir(parents=True, exist_ok=True)
     audio_blob_dir = records_path.parent / f"{records_path.stem}_audio_blobs"
-    offsets = array.array("Q")
-    estimated_frames = array.array("I")
+    offsets_path = _record_index_path(records_path, ".offsets.u64")
+    estimated_frames_path = _record_index_path(records_path, ".estimated_frames.u32")
     written = 0
-    with records_path.open("wb") as handle:
+    with (
+        records_path.open("wb") as handle,
+        offsets_path.open("wb") as offsets_handle,
+        estimated_frames_path.open("wb") as estimated_frames_handle,
+    ):
         for dataset_source in dataset_sources:
             remaining_samples = None
             if max_samples is not None:
@@ -572,7 +645,7 @@ def _build_disk_backed_record_store(
                     if not blob_path.exists():
                         blob_path.write_bytes(audio_bytes)
                     audio_blob_path = str(blob_path.relative_to(records_path.parent))
-                offsets.append(handle.tell())
+                offsets_handle.write(struct.pack("<Q", handle.tell()))
                 payload = json.dumps(
                     {
                         "audio_path": record.audio_path,
@@ -586,14 +659,25 @@ def _build_disk_backed_record_store(
                 )
                 handle.write(payload.encode("utf-8"))
                 handle.write(b"\n")
-                estimated_frames.append(max(0, int(record.estimated_frames)))
+                estimated_frames_handle.write(
+                    struct.pack("<I", max(0, int(record.estimated_frames)))
+                )
                 written += 1
-    if not offsets:
+    if written == 0:
         raise RuntimeError(
             f"Split '{split}' is empty after applying the current split fractions across "
             "all dataset sources."
         )
-    return DiskBackedRecordStore(records_path, offsets, estimated_frames)
+    return DiskBackedRecordStore(
+        records_path,
+        _BinaryIndexView(offsets_path, item_size=8, fmt="<Q"),
+        _BinaryIndexView(
+            estimated_frames_path,
+            item_size=4,
+            fmt="<I",
+            writable=True,
+        ),
+    )
 
 
 def _load_cached_audio_bytes(payload: dict[str, object], *, records_path: Path) -> bytes | None:
