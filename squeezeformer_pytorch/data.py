@@ -778,34 +778,8 @@ def iter_cv22_corpus_texts_from_repo(
 ) -> Iterable[str]:
     seen: set[str] = set()
     yielded = 0
-    storage_options = _hf_storage_options(token)
-    for repo_path in sorted(list_repo_files(repo_id, repo_type="dataset", token=token)):
-        if repo_path.endswith(".parquet"):
-            lazy_frame = pl.scan_parquet(
-                f"hf://datasets/{repo_id}/{repo_path}",
-                storage_options=storage_options,
-            )
-            transcript_column = _select_transcript_column(lazy_frame.collect_schema().names())
-            if transcript_column is None:
-                continue
-            frame = lazy_frame.select(pl.col(transcript_column)).collect()
-            rows = ({transcript_column: value} for value in frame[transcript_column].to_list())
-        elif repo_path.endswith(".tsv"):
-            lazy_frame = pl.scan_csv(
-                f"hf://datasets/{repo_id}/{repo_path}",
-                separator="\t",
-                infer_schema_length=1000,
-                storage_options=storage_options,
-            )
-            transcript_column = _select_transcript_column(lazy_frame.collect_schema().names())
-            if transcript_column is None:
-                continue
-            frame = lazy_frame.select(pl.col(transcript_column)).collect()
-            rows = ({transcript_column: value} for value in frame[transcript_column].to_list())
-        else:
-            continue
-
-        for row in rows:
+    for manifest_url in _iter_repo_manifest_urls(repo_id, token=token):
+        for row in _iter_remote_rows(manifest_url, token=token, batch_size=8192):
             try:
                 transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
             except KeyError:
@@ -970,11 +944,12 @@ class MaxFramesBatchSampler(BatchSampler):
         return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
+        if not self.shuffle:
+            yield from self._iter_batches()
+            return
         batches = list(self._iter_batches())
-        if self.shuffle:
-            order = torch.randperm(len(batches)).tolist()
-            batches = [batches[index] for index in order]
-        yield from batches
+        order = torch.randperm(len(batches)).tolist()
+        yield from (batches[index] for index in order)
 
     def __len__(self) -> int:
         return self._num_batches
@@ -1026,11 +1001,12 @@ class AdaptiveBatchSampler(BatchSampler):
         return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
+        if not self.shuffle:
+            yield from self._iter_batches()
+            return
         batches = list(self._iter_batches())
-        if self.shuffle:
-            order = torch.randperm(len(batches)).tolist()
-            batches = [batches[index] for index in order]
-        yield from batches
+        order = torch.randperm(len(batches)).tolist()
+        yield from (batches[index] for index in order)
 
     def __len__(self) -> int:
         return self._num_batches
@@ -1064,9 +1040,12 @@ def prevalidate_records(
     if num_workers <= 1:
         return [record for record in records if _record_is_valid(record)]
 
+    validated_records: list[CVRecord] = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        validity = list(executor.map(_record_is_valid, records))
-    return [record for record, is_valid in zip(records, validity, strict=True) if is_valid]
+        for record, is_valid in zip(records, executor.map(_record_is_valid, records), strict=True):
+            if is_valid:
+                validated_records.append(record)
+    return validated_records
 
 
 def estimate_record_frames(record: CVRecord, hop_length: int) -> int:
@@ -1094,7 +1073,9 @@ def materialize_record_metadata(
     if num_workers <= 1:
         return [populate(record) for record in records]
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        return list(executor.map(populate, records))
+        for _ in executor.map(populate, records):
+            pass
+    return records
 
 
 def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
