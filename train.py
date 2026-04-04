@@ -33,6 +33,7 @@ from squeezeformer_pytorch.asr import (
     Tokenizer,
     ctc_prefix_beam_search,
     load_lm_scorer,
+    load_tokenizer,
     tokenizer_from_dict,
 )
 from squeezeformer_pytorch.checkpoints import save_checkpoint
@@ -1590,6 +1591,14 @@ def parse_args() -> argparse.Namespace:
         default="sentencepiece",
         choices=["character", "sentencepiece"],
     )
+    parser.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help=(
+            "Path to an existing tokenizer artifact to reuse instead of building one from the "
+            "training transcripts. Supports tokenizer JSON files and SentencePiece .model files."
+        ),
+    )
     parser.add_argument("--spm-vocab-size", type=int, default=4096)
     parser.add_argument(
         "--spm-model-type",
@@ -2217,12 +2226,15 @@ def main() -> None:
         )
     stage_start_time = time.perf_counter()
     logger.info(
-        "preparing tokenizer mode=%s resume=%s",
+        "preparing tokenizer mode=%s resume=%s tokenizer_path=%s",
         args.tokenizer,
         checkpoint is not None,
+        args.tokenizer_path or "auto",
     )
     if checkpoint is not None:
         tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
+    elif args.tokenizer_path is not None:
+        tokenizer = load_tokenizer(args.tokenizer_path)
     elif args.tokenizer == "sentencepiece":
         tokenizer = SentencePieceTokenizer.train(
             (record.transcript for record in train_records),

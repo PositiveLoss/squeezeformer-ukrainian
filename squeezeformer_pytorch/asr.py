@@ -209,7 +209,10 @@ def tokenizer_from_dict(payload: dict[str, object]) -> Tokenizer:
 
 
 def load_tokenizer(path: str | Path) -> Tokenizer:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    path = Path(path)
+    if path.suffix == ".model":
+        return SentencePieceTokenizer.from_model_bytes(path.read_bytes())
+    payload = json.loads(path.read_text(encoding="utf-8"))
     return tokenizer_from_dict(payload)
 
 
