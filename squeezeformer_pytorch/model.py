@@ -647,6 +647,11 @@ class SqueezeformerConfig:
     time_recover_idx: tuple[int, ...] = (15,)
     attention_backend: str = "relative"
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "block_pattern", tuple(self.block_pattern))
+        object.__setattr__(self, "time_reduce_idx", tuple(self.time_reduce_idx))
+        object.__setattr__(self, "time_recover_idx", tuple(self.time_recover_idx))
+
 
 VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
     "xs": SqueezeformerConfig(
