@@ -1937,6 +1937,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+fp8 = [
+    { name = "transformer-engine", extra = ["pytorch"] },
+]
 jax = [
     { name = "flax" },
     { name = "jax" },
@@ -1952,7 +1955,6 @@ train = [
     { name = "polars" },
     { name = "torchcodec" },
     { name = "trackio" },
-    { name = "transformer-engine", extra = ["pytorch"] },
     { name = "transformers" },
 ]
 
@@ -1982,10 +1984,10 @@ requires-dist = [
     { name = "torchcodec", specifier = ">=0.11.0" },
     { name = "torchcodec", marker = "extra == 'train'", specifier = ">=0.11.0" },
     { name = "trackio", marker = "extra == 'train'", specifier = ">=0.20.2" },
-    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'train'", specifier = ">=2.13.0" },
+    { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'fp8'", specifier = ">=2.13.0" },
     { name = "transformers", marker = "extra == 'train'", specifier = ">=4.57.0" },
 ]
-provides-extras = ["jax", "quantize", "train"]
+provides-extras = ["jax", "quantize", "fp8", "train"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -24,6 +24,9 @@ jax = [
 quantize = [
     "torchao>=0.16.0",
 ]
+fp8 = [
+    "transformer-engine[pytorch]>=2.13.0",
+]
 train = [
     "jiwer>=4.0.0",
     "nvidia-npp>=13.1.0.44",
@@ -31,7 +34,6 @@ train = [
     "torchcodec>=0.11.0",
     "trackio>=0.20.2",
     "transformers>=4.57.0",
-    "transformer-engine[pytorch]>=2.13.0",
 ]
 
 [tool.pytest.ini_options]

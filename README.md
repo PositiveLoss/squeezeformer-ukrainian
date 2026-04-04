@@ -57,7 +57,9 @@ If you are installing from the project metadata instead, `gradio` is already inc
 
 Optional extras:
 
-- `uv pip install .[train]` for training dependencies, including Transformer Engine FP8 support
+- `uv pip install .[train]` for training dependencies
+- `uv pip install .[fp8]` for Transformer Engine FP8 inference support
+- `uv pip install .[train,fp8]` for training with Transformer Engine FP8 support
 - `uv pip install .[quantize]` for TorchAO post-training quantization
 
 ## Inference
