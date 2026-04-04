@@ -1688,6 +1688,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freq-mask-param", type=int, default=27)
     parser.add_argument("--num-time-masks", type=int, default=None)
     parser.add_argument("--time-mask-max-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--no-data-augmentation",
+        action="store_true",
+        help=(
+            "Disable SpecAugment and waveform augmentation regardless of the configured "
+            "augmentation parameters."
+        ),
+    )
     parser.add_argument("--speed-perturb-prob", type=float, default=0.0)
     parser.add_argument("--speed-factors", default="0.9,1.0,1.1")
     parser.add_argument("--noise-prob", type=float, default=0.0)
@@ -2268,21 +2276,24 @@ def main() -> None:
         normalize_feature=args.normalize_feature,
         normalize_per_frame=args.normalize_per_frame,
     )
-    specaugment = SpecAugment(
-        num_freq_masks=args.num_freq_masks,
-        freq_mask_param=args.freq_mask_param,
-        num_time_masks=args.num_time_masks or variant_defaults.num_time_masks,
-        time_mask_max_ratio=args.time_mask_max_ratio,
-    )
-    waveform_augment = WaveformAugment(
-        speed_perturb_prob=args.speed_perturb_prob,
-        speed_factors=_resolve_float_tuple(args.speed_factors),
-        noise_prob=args.noise_prob,
-        noise_snr_db_range=(args.noise_snr_db_min, args.noise_snr_db_max),
-        reverb_prob=args.reverb_prob,
-        reverb_decay_range=(args.reverb_decay_min, args.reverb_decay_max),
-        reverb_delay_ms_range=(args.reverb_delay_ms_min, args.reverb_delay_ms_max),
-    )
+    specaugment = None
+    waveform_augment = None
+    if not args.no_data_augmentation:
+        specaugment = SpecAugment(
+            num_freq_masks=args.num_freq_masks,
+            freq_mask_param=args.freq_mask_param,
+            num_time_masks=args.num_time_masks or variant_defaults.num_time_masks,
+            time_mask_max_ratio=args.time_mask_max_ratio,
+        )
+        waveform_augment = WaveformAugment(
+            speed_perturb_prob=args.speed_perturb_prob,
+            speed_factors=_resolve_float_tuple(args.speed_factors),
+            noise_prob=args.noise_prob,
+            noise_snr_db_range=(args.noise_snr_db_min, args.noise_snr_db_max),
+            reverb_prob=args.reverb_prob,
+            reverb_decay_range=(args.reverb_decay_min, args.reverb_decay_max),
+            reverb_delay_ms_range=(args.reverb_delay_ms_min, args.reverb_delay_ms_max),
+        )
     train_feature_cache_dir = (
         Path(args.feature_cache_dir) / "train" if args.feature_cache_dir is not None else None
     )
