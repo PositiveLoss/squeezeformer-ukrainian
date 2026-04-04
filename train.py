@@ -273,6 +273,22 @@ def _validate_resume_checkpoint_payload(
         )
 
 
+def _configure_trackio_storage(output_dir: Path) -> Path:
+    trackio_dir = output_dir / "trackio"
+    trackio_dir.mkdir(parents=True, exist_ok=True)
+    media_dir = trackio_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["TRACKIO_DIR"] = str(trackio_dir)
+    trackio.utils.TRACKIO_DIR = trackio_dir
+    trackio.utils.MEDIA_DIR = media_dir
+    trackio.TRACKIO_DIR = trackio_dir
+    import trackio.sqlite_storage as trackio_sqlite_storage
+
+    trackio_sqlite_storage.TRACKIO_DIR = trackio_dir
+    trackio_sqlite_storage.MEDIA_DIR = media_dir
+    return trackio_dir
+
+
 def _resolve_resume_checkpoint_path(
     args: argparse.Namespace,
     *,
@@ -2312,6 +2328,7 @@ def main() -> None:
         is_main_process=is_main_process,
         log_path=output_dir / "training.log",
     )
+    trackio_dir = _configure_trackio_storage(output_dir)
     resume_path = _resolve_resume_checkpoint_path(args, output_dir=output_dir, logger=logger)
     logger.info(
         "starting training variant=%s device=%s distributed=%s world_size=%s output_dir=%s",
@@ -2765,8 +2782,9 @@ def main() -> None:
             },
         )
         logger.info(
-            "trackio initialized project=%s elapsed_since_start=%s",
+            "trackio initialized project=%s trackio_dir=%s elapsed_since_start=%s",
             args.trackio_project,
+            trackio_dir,
             _format_elapsed_seconds(time.perf_counter() - process_start_time),
         )
 
