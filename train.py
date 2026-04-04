@@ -232,6 +232,64 @@ def _format_elapsed_seconds(seconds: float) -> str:
     return f"{int(minutes)}m {remainder:.1f}s"
 
 
+def _validate_resume_checkpoint_payload(
+    checkpoint: dict[str, object],
+    *,
+    checkpoint_path: Path,
+) -> None:
+    required_keys = (
+        "model_state_dict",
+        "encoder_config",
+        "tokenizer",
+        "optimizer_state_dicts",
+        "scheduler_state_dicts",
+        "epoch",
+        "global_step",
+    )
+    missing = [key for key in required_keys if key not in checkpoint]
+    if missing:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' is missing required field(s): {', '.join(missing)}."
+        )
+
+
+def _resolve_resume_checkpoint_path(
+    args: argparse.Namespace,
+    *,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> Path | None:
+    if args.resume and args.auto_resume:
+        raise ValueError("Use only one of --resume or --auto-resume.")
+    if args.resume:
+        return Path(args.resume)
+    if not args.auto_resume:
+        return None
+
+    checkpoint_path = output_dir / "checkpoint_last.pt"
+    if not checkpoint_path.exists():
+        logger.info(
+            "auto-resume requested but no checkpoint found at %s; starting a fresh run",
+            checkpoint_path,
+        )
+        return None
+
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to load auto-resume checkpoint '{checkpoint_path}': {error}"
+        ) from error
+    _validate_resume_checkpoint_payload(checkpoint, checkpoint_path=checkpoint_path)
+    logger.info(
+        "auto-resume validated checkpoint path=%s epoch=%s global_step=%s",
+        checkpoint_path,
+        checkpoint.get("epoch"),
+        checkpoint.get("global_step"),
+    )
+    return checkpoint_path
+
+
 def _validate_device_argument(device: str) -> str:
     try:
         torch.device(device)
@@ -1524,6 +1582,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", default=None)
     parser.add_argument(
+        "--auto-resume",
+        action="store_true",
+        help=(
+            "Resume from OUTPUT_DIR/checkpoint_last.pt when it exists and passes validation. "
+            "Starts a fresh run when no last checkpoint is available."
+        ),
+    )
+    parser.add_argument(
         "--distributed",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2175,6 +2241,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     if is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
+    resume_path = _resolve_resume_checkpoint_path(args, output_dir=output_dir, logger=logger)
     logger.info(
         "starting training variant=%s device=%s distributed=%s world_size=%s output_dir=%s",
         args.variant,
@@ -2244,12 +2311,15 @@ def main() -> None:
 
     stage_start_time = time.perf_counter()
     checkpoint = (
-        torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
+        torch.load(resume_path, map_location="cpu", weights_only=False)
+        if resume_path is not None
+        else None
     )
-    if args.resume:
+    if resume_path is not None:
+        _validate_resume_checkpoint_payload(checkpoint, checkpoint_path=resume_path)
         logger.info(
             "resume checkpoint loaded path=%s elapsed=%s",
-            args.resume,
+            resume_path,
             _format_elapsed_seconds(time.perf_counter() - stage_start_time),
         )
     stage_start_time = time.perf_counter()
@@ -2580,7 +2650,7 @@ def main() -> None:
         best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
         logger.info(
             "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layers=%s intermediate_ctc_weight=%.3f blank_prune_layer=%s blank_prune_threshold=%.3f",
-            args.resume,
+            resume_path,
             start_epoch,
             global_step,
             best_val_wer,
