@@ -1921,8 +1921,8 @@ def parse_args() -> argparse.Namespace:
         default="flash",
         choices=["relative", "flash"],
         help=(
-            "Attention implementation. 'flash' uses PyTorch scaled_dot_product_attention, "
-            "which dispatches to FlashAttention kernels on supported CUDA setups."
+            "Attention implementation. 'flash' prefers kernels-community/flash-attn2 on "
+            "supported CUDA setups and falls back to PyTorch scaled_dot_product_attention."
         ),
     )
     parser.add_argument("--block-pattern", default="M,s,C,s")

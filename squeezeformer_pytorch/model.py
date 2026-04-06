@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Callable
 
 import torch
@@ -12,12 +14,38 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .masking import make_attention_mask, make_sequence_mask
 
 try:
+    from kernels import get_kernel
+except ImportError:
+    get_kernel = None
+
+try:
     import transformer_engine.pytorch as te
 except ImportError, OSError:
     te = None
 
 
 FP8_SHAPE_ALIGNMENT = 16
+_FLASH_ATTN2_REPO_ID = "kernels-community/flash-attn2"
+_FLASH_ATTN2_WARNING_CACHE: set[str] = set()
+logger = logging.getLogger(__name__)
+
+
+def _warn_flash_attn2_once(reason: str) -> None:
+    if reason in _FLASH_ATTN2_WARNING_CACHE:
+        return
+    _FLASH_ATTN2_WARNING_CACHE.add(reason)
+    logger.warning("flash-attn2 disabled; falling back to SDPA: %s", reason)
+
+
+@lru_cache(maxsize=1)
+def _load_flash_attn2_kernel():
+    if get_kernel is None:
+        return None
+    try:
+        return get_kernel(_FLASH_ATTN2_REPO_ID)
+    except Exception as exc:
+        _warn_flash_attn2_once(f"unable to load {_FLASH_ATTN2_REPO_ID} ({exc})")
+        return None
 
 
 def _subsample_length(
@@ -207,10 +235,12 @@ class RelPositionMultiHeadAttention(nn.Module):
 
 
 class FlashMultiHeadAttention(nn.Module):
-    """PyTorch SDPA-backed MHA.
+    """Flash-attn2 or PyTorch SDPA-backed MHA.
 
-    On supported CUDA shapes/dtypes, scaled_dot_product_attention dispatches to
-    FlashAttention kernels automatically.
+    The Hugging Face `kernels-community/flash-attn2` kernel is preferred on
+    supported CUDA runtimes. When the kernel package/runtime/build is missing or
+    does not support the current shapes, dtype, or dropout mode, this module
+    falls back to PyTorch SDPA.
     """
 
     def __init__(
@@ -232,6 +262,7 @@ class FlashMultiHeadAttention(nn.Module):
         self.value = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
         self.out_proj = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
         self.dropout_p = dropout
+        self._flash_attn2_enabled = True
 
     def _shape(self, x: Tensor) -> Tensor:
         batch, time, _ = x.shape
@@ -241,19 +272,123 @@ class FlashMultiHeadAttention(nn.Module):
     def _to_sdpa_mask(mask: Tensor) -> Tensor:
         return mask.unsqueeze(1)
 
+    @staticmethod
+    def _heads_first_to_last(x: Tensor) -> Tensor:
+        return x.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def _heads_last_to_first(x: Tensor) -> Tensor:
+        return x.transpose(1, 2).contiguous()
+
+    @staticmethod
+    def _infer_sequence_lengths(mask: Tensor) -> Tensor:
+        return mask.any(dim=-1).sum(dim=-1, dtype=torch.int32)
+
+    @staticmethod
+    def _cu_seqlens(lengths: Tensor) -> Tensor:
+        cu_seqlens = torch.zeros(lengths.size(0) + 1, device=lengths.device, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(lengths.to(dtype=torch.int32), dim=0)
+        return cu_seqlens
+
+    @staticmethod
+    def _pack_padded_sequences(x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
+        steps = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+        sequence_mask = steps < lengths.unsqueeze(1)
+        return x[sequence_mask], sequence_mask
+
+    @staticmethod
+    def _unpack_padded_sequences(
+        packed: Tensor,
+        sequence_mask: Tensor,
+        *,
+        batch: int,
+        time: int,
+    ) -> Tensor:
+        out = packed.new_zeros((batch, time, packed.size(1), packed.size(2)))
+        out[sequence_mask] = packed
+        return out
+
+    def _maybe_disable_flash_attn2(self, exc: Exception) -> None:
+        self._flash_attn2_enabled = False
+        _warn_flash_attn2_once(str(exc))
+
+    def _supports_flash_attn2(self, query: Tensor) -> bool:
+        return (
+            self._flash_attn2_enabled
+            and query.device.type == "cuda"
+            and query.dtype in (torch.float16, torch.bfloat16)
+        )
+
+    def _flash_attn2(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        mask: Tensor | None,
+    ) -> Tensor | None:
+        if not self._supports_flash_attn2(query):
+            return None
+        kernel = _load_flash_attn2_kernel()
+        if kernel is None:
+            return None
+        dropout_p = self.dropout_p if self.training else 0.0
+        try:
+            if mask is None:
+                return kernel.fwd(
+                    q=query,
+                    k=key,
+                    v=value,
+                    p_dropout=dropout_p,
+                    is_causal=False,
+                )[0]
+
+            lengths = self._infer_sequence_lengths(mask)
+            if torch.any(lengths <= 0):
+                return None
+            packed_query, sequence_mask = self._pack_padded_sequences(query, lengths)
+            packed_key, _ = self._pack_padded_sequences(key, lengths)
+            packed_value, _ = self._pack_padded_sequences(value, lengths)
+            packed_out = kernel.varlen_fwd(
+                q=packed_query,
+                k=packed_key,
+                v=packed_value,
+                cu_seqlens_q=self._cu_seqlens(lengths),
+                cu_seqlens_k=self._cu_seqlens(lengths),
+                max_seqlen_q=int(lengths.max().item()),
+                max_seqlen_k=int(lengths.max().item()),
+                p_dropout=dropout_p,
+                is_causal=False,
+            )[0]
+            return self._unpack_padded_sequences(
+                packed_out,
+                sequence_mask,
+                batch=query.size(0),
+                time=query.size(1),
+            )
+        except Exception as exc:
+            self._maybe_disable_flash_attn2(exc)
+            return None
+
     def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
         query = self._shape(apply_linear_with_fp8_padding(self.query, x))
         key = self._shape(apply_linear_with_fp8_padding(self.key, x))
         value = self._shape(apply_linear_with_fp8_padding(self.value, x))
-        attn_mask = self._to_sdpa_mask(mask) if mask is not None else None
-        context = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=False,
-        )
+        flash_query = self._heads_first_to_last(query)
+        flash_key = self._heads_first_to_last(key)
+        flash_value = self._heads_first_to_last(value)
+        flash_context = self._flash_attn2(flash_query, flash_key, flash_value, mask)
+        if flash_context is not None:
+            context = self._heads_last_to_first(flash_context)
+        else:
+            attn_mask = self._to_sdpa_mask(mask) if mask is not None else None
+            context = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,
+            )
         context = context.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.dim)
         return apply_linear_with_fp8_padding(self.out_proj, context)
 
