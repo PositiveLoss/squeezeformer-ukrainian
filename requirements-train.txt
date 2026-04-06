@@ -10,8 +10,6 @@ transformers>=4.57.0
 
 torch>=2.9.0,<=2.11.0
 
-transformer-engine[pytorch]>=2.13.0
-
 torchaudio>=2.9.0,<=2.11.0
 torchcodec>=0.11.0
 
