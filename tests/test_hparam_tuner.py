@@ -13,6 +13,8 @@ def _base_args(**overrides: object) -> Namespace:
         tokenizer="sentencepiece",
         spm_vocab_size=128,
         device="cpu",
+        distributed=False,
+        nproc_per_node=1,
         dtype="bfloat16",
         feature_cache_dir="artifacts/feature_cache",
         compile=True,
@@ -63,6 +65,63 @@ def test_build_train_command_includes_estimated_knobs() -> None:
     assert f"--gradient-accumulation-steps {estimate.gradient_accumulation_steps}" in command
     assert f"--dtype {estimate.resolved_dtype}" in command
     assert "--compile" in command
+
+
+def test_distributed_command_uses_torchrun_and_disables_compile(monkeypatch) -> None:
+    args = _base_args(
+        device="cuda:0",
+        distributed=True,
+        nproc_per_node=4,
+        emit_format="shell",
+    )
+
+    monkeypatch.setattr(
+        hparam_tuner,
+        "probe_device",
+        lambda device: hparam_tuner.DeviceProfile(device, "cuda", 24.0, 16),
+    )
+    monkeypatch.setattr(hparam_tuner, "_fp8_support_status", lambda device, variant: (False, None))
+
+    estimate = estimate_training_hparams(args)
+    command = build_train_command(args, estimate)
+
+    assert estimate.distributed is True
+    assert estimate.world_size == 4
+    assert estimate.resolved_compile is False
+    assert estimate.estimated_effective_frames >= estimate.target_effective_frames
+    assert "uv run torchrun --nproc_per_node=4 train.py" in command
+    assert "--distributed" in command
+    assert "--no-compile" in command
+
+
+def test_distributed_reduces_gradient_accumulation(monkeypatch) -> None:
+    args_single = _base_args(device="cuda:0", distributed=False, nproc_per_node=1)
+    args_distributed = _base_args(device="cuda:0", distributed=True, nproc_per_node=4)
+
+    monkeypatch.setattr(
+        hparam_tuner,
+        "probe_device",
+        lambda device: hparam_tuner.DeviceProfile(device, "cuda", 24.0, 16),
+    )
+    monkeypatch.setattr(hparam_tuner, "_fp8_support_status", lambda device, variant: (False, None))
+
+    estimate_single = estimate_training_hparams(args_single)
+    estimate_distributed = estimate_training_hparams(args_distributed)
+
+    assert estimate_distributed.gradient_accumulation_steps <= estimate_single.gradient_accumulation_steps
+    assert estimate_distributed.estimated_per_rank_effective_frames <= estimate_single.estimated_effective_frames
+    assert estimate_distributed.estimated_effective_frames >= estimate_distributed.estimated_per_rank_effective_frames
+
+
+def test_distributed_requires_at_least_two_processes() -> None:
+    args = _base_args(distributed=True, nproc_per_node=1)
+
+    try:
+        estimate_training_hparams(args)
+    except ValueError as error:
+        assert str(error) == "--distributed requires --nproc-per-node >= 2."
+    else:
+        raise AssertionError("expected distributed validation error")
 
 
 def test_larger_variant_reduces_frame_budget(monkeypatch) -> None:

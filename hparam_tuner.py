@@ -39,6 +39,8 @@ class DeviceProfile:
 @dataclass(frozen=True)
 class TrainingEstimate:
     variant: str
+    distributed: bool
+    world_size: int
     batch_size: int
     max_batch_frames: int
     gradient_accumulation_steps: int
@@ -55,6 +57,7 @@ class TrainingEstimate:
     available_memory_gb: float | None
     target_effective_frames: int
     estimated_effective_frames: int
+    estimated_per_rank_effective_frames: int
     resolved_dtype: str
     resolved_compile: bool
     fp8_supported: bool
@@ -80,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", default="sentencepiece", choices=TOKENIZER_CHOICES)
     parser.add_argument("--spm-vocab-size", type=int, default=4096)
     parser.add_argument("--device", type=_validate_device_argument, required=True)
+    parser.add_argument(
+        "--distributed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--nproc-per-node", type=int, default=1)
     parser.add_argument("--dtype", default="auto", choices=DTYPE_CHOICES)
     parser.add_argument("--feature-cache-dir", default=None)
     parser.add_argument(
@@ -224,10 +233,13 @@ def _resolve_training_dtype(args: argparse.Namespace) -> tuple[str, bool, str | 
 
 
 def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
+    if args.distributed and args.nproc_per_node < 2:
+        raise ValueError("--distributed requires --nproc-per-node >= 2.")
     profile = probe_device(args.device)
     resolved_dtype, fp8_supported, fp8_support_reason = _resolve_training_dtype(args)
     compile_supported, compile_support_reason = _compile_support_status(args.device)
-    resolved_compile = args.compile and compile_supported
+    world_size = args.nproc_per_node if args.distributed else 1
+    resolved_compile = args.compile and compile_supported and not args.distributed
     vocab_size = args.spm_vocab_size if args.tokenizer == "sentencepiece" else 256
     model_parameters = count_model_parameters(args.variant, vocab_size=vocab_size)
     model_parameters_millions = model_parameters / 1_000_000.0
@@ -303,7 +315,11 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         pin_memory = False
 
     batch_size = max(1, min(batch_cap, max_batch_frames // max(1, args.avg_frames_per_sample)))
-    gradient_accumulation_steps = max(1, math.ceil(target_effective_frames / max_batch_frames))
+    per_rank_effective_frames = max_batch_frames
+    gradient_accumulation_steps = max(
+        1,
+        math.ceil(target_effective_frames / max(1, per_rank_effective_frames * world_size)),
+    )
     prefetch_factor = 2 if num_workers > 0 else 0
     persistent_workers = num_workers > 0
 
@@ -317,6 +333,8 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
 
     return TrainingEstimate(
         variant=args.variant,
+        distributed=args.distributed,
+        world_size=world_size,
         batch_size=batch_size,
         max_batch_frames=max_batch_frames,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -332,7 +350,8 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         parameter_scale=parameter_scale,
         available_memory_gb=profile.memory_gb,
         target_effective_frames=target_effective_frames,
-        estimated_effective_frames=max_batch_frames * gradient_accumulation_steps,
+        estimated_effective_frames=per_rank_effective_frames * gradient_accumulation_steps * world_size,
+        estimated_per_rank_effective_frames=per_rank_effective_frames * gradient_accumulation_steps,
         resolved_dtype=resolved_dtype,
         resolved_compile=resolved_compile,
         fp8_supported=fp8_supported,
@@ -344,34 +363,48 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
 def build_train_command(args: argparse.Namespace, estimate: TrainingEstimate) -> str:
     dataset_repo = getattr(args, "dataset_repo", "speech-uk/cv22")
     command = [
-        "uv run python train.py",
-        f"--dataset-repo {dataset_repo}",
-        f"--variant {args.variant}",
-        f"--optimizer {args.optimizer}",
-        f"--tokenizer {args.tokenizer}",
-        f"--device {args.device}",
-        f"--dtype {estimate.resolved_dtype}",
-        "--compile" if estimate.resolved_compile else "--no-compile",
-        f"--gradient-accumulation-steps {estimate.gradient_accumulation_steps}",
-        f"--max-batch-frames {estimate.max_batch_frames}",
-        f"--speed-perturb-prob {args.speed_perturb_prob}",
-        f"--noise-prob {args.noise_prob}",
-        f"--reverb-prob {args.reverb_prob}",
-        f"--decode-strategy {args.decode_strategy}",
-        f"--beam-size {estimate.beam_size}",
-        f"--output-dir {args.output_dir}",
-        f"--batch-size {estimate.batch_size}",
-        f"--epochs {args.epochs}",
-        f"--num-workers {estimate.num_workers}",
-        f"--metadata-workers {estimate.metadata_workers}",
-        f"--prefetch-factor {estimate.prefetch_factor}",
-        "--pin-memory" if estimate.pin_memory else "--no-pin-memory",
-        "--persistent-workers" if estimate.persistent_workers else "--no-persistent-workers",
+        (
+            f"uv run torchrun --nproc_per_node={estimate.world_size} train.py"
+            if estimate.distributed
+            else "uv run python train.py"
+        ),
     ]
+    if estimate.distributed:
+        command.append("--distributed")
+    command.extend(
+        [
+            f"--dataset-repo {dataset_repo}",
+            f"--variant {args.variant}",
+            f"--optimizer {args.optimizer}",
+            f"--tokenizer {args.tokenizer}",
+        ]
+    )
     if args.tokenizer == "sentencepiece":
-        command.insert(4, f"--spm-vocab-size {args.spm_vocab_size}")
+        command.append(f"--spm-vocab-size {args.spm_vocab_size}")
     if args.feature_cache_dir is not None:
-        command.insert(8, f"--feature-cache-dir {args.feature_cache_dir}")
+        command.append(f"--feature-cache-dir {args.feature_cache_dir}")
+    command.extend(
+        [
+            f"--device {args.device}",
+            f"--dtype {estimate.resolved_dtype}",
+            "--compile" if estimate.resolved_compile else "--no-compile",
+            f"--gradient-accumulation-steps {estimate.gradient_accumulation_steps}",
+            f"--max-batch-frames {estimate.max_batch_frames}",
+            f"--speed-perturb-prob {args.speed_perturb_prob}",
+            f"--noise-prob {args.noise_prob}",
+            f"--reverb-prob {args.reverb_prob}",
+            f"--decode-strategy {args.decode_strategy}",
+            f"--beam-size {estimate.beam_size}",
+            f"--output-dir {args.output_dir}",
+            f"--batch-size {estimate.batch_size}",
+            f"--epochs {args.epochs}",
+            f"--num-workers {estimate.num_workers}",
+            f"--metadata-workers {estimate.metadata_workers}",
+            f"--prefetch-factor {estimate.prefetch_factor}",
+            "--pin-memory" if estimate.pin_memory else "--no-pin-memory",
+            "--persistent-workers" if estimate.persistent_workers else "--no-persistent-workers",
+        ]
+    )
     return " \\\n  ".join(command)
 
 
@@ -385,6 +418,8 @@ def main() -> None:
             "tokenizer": args.tokenizer,
             "spm_vocab_size": args.spm_vocab_size,
             "device": args.device,
+            "distributed": args.distributed,
+            "nproc_per_node": args.nproc_per_node,
             "dtype": args.dtype,
             "resolved_dtype": estimate.resolved_dtype,
             "compile": args.compile,
