@@ -66,12 +66,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prevalidate-workers", type=int, default=4)
     parser.add_argument("--min-transcript-chars", type=int, default=1)
-    parser.add_argument("--max-transcript-chars", type=int, default=400)
+    parser.add_argument("--max-transcript-chars", type=int, default=5000)
     parser.add_argument("--max-symbol-ratio", type=float, default=0.5)
     parser.add_argument("--sample-rate", type=int, default=16_000)
     parser.add_argument(
         "--frontend-backend",
-        default="audioflux",
+        default="torchaudio",
         choices=["torchaudio", "audioflux"],
     )
     parser.add_argument("--n-fft", type=int, default=512)
