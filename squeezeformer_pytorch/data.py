@@ -821,6 +821,7 @@ def feature_cache_path(
     feature_cache_dir: str | Path | None,
     utterance_id: str,
     featurizer: AudioFeaturizer,
+    cache_key_extra: dict[str, object] | None = None,
 ) -> Path | None:
     if feature_cache_dir is None:
         return None
@@ -836,7 +837,10 @@ def feature_cache_path(
         safe_utterance_id = (
             f"{safe_utterance_id[:96]}_{hashlib.sha256(utterance_id.encode('utf-8')).hexdigest()[:8]}"
         )
-    frontend_hash = hashlib.sha256(repr(featurizer.config_dict()).encode("utf-8")).hexdigest()[:12]
+    cache_config: dict[str, object] = {"featurizer": featurizer.config_dict()}
+    if cache_key_extra:
+        cache_config["extra"] = cache_key_extra
+    frontend_hash = hashlib.sha256(repr(cache_config).encode("utf-8")).hexdigest()[:12]
     return feature_cache_path / f"{safe_utterance_id}_{frontend_hash}.pt"
 
 

@@ -12,6 +12,8 @@ from tqdm.auto import tqdm
 
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
+    SpecAugment,
+    WaveformAugment,
     feature_cache_path,
     iter_cv22_records_from_source,
     load_audio,
@@ -19,6 +21,8 @@ from squeezeformer_pytorch.data import (
 )
 
 _WORKER_FEATURIZER: AudioFeaturizer | None = None
+_WORKER_SPECAUGMENT: SpecAugment | None = None
+_WORKER_WAVEFORM_AUGMENT: WaveformAugment | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,6 +121,28 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
+    parser.add_argument("--num-freq-masks", type=int, default=0)
+    parser.add_argument("--freq-mask-param", type=int, default=27)
+    parser.add_argument("--num-time-masks", type=int, default=0)
+    parser.add_argument("--time-mask-max-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--no-data-augmentation",
+        action="store_true",
+        help=(
+            "Disable SpecAugment and waveform augmentation regardless of the configured "
+            "augmentation parameters."
+        ),
+    )
+    parser.add_argument("--speed-perturb-prob", type=float, default=0.0)
+    parser.add_argument("--speed-factors", default="0.9,1.0,1.1")
+    parser.add_argument("--noise-prob", type=float, default=0.0)
+    parser.add_argument("--noise-snr-db-min", type=float, default=10.0)
+    parser.add_argument("--noise-snr-db-max", type=float, default=30.0)
+    parser.add_argument("--reverb-prob", type=float, default=0.0)
+    parser.add_argument("--reverb-decay-min", type=float, default=0.15)
+    parser.add_argument("--reverb-decay-max", type=float, default=0.5)
+    parser.add_argument("--reverb-delay-ms-min", type=float, default=8.0)
+    parser.add_argument("--reverb-delay-ms-max", type=float, default=35.0)
     return parser.parse_args()
 
 
@@ -177,6 +203,14 @@ def _resolve_validation_dataset_sources(args: argparse.Namespace) -> list[str | 
     return _resolve_sources(args.validation_dataset_source)
 
 
+def _resolve_float_tuple(values: str) -> tuple[float, ...]:
+    parts = [part.strip() for part in values.split(",")]
+    parsed = tuple(float(part) for part in parts if part)
+    if not parsed:
+        raise ValueError("Expected at least one comma-separated float value.")
+    return parsed
+
+
 def _resolve_extraction_sources(
     args: argparse.Namespace,
     dataset_sources: list[str | Path],
@@ -190,39 +224,116 @@ def _resolve_extraction_sources(
     return dataset_sources, args.split, args.val_fraction, args.test_fraction
 
 
+def _specaugment_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "num_freq_masks": args.num_freq_masks,
+        "freq_mask_param": args.freq_mask_param,
+        "num_time_masks": args.num_time_masks,
+        "time_mask_max_ratio": args.time_mask_max_ratio,
+    }
+
+
+def _waveform_augment_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "speed_perturb_prob": args.speed_perturb_prob,
+        "speed_factors": _resolve_float_tuple(args.speed_factors),
+        "noise_prob": args.noise_prob,
+        "noise_snr_db_range": (args.noise_snr_db_min, args.noise_snr_db_max),
+        "reverb_prob": args.reverb_prob,
+        "reverb_decay_range": (args.reverb_decay_min, args.reverb_decay_max),
+        "reverb_delay_ms_range": (args.reverb_delay_ms_min, args.reverb_delay_ms_max),
+    }
+
+
+def _augmentation_modules(
+    args: argparse.Namespace,
+) -> tuple[SpecAugment | None, WaveformAugment | None, dict[str, object] | None]:
+    if args.no_data_augmentation:
+        return None, None, None
+    specaugment = None
+    waveform_augment = None
+    augmentation_config: dict[str, object] = {}
+    specaugment_kwargs = _specaugment_kwargs(args)
+    if args.num_freq_masks > 0 or args.num_time_masks > 0:
+        specaugment = SpecAugment(**specaugment_kwargs)
+        augmentation_config["specaugment"] = specaugment_kwargs
+    waveform_augment_kwargs = _waveform_augment_kwargs(args)
+    waveform_augment = WaveformAugment(**waveform_augment_kwargs)
+    if waveform_augment.is_enabled():
+        augmentation_config["waveform_augment"] = {
+            "speed_perturb_prob": args.speed_perturb_prob,
+            "speed_factors": list(waveform_augment_kwargs["speed_factors"]),
+            "noise_prob": args.noise_prob,
+            "noise_snr_db_range": list(waveform_augment_kwargs["noise_snr_db_range"]),
+            "reverb_prob": args.reverb_prob,
+            "reverb_decay_range": list(waveform_augment_kwargs["reverb_decay_range"]),
+            "reverb_delay_ms_range": list(waveform_augment_kwargs["reverb_delay_ms_range"]),
+        }
+    else:
+        waveform_augment = None
+    return specaugment, waveform_augment, augmentation_config or None
+
+
 def extract_record_features(
     record,
     split_cache_dir: str | Path,
     featurizer_kwargs: dict[str, object],
+    augmentation_config: dict[str, object] | None,
     overwrite: bool,
 ) -> str:
     featurizer = _WORKER_FEATURIZER or AudioFeaturizer(**featurizer_kwargs)
-    cache_path = feature_cache_path(Path(split_cache_dir), record.utterance_id, featurizer)
+    specaugment = _WORKER_SPECAUGMENT
+    waveform_augment = _WORKER_WAVEFORM_AUGMENT
+    cache_path = feature_cache_path(
+        Path(split_cache_dir),
+        record.utterance_id,
+        featurizer,
+        cache_key_extra=augmentation_config,
+    )
     if cache_path is None:
         raise RuntimeError("feature cache path could not be resolved")
     if cache_path.exists() and not overwrite:
         return "cache_hit"
     waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
+    if waveform_augment is not None:
+        waveform, sample_rate = waveform_augment(waveform, sample_rate)
     features = featurizer(waveform, sample_rate)
+    if specaugment is not None:
+        features = specaugment(features)
     torch.save(features, cache_path)
     return "written"
 
 
-def _initialize_process_worker(featurizer_kwargs: dict[str, object]) -> None:
-    global _WORKER_FEATURIZER
+def _initialize_process_worker(
+    featurizer_kwargs: dict[str, object],
+    specaugment_kwargs: dict[str, object] | None,
+    waveform_augment_kwargs: dict[str, object] | None,
+) -> None:
+    global _WORKER_FEATURIZER, _WORKER_SPECAUGMENT, _WORKER_WAVEFORM_AUGMENT
     torch.set_num_threads(1)
     if hasattr(torch, "set_num_interop_threads"):
         torch.set_num_interop_threads(1)
     _WORKER_FEATURIZER = AudioFeaturizer(**featurizer_kwargs)
+    _WORKER_SPECAUGMENT = SpecAugment(**specaugment_kwargs) if specaugment_kwargs else None
+    _WORKER_WAVEFORM_AUGMENT = (
+        WaveformAugment(**waveform_augment_kwargs) if waveform_augment_kwargs else None
+    )
 
 
 def submit_extract_record_features(
     record,
     split_cache_dir: str | Path,
     featurizer_kwargs: dict[str, object],
+    augmentation_config: dict[str, object] | None,
     overwrite: bool,
 ) -> str:
-    return extract_record_features(record, split_cache_dir, featurizer_kwargs, overwrite)
+    return extract_record_features(
+        record,
+        split_cache_dir,
+        featurizer_kwargs,
+        augmentation_config,
+        overwrite,
+    )
 
 
 def iter_completed_futures(executor, records, num_workers: int, submit_task):
@@ -248,6 +359,7 @@ def iter_completed_futures(executor, records, num_workers: int, submit_task):
 
 
 def main() -> None:
+    global _WORKER_FEATURIZER, _WORKER_SPECAUGMENT, _WORKER_WAVEFORM_AUGMENT
     args = parse_args()
     torch.set_num_threads(1)
     if hasattr(torch, "set_num_interop_threads"):
@@ -257,6 +369,7 @@ def main() -> None:
     selected_sources, selected_split, selected_val_fraction, selected_test_fraction = (
         _resolve_extraction_sources(args, dataset_sources, validation_dataset_sources)
     )
+    specaugment, waveform_augment, augmentation_config = _augmentation_modules(args)
     featurizer = AudioFeaturizer(
         sample_rate=args.sample_rate,
         n_fft=args.n_fft,
@@ -268,6 +381,9 @@ def main() -> None:
         normalize_feature=args.normalize_feature,
         normalize_per_frame=args.normalize_per_frame,
     )
+    _WORKER_FEATURIZER = featurizer
+    _WORKER_SPECAUGMENT = specaugment
+    _WORKER_WAVEFORM_AUGMENT = waveform_augment
     split_cache_dir = Path(args.feature_cache_dir) / args.split
     selection_progress = tqdm(
         desc=f"Selecting {args.split} records",
@@ -308,6 +424,8 @@ def main() -> None:
         "normalize_feature": args.normalize_feature,
         "normalize_per_frame": args.normalize_per_frame,
     }
+    specaugment_kwargs = _specaugment_kwargs(args) if specaugment is not None else None
+    waveform_augment_kwargs = _waveform_augment_kwargs(args) if waveform_augment is not None else None
     num_workers = max(1, args.num_workers)
     split_cache_dir_str = str(split_cache_dir)
     try:
@@ -319,6 +437,7 @@ def main() -> None:
                     record=record,
                     split_cache_dir=split_cache_dir,
                     featurizer_kwargs=featurizer_kwargs,
+                    augmentation_config=augmentation_config,
                     overwrite=args.overwrite,
                 )
                 counters["processed"] += 1
@@ -332,12 +451,17 @@ def main() -> None:
             executor_kwargs = {"max_workers": num_workers}
             if args.parallelism == "process":
                 executor_kwargs["initializer"] = _initialize_process_worker
-                executor_kwargs["initargs"] = (featurizer_kwargs,)
+                executor_kwargs["initargs"] = (
+                    featurizer_kwargs,
+                    specaugment_kwargs,
+                    waveform_augment_kwargs,
+                )
             with executor_cls(**executor_kwargs) as executor:
                 submit_task = partial(
                     submit_extract_record_features,
                     split_cache_dir=split_cache_dir_str,
                     featurizer_kwargs=featurizer_kwargs,
+                    augmentation_config=augmentation_config,
                     overwrite=args.overwrite,
                 )
                 saw_record = False
@@ -369,6 +493,7 @@ def main() -> None:
         "max_samples": args.max_samples,
         "parallelism": args.parallelism,
         "num_workers": num_workers,
+        "augmentation_config": augmentation_config,
         "featurizer_config": featurizer.config_dict(),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
