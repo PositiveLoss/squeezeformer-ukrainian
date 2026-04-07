@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import os
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import torch
@@ -16,6 +17,8 @@ from squeezeformer_pytorch.data import (
     load_audio,
     prevalidate_records,
 )
+
+_WORKER_FEATURIZER: AudioFeaturizer | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,7 +54,16 @@ def parse_args() -> argparse.Namespace:
         "--num-workers",
         type=int,
         default=min(8, (os.cpu_count() or 1)),
-        help="Number of worker threads to use for audio loading and feature extraction.",
+        help="Number of worker threads or processes to use for audio loading and feature extraction.",
+    )
+    parser.add_argument(
+        "--parallelism",
+        default="process",
+        choices=["process", "thread"],
+        help=(
+            "Worker backend for feature extraction. Use 'process' for CPU-bound multi-core "
+            "servers, or 'thread' when process spawning is undesirable."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -144,12 +156,12 @@ def _selected_records(args: argparse.Namespace, dataset_sources: list[str | Path
 
 def extract_record_features(
     record,
-    split_cache_dir: Path,
+    split_cache_dir: str | Path,
     featurizer_kwargs: dict[str, object],
     overwrite: bool,
 ) -> str:
-    featurizer = AudioFeaturizer(**featurizer_kwargs)
-    cache_path = feature_cache_path(split_cache_dir, record.utterance_id, featurizer)
+    featurizer = _WORKER_FEATURIZER or AudioFeaturizer(**featurizer_kwargs)
+    cache_path = feature_cache_path(Path(split_cache_dir), record.utterance_id, featurizer)
     if cache_path is None:
         raise RuntimeError("feature cache path could not be resolved")
     if cache_path.exists() and not overwrite:
@@ -160,7 +172,24 @@ def extract_record_features(
     return "written"
 
 
-def iter_completed_futures(executor: ThreadPoolExecutor, records, num_workers: int, submit_task):
+def _initialize_process_worker(featurizer_kwargs: dict[str, object]) -> None:
+    global _WORKER_FEATURIZER
+    torch.set_num_threads(1)
+    if hasattr(torch, "set_num_interop_threads"):
+        torch.set_num_interop_threads(1)
+    _WORKER_FEATURIZER = AudioFeaturizer(**featurizer_kwargs)
+
+
+def submit_extract_record_features(
+    record,
+    split_cache_dir: str | Path,
+    featurizer_kwargs: dict[str, object],
+    overwrite: bool,
+) -> str:
+    return extract_record_features(record, split_cache_dir, featurizer_kwargs, overwrite)
+
+
+def iter_completed_futures(executor, records, num_workers: int, submit_task):
     record_iter = iter(records)
     pending = set()
     max_pending = max(num_workers * 2, 1)
@@ -234,6 +263,7 @@ def main() -> None:
         "normalize_per_frame": args.normalize_per_frame,
     }
     num_workers = max(1, args.num_workers)
+    split_cache_dir_str = str(split_cache_dir)
     try:
         if num_workers == 1:
             saw_record = False
@@ -252,16 +282,18 @@ def main() -> None:
             if not saw_record:
                 raise RuntimeError("No records were selected for feature extraction.")
         else:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-
-                def submit_task(record):
-                    return extract_record_features(
-                        record,
-                        split_cache_dir,
-                        featurizer_kwargs,
-                        args.overwrite,
-                    )
-
+            executor_cls = ProcessPoolExecutor if args.parallelism == "process" else ThreadPoolExecutor
+            executor_kwargs = {"max_workers": num_workers}
+            if args.parallelism == "process":
+                executor_kwargs["initializer"] = _initialize_process_worker
+                executor_kwargs["initargs"] = (featurizer_kwargs,)
+            with executor_cls(**executor_kwargs) as executor:
+                submit_task = partial(
+                    submit_extract_record_features,
+                    split_cache_dir=split_cache_dir_str,
+                    featurizer_kwargs=featurizer_kwargs,
+                    overwrite=args.overwrite,
+                )
                 saw_record = False
                 for future in iter_completed_futures(executor, records, num_workers, submit_task):
                     saw_record = True
@@ -284,6 +316,8 @@ def main() -> None:
         "cache_hits": counters["cache_hits"],
         "overwrite": args.overwrite,
         "max_samples": args.max_samples,
+        "parallelism": args.parallelism,
+        "num_workers": num_workers,
         "featurizer_config": featurizer.config_dict(),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
