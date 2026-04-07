@@ -1605,9 +1605,12 @@ def build_optimizer(
                 "Muon optimizer requires `torch.optim.Muon` or the `pytorch-optimizer` package. "
                 "Install the training dependencies with `pytorch-optimizer>=3.10.0`."
             )
+        muon_param_group: dict[str, object] = {"params": muon_params}
+        if muon_cls is ExternalMuon:
+            muon_param_group["use_muon"] = True
         optimizers.append(
             muon_cls(
-                muon_params,
+                [muon_param_group],
                 lr=muon_lr,
                 weight_decay=muon_weight_decay,
                 adjust_lr_fn="match_rms_adamw",
