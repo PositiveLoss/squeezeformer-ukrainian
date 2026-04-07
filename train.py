@@ -21,8 +21,6 @@ from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
-from urllib.parse import urlparse
-
 import torch
 import torch.distributed as dist
 import trackio
@@ -395,6 +393,199 @@ def _validate_device_argument(device: str) -> str:
     except (RuntimeError, ValueError) as error:
         raise argparse.ArgumentTypeError(f"Invalid device '{device}': {error}") from error
     return device
+
+
+def _is_explicit_local_path(value: str) -> bool:
+    return value.startswith(("/", "./", "../", "~"))
+
+
+def _validate_existing_local_path_argument(
+    argument_name: str,
+    raw_value: str,
+    *,
+    expected: str = "any",
+) -> None:
+    path = Path(raw_value).expanduser()
+    if path.exists():
+        if expected == "file" and not path.is_file():
+            raise ValueError(f"{argument_name} must point to a file, got '{raw_value}'.")
+        if expected == "dir" and not path.is_dir():
+            raise ValueError(f"{argument_name} must point to a directory, got '{raw_value}'.")
+        return
+    if _is_explicit_local_path(raw_value):
+        raise ValueError(f"{argument_name} points to a missing local path: '{raw_value}'.")
+
+
+def _validate_creatable_directory(argument_name: str, raw_value: str | None) -> None:
+    if raw_value is None:
+        return
+    path = Path(raw_value).expanduser()
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"{argument_name} must be a directory path, got '{raw_value}'.")
+    probe = path if path.exists() else path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if not probe.exists():
+        raise ValueError(f"{argument_name} has no existing parent directory: '{raw_value}'.")
+    if not probe.is_dir():
+        raise ValueError(f"{argument_name} parent is not a directory: '{probe}'.")
+    if not os.access(probe, os.W_OK):
+        raise ValueError(f"{argument_name} is not writable via parent directory '{probe}'.")
+
+
+def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None:
+    if (args.adaptive_batch_unit is None) != (args.adaptive_batch_budget is None):
+        raise ValueError("--adaptive-batch-unit and --adaptive-batch-budget must be set together.")
+    if args.distributed and world_size <= 1:
+        raise ValueError("--distributed expects a torchrun-style environment with WORLD_SIZE > 1.")
+    if world_size > 1 and args.compile:
+        raise ValueError("--compile is not currently supported together with distributed training.")
+
+    requested_device = resolve_device(args.device)
+    _validate_device_ready(requested_device)
+
+    positive_int_arguments = {
+        "--batch-size": args.batch_size,
+        "--epochs": args.epochs,
+        "--gradient-accumulation-steps": args.gradient_accumulation_steps,
+        "--metadata-workers": args.metadata_workers,
+        "--prevalidate-workers": args.prevalidate_workers,
+        "--log-every": args.log_every,
+        "--keep-top-k": args.keep_top_k,
+        "--beam-size": args.beam_size,
+        "--spm-vocab-size": args.spm_vocab_size,
+        "--warmup-epochs": args.warmup_epochs,
+        "--hold-epochs": args.hold_epochs,
+        "--blank-prune-min-keep-frames": args.blank_prune_min_keep_frames,
+        "--aed-decoder-layers": args.aed_decoder_layers,
+        "--aed-decoder-heads": args.aed_decoder_heads,
+        "--liberta-max-length": args.liberta_max_length,
+        "--fp8-amax-history-len": args.fp8_amax_history_len,
+        "--example-limit": args.example_limit,
+        "--n-fft": args.n_fft,
+        "--hop-length": args.hop_length,
+        "--n-mels": args.n_mels,
+        "--num-freq-masks": args.num_freq_masks,
+        "--freq-mask-param": args.freq_mask_param,
+    }
+    if args.prefetch_factor is not None and args.num_workers > 0:
+        positive_int_arguments["--prefetch-factor"] = args.prefetch_factor
+    if args.num_time_masks is not None:
+        positive_int_arguments["--num-time-masks"] = args.num_time_masks
+    if args.max_train_samples is not None:
+        positive_int_arguments["--max-train-samples"] = args.max_train_samples
+    if args.max_val_samples is not None:
+        positive_int_arguments["--max-val-samples"] = args.max_val_samples
+    if args.max_batch_frames is not None:
+        positive_int_arguments["--max-batch-frames"] = args.max_batch_frames
+    if args.adaptive_batch_budget is not None:
+        positive_int_arguments["--adaptive-batch-budget"] = args.adaptive_batch_budget
+    for name, value in positive_int_arguments.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0, got {value}.")
+
+    nonnegative_int_arguments = {
+        "--num-workers": args.num_workers,
+        "--seed": args.seed,
+        "--intermediate-ctc-layer": args.intermediate_ctc_layer,
+        "--blank-prune-layer": args.blank_prune_layer,
+        "--ema-warmup-steps": args.ema_warmup_steps,
+    }
+    for name, value in nonnegative_int_arguments.items():
+        if value is not None and value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}.")
+
+    nonnegative_float_arguments = {
+        "--weight-decay": args.weight_decay,
+        "--grad-clip-norm": args.grad_clip_norm,
+        "--muon-weight-decay": args.muon_weight_decay,
+        "--adamw-weight-decay": args.adamw_weight_decay,
+        "--learning-rate": args.learning_rate,
+        "--muon-learning-rate": args.muon_learning_rate,
+        "--adamw-learning-rate": args.adamw_learning_rate,
+        "--preemphasis": args.preemphasis,
+        "--lm-weight": args.lm_weight,
+    }
+    for name, value in nonnegative_float_arguments.items():
+        if value is not None and value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}.")
+
+    probability_arguments = {
+        "--val-fraction": args.val_fraction,
+        "--test-fraction": args.test_fraction,
+        "--max-symbol-ratio": args.max_symbol_ratio,
+        "--speed-perturb-prob": args.speed_perturb_prob,
+        "--noise-prob": args.noise_prob,
+        "--reverb-prob": args.reverb_prob,
+        "--time-mask-max-ratio": args.time_mask_max_ratio,
+        "--intermediate-ctc-weight": args.intermediate_ctc_weight,
+        "--aed-decoder-dropout": args.aed_decoder_dropout,
+        "--aed-loss-weight": args.aed_loss_weight,
+        "--liberta-distill-weight": args.liberta_distill_weight,
+        "--blank-prune-threshold": args.blank_prune_threshold,
+        "--ema-decay": args.ema_decay,
+    }
+    for name, value in probability_arguments.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be within [0, 1], got {value}.")
+    if args.val_fraction + args.test_fraction >= 1.0:
+        raise ValueError("--val-fraction + --test-fraction must be < 1.")
+
+    if args.min_transcript_chars < 1:
+        raise ValueError(f"--min-transcript-chars must be >= 1, got {args.min_transcript_chars}.")
+    if args.max_transcript_chars < args.min_transcript_chars:
+        raise ValueError(
+            "--max-transcript-chars must be >= --min-transcript-chars, got "
+            f"{args.max_transcript_chars} < {args.min_transcript_chars}."
+        )
+    if args.min_audio_duration_sec <= 0:
+        raise ValueError(
+            f"--min-audio-duration-sec must be > 0, got {args.min_audio_duration_sec}."
+        )
+    if args.max_audio_duration_sec < args.min_audio_duration_sec:
+        raise ValueError(
+            "--max-audio-duration-sec must be >= --min-audio-duration-sec, got "
+            f"{args.max_audio_duration_sec} < {args.min_audio_duration_sec}."
+        )
+    if args.noise_snr_db_max < args.noise_snr_db_min:
+        raise ValueError(
+            "--noise-snr-db-max must be >= --noise-snr-db-min, got "
+            f"{args.noise_snr_db_max} < {args.noise_snr_db_min}."
+        )
+    if args.reverb_decay_max < args.reverb_decay_min:
+        raise ValueError(
+            "--reverb-decay-max must be >= --reverb-decay-min, got "
+            f"{args.reverb_decay_max} < {args.reverb_decay_min}."
+        )
+    if args.reverb_delay_ms_max < args.reverb_delay_ms_min:
+        raise ValueError(
+            "--reverb-delay-ms-max must be >= --reverb-delay-ms-min, got "
+            f"{args.reverb_delay_ms_max} < {args.reverb_delay_ms_min}."
+        )
+
+    speed_factors = _resolve_float_tuple(args.speed_factors)
+    if any(value <= 0 for value in speed_factors):
+        raise ValueError(
+            f"--speed-factors must contain only positive values, got {args.speed_factors}."
+        )
+    _resolve_block_pattern(args.block_pattern)
+
+    _validate_creatable_directory("--output-dir", args.output_dir)
+    _validate_creatable_directory("--feature-cache-dir", args.feature_cache_dir)
+    _validate_creatable_directory("--record-cache-dir", args.record_cache_dir)
+    if args.resume is not None:
+        _validate_existing_local_path_argument("--resume", args.resume, expected="file")
+    if args.tokenizer_path is not None:
+        _validate_existing_local_path_argument(
+            "--tokenizer-path",
+            args.tokenizer_path,
+            expected="file",
+        )
+
+    for source in args.dataset_source or []:
+        _validate_existing_local_path_argument("--dataset-source", source)
+    for source in args.validation_dataset_source or []:
+        _validate_existing_local_path_argument("--validation-dataset-source", source)
 
 
 def _resolve_dataset_roots(args: argparse.Namespace) -> list[Path]:
@@ -2461,23 +2652,17 @@ def _build_checkpoint(
 def main() -> None:
     args = parse_args()
     process_start_time = time.perf_counter()
-    if (args.adaptive_batch_unit is None) != (args.adaptive_batch_budget is None):
-        raise ValueError("--adaptive-batch-unit and --adaptive-batch-budget must be set together.")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    _validate_startup_args(args, world_size=world_size)
     distributed = world_size > 1
-    if args.distributed and not distributed:
-        raise ValueError("--distributed expects a torchrun-style environment with WORLD_SIZE > 1.")
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     requested_device = resolve_device(args.device)
-    _validate_device_ready(requested_device)
     is_main_process = rank == 0
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
         if not dist.is_initialized():
             dist.init_process_group(backend=backend)
-    if distributed and args.compile:
-        raise ValueError("--compile is not currently supported together with distributed training.")
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir)
     if is_main_process:
