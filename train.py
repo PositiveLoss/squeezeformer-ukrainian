@@ -85,6 +85,11 @@ except ImportError:
     AutoModel = None
     AutoTokenizer = None
 
+try:
+    from pytorch_optimizer import Muon as ExternalMuon
+except ImportError:
+    ExternalMuon = None
+
 
 def _checkpoint_name(epoch: int, val_wer: float) -> str:
     return f"checkpoint_epoch={epoch:04d}_valwer={val_wer:.6f}.pt"
@@ -1387,8 +1392,14 @@ def build_optimizer(
     optimizers: list[torch.optim.Optimizer] = []
     optimizer_names: list[str] = []
     if muon_params:
+        muon_cls = getattr(torch.optim, "Muon", None) or ExternalMuon
+        if muon_cls is None:
+            raise RuntimeError(
+                "Muon optimizer requires `torch.optim.Muon` or the `pytorch-optimizer` package. "
+                "Install the training dependencies with `pytorch-optimizer>=3.10.0`."
+            )
         optimizers.append(
-            torch.optim.Muon(
+            muon_cls(
                 muon_params,
                 lr=muon_lr,
                 weight_decay=muon_weight_decay,

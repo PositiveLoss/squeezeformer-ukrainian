@@ -3,8 +3,8 @@ import json
 import logging
 import math
 import sys
-from io import BytesIO
 from dataclasses import asdict
+from io import BytesIO
 from pathlib import Path
 
 import polars as pl
@@ -1514,7 +1514,32 @@ def test_create_dataloader_uses_fork_context_on_linux(monkeypatch: pytest.Monkey
         assert "multiprocessing_context" not in kwargs
 
 
-def test_muon_optimizer_partition_uses_encoder_hidden_weights() -> None:
+def test_muon_optimizer_partition_uses_encoder_hidden_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeMuon(torch.optim.Optimizer):
+        def __init__(
+            self,
+            params: object,
+            lr: float,
+            weight_decay: float,
+            adjust_lr_fn: str,
+        ) -> None:
+            defaults = {
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "adjust_lr_fn": adjust_lr_fn,
+            }
+            super().__init__(params, defaults)
+
+        def step(self, closure=None):  # type: ignore[no-untyped-def]
+            return None
+
+    import train
+
+    monkeypatch.setattr(train, "ExternalMuon", FakeMuon)
+    monkeypatch.setattr(train.torch.optim, "Muon", None, raising=False)
+
     config = squeezeformer_variant("xs")
     model = SqueezeformerCTC(encoder_config=config, vocab_size=32)
     optimizers, optimizer_names = build_optimizer(
@@ -1525,6 +1550,7 @@ def test_muon_optimizer_partition_uses_encoder_hidden_weights() -> None:
         muon_weight_decay=1e-4,
         adamw_weight_decay=5e-5,
     )
+
     assert optimizer_names == ["muon", "adamw_aux"]
     muon_params = optimizers[0].param_groups[0]["params"]
     adamw_params = optimizers[1].param_groups[0]["params"] + optimizers[1].param_groups[1]["params"]
