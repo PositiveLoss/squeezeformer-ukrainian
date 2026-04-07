@@ -826,8 +826,18 @@ def feature_cache_path(
         return None
     feature_cache_path = Path(feature_cache_dir)
     feature_cache_path.mkdir(parents=True, exist_ok=True)
+    safe_utterance_id = "".join(
+        char if char.isalnum() or char in {"-", "_", "."} else "_"
+        for char in utterance_id
+    ).strip("._")
+    if not safe_utterance_id:
+        safe_utterance_id = hashlib.sha256(utterance_id.encode("utf-8")).hexdigest()[:16]
+    elif safe_utterance_id != utterance_id:
+        safe_utterance_id = (
+            f"{safe_utterance_id[:96]}_{hashlib.sha256(utterance_id.encode('utf-8')).hexdigest()[:8]}"
+        )
     frontend_hash = hashlib.sha256(repr(featurizer.config_dict()).encode("utf-8")).hexdigest()[:12]
-    return feature_cache_path / f"{utterance_id}_{frontend_hash}.pt"
+    return feature_cache_path / f"{safe_utterance_id}_{frontend_hash}.pt"
 
 
 class CV22ASRDataset(Dataset[dict[str, Any]]):
