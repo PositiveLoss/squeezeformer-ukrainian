@@ -37,6 +37,18 @@ def parse_args() -> argparse.Namespace:
             "If omitted, --dataset-repo is used."
         ),
     )
+    parser.add_argument(
+        "--validation-dataset-source",
+        action="append",
+        default=None,
+        help=(
+            "Validation-only dataset source. Repeat to combine multiple sources. Each source may "
+            "be a Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. When "
+            "provided, validation extraction uses the full set of records from these sources, "
+            "matching train.py behavior."
+        ),
+    )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
@@ -130,7 +142,14 @@ def _resolve_sources(
     return resolved_sources
 
 
-def _selected_records(args: argparse.Namespace, dataset_sources: list[str | Path]):
+def _selected_records(
+    args: argparse.Namespace,
+    dataset_sources: list[str | Path],
+    *,
+    split: str,
+    val_fraction: float,
+    test_fraction: float,
+):
     selected = 0
     for dataset_source in dataset_sources:
         remaining_samples = None
@@ -140,10 +159,10 @@ def _selected_records(args: argparse.Namespace, dataset_sources: list[str | Path
                 break
         for record in iter_cv22_records_from_source(
             dataset_source,
-            split=args.split,
+            split=split,
             seed=args.seed,
-            val_fraction=args.val_fraction,
-            test_fraction=args.test_fraction,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
             max_samples=remaining_samples,
             min_transcript_chars=args.min_transcript_chars,
             max_transcript_chars=args.max_transcript_chars,
@@ -152,6 +171,23 @@ def _selected_records(args: argparse.Namespace, dataset_sources: list[str | Path
         ):
             selected += 1
             yield record
+
+
+def _resolve_validation_dataset_sources(args: argparse.Namespace) -> list[str | Path]:
+    return _resolve_sources(args.validation_dataset_source)
+
+
+def _resolve_extraction_sources(
+    args: argparse.Namespace,
+    dataset_sources: list[str | Path],
+    validation_dataset_sources: list[str | Path],
+) -> tuple[list[str | Path], str, float, float]:
+    explicit_train_sources = bool(args.dataset_source)
+    if args.split == "train" and explicit_train_sources:
+        return dataset_sources, "train", 0.0, 0.0
+    if args.split == "validation" and validation_dataset_sources:
+        return validation_dataset_sources, "train", 0.0, 0.0
+    return dataset_sources, args.split, args.val_fraction, args.test_fraction
 
 
 def extract_record_features(
@@ -217,6 +253,10 @@ def main() -> None:
     if hasattr(torch, "set_num_interop_threads"):
         torch.set_num_interop_threads(1)
     dataset_sources = _resolve_sources(args.dataset_source, fallback=args.dataset_repo)
+    validation_dataset_sources = _resolve_validation_dataset_sources(args)
+    selected_sources, selected_split, selected_val_fraction, selected_test_fraction = (
+        _resolve_extraction_sources(args, dataset_sources, validation_dataset_sources)
+    )
     featurizer = AudioFeaturizer(
         sample_rate=args.sample_rate,
         n_fft=args.n_fft,
@@ -237,7 +277,13 @@ def main() -> None:
 
     def selected_records():
         try:
-            for record in _selected_records(args, dataset_sources):
+            for record in _selected_records(
+                args,
+                selected_sources,
+                split=selected_split,
+                val_fraction=selected_val_fraction,
+                test_fraction=selected_test_fraction,
+            ):
                 selection_progress.update()
                 yield record
         finally:
@@ -309,7 +355,12 @@ def main() -> None:
 
     summary = {
         "dataset_sources": [str(source) for source in dataset_sources],
+        "validation_dataset_sources": [str(source) for source in validation_dataset_sources],
+        "selected_sources": [str(source) for source in selected_sources],
         "split": args.split,
+        "selection_split": selected_split,
+        "selection_val_fraction": selected_val_fraction,
+        "selection_test_fraction": selected_test_fraction,
         "feature_cache_dir": str(split_cache_dir),
         "processed": counters["processed"],
         "written": counters["written"],
