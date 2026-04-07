@@ -11,9 +11,8 @@ from tqdm.auto import tqdm
 
 from squeezeformer_pytorch.data import (
     AudioFeaturizer,
-    download_cv22_dataset,
     feature_cache_path,
-    iter_cv22_records,
+    iter_cv22_records_from_source,
     load_audio,
     prevalidate_records,
 )
@@ -24,6 +23,17 @@ def parse_args() -> argparse.Namespace:
         description="Extract and cache log-mel features for a dataset split without training."
     )
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
+    parser.add_argument(
+        "--dataset-source",
+        action="append",
+        default=None,
+        help=(
+            "Dataset source to load. Repeat to combine multiple sources. Each source may be a "
+            "Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. "
+            "If omitted, --dataset-repo is used."
+        ),
+    )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
@@ -86,6 +96,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_sources(
+    raw_sources: list[str] | None, *, fallback: str | None = None
+) -> list[str | Path]:
+    sources = list(raw_sources or [])
+    if not sources:
+        if fallback is None:
+            return []
+        sources = [fallback]
+
+    resolved_sources: list[str | Path] = []
+    seen: set[str] = set()
+    for source in sources:
+        source_path = Path(source).expanduser()
+        resolved_source: str | Path = source_path.resolve() if source_path.exists() else source
+        dedupe_key = str(resolved_source)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        resolved_sources.append(resolved_source)
+    return resolved_sources
+
+
+def _selected_records(args: argparse.Namespace, dataset_sources: list[str | Path]):
+    selected = 0
+    for dataset_source in dataset_sources:
+        remaining_samples = None
+        if args.max_samples is not None:
+            remaining_samples = args.max_samples - selected
+            if remaining_samples <= 0:
+                break
+        for record in iter_cv22_records_from_source(
+            dataset_source,
+            split=args.split,
+            seed=args.seed,
+            val_fraction=args.val_fraction,
+            test_fraction=args.test_fraction,
+            max_samples=remaining_samples,
+            min_transcript_chars=args.min_transcript_chars,
+            max_transcript_chars=args.max_transcript_chars,
+            max_symbol_ratio=args.max_symbol_ratio,
+            hf_token=args.hf_token,
+        ):
+            selected += 1
+            yield record
+
+
 def extract_record_features(
     record,
     split_cache_dir: Path,
@@ -131,11 +187,7 @@ def main() -> None:
     torch.set_num_threads(1)
     if hasattr(torch, "set_num_interop_threads"):
         torch.set_num_interop_threads(1)
-    dataset_root = download_cv22_dataset(
-        repo_id=args.dataset_repo,
-        token=args.hf_token,
-        cache_dir=args.cache_dir,
-    )
+    dataset_sources = _resolve_sources(args.dataset_source, fallback=args.dataset_repo)
     featurizer = AudioFeaturizer(
         sample_rate=args.sample_rate,
         n_fft=args.n_fft,
@@ -156,17 +208,7 @@ def main() -> None:
 
     def selected_records():
         try:
-            for record in iter_cv22_records(
-                dataset_root=dataset_root,
-                split=args.split,
-                seed=args.seed,
-                val_fraction=args.val_fraction,
-                test_fraction=args.test_fraction,
-                max_samples=args.max_samples,
-                min_transcript_chars=args.min_transcript_chars,
-                max_transcript_chars=args.max_transcript_chars,
-                max_symbol_ratio=args.max_symbol_ratio,
-            ):
+            for record in _selected_records(args, dataset_sources):
                 selection_progress.update()
                 yield record
         finally:
@@ -234,7 +276,7 @@ def main() -> None:
         progress.close()
 
     summary = {
-        "dataset_root": str(dataset_root),
+        "dataset_sources": [str(source) for source in dataset_sources],
         "split": args.split,
         "feature_cache_dir": str(split_cache_dir),
         "processed": counters["processed"],
