@@ -319,6 +319,44 @@ def _format_memory_snapshot(device: torch.device) -> str:
     return " ".join(memory_parts) if memory_parts else "memory=unavailable"
 
 
+def _log_batch_autotune_snapshot(
+    logger: logging.Logger,
+    *,
+    epoch: int,
+    global_step: int,
+    batch_index: int,
+    total_batches: int,
+    optimizer_step_index: int,
+    effective_frames: int,
+    padded_frames: int,
+    target_tokens: int,
+    device: torch.device,
+) -> None:
+    padding_waste = max(0, padded_frames - effective_frames)
+    padding_waste_ratio = (padding_waste / padded_frames) if padded_frames > 0 else 0.0
+    parts = [
+        f"memory_tune epoch={epoch}",
+        f"optimizer_step={optimizer_step_index}",
+        f"batch={batch_index}/{total_batches}",
+        f"global_step={global_step}",
+        f"effective_frames={effective_frames}",
+        f"padded_frames={padded_frames}",
+        f"padding_waste_frames={padding_waste}",
+        f"padding_waste_ratio={padding_waste_ratio:.3f}",
+        f"target_tokens={target_tokens}",
+    ]
+    if device.type == "cuda" and torch.cuda.is_available():
+        parts.extend(
+            (
+                f"cuda_allocated={_format_bytes(torch.cuda.memory_allocated(device))}",
+                f"cuda_reserved={_format_bytes(torch.cuda.memory_reserved(device))}",
+                f"cuda_peak_allocated={_format_bytes(torch.cuda.max_memory_allocated(device))}",
+                f"cuda_peak_reserved={_format_bytes(torch.cuda.max_memory_reserved(device))}",
+            )
+        )
+    logger.info(" ".join(parts))
+
+
 def _validate_resume_checkpoint_payload(
     checkpoint: dict[str, object],
     *,
@@ -2183,6 +2221,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trackio-space-id", default=None)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument(
+        "--memory-tune-steps",
+        type=int,
+        default=0,
+        help=(
+            "For the first N optimizer steps, log effective/padded batch frames and per-step "
+            "peak CUDA memory to help tune adaptive_batch/max_batch_frames."
+        ),
+    )
+    parser.add_argument(
         "--validate-every-steps",
         type=int,
         default=0,
@@ -3427,13 +3474,31 @@ def main() -> None:
         running_intermediate_ctc_loss = 0.0
         running_aed_loss = 0.0
         running_liberta_distill_loss = 0.0
+        tune_effective_frames = 0
+        tune_padded_frames = 0
+        tune_target_tokens = 0
         for optimizer in optimizers:
             optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(train_loader, start=1):
+            if (batch_index - 1) % args.gradient_accumulation_steps == 0:
+                tune_effective_frames = 0
+                tune_padded_frames = 0
+                tune_target_tokens = 0
+                if (
+                    is_main_process
+                    and args.memory_tune_steps > 0
+                    and device.type == "cuda"
+                    and torch.cuda.is_available()
+                    and global_step < args.memory_tune_steps
+                ):
+                    torch.cuda.reset_peak_memory_stats(device)
             features = batch["features"].to(device)
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
             target_lengths = batch["target_lengths"].to(device)
+            tune_effective_frames += int(feature_lengths.sum().item())
+            tune_padded_frames += int(features.size(0) * features.size(1))
+            tune_target_tokens += int(target_lengths.sum().item())
             if is_main_process and batch_index == 1:
                 logger.info(
                     "epoch=%s first_train_batch_ready elapsed=%s batch_size=%s max_feature_frames=%s target_tokens=%s",
@@ -3559,6 +3624,24 @@ def main() -> None:
                 global_step += 1
                 if ema is not None:
                     ema.update(model)
+
+                if (
+                    is_main_process
+                    and args.memory_tune_steps > 0
+                    and global_step <= args.memory_tune_steps
+                ):
+                    _log_batch_autotune_snapshot(
+                        logger,
+                        epoch=epoch,
+                        global_step=global_step,
+                        batch_index=batch_index,
+                        total_batches=len(train_loader),
+                        optimizer_step_index=global_step,
+                        effective_frames=tune_effective_frames,
+                        padded_frames=tune_padded_frames,
+                        target_tokens=tune_target_tokens,
+                        device=device,
+                    )
 
                 if is_main_process and global_step % args.log_every == 0:
                     learning_rates = {
