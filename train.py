@@ -950,6 +950,21 @@ def _build_disk_backed_record_store(
     )
 
 
+def _open_disk_backed_record_store(records_path: Path) -> DiskBackedRecordStore:
+    offsets_path = _record_index_path(records_path, ".offsets.u64")
+    estimated_frames_path = _record_index_path(records_path, ".estimated_frames.u32")
+    return DiskBackedRecordStore(
+        records_path,
+        _BinaryIndexView(offsets_path, item_size=8, fmt="<Q"),
+        _BinaryIndexView(
+            estimated_frames_path,
+            item_size=4,
+            fmt="<I",
+            writable=True,
+        ),
+    )
+
+
 def _load_cached_audio_bytes(payload: dict[str, object], *, records_path: Path) -> bytes | None:
     audio_blob_path = payload.get("audio_blob_path")
     if isinstance(audio_blob_path, str) and audio_blob_path:
@@ -1140,6 +1155,8 @@ def _load_train_val_records(
     *,
     lowercase_transcripts: bool,
     output_dir: Path,
+    distributed: bool = False,
+    is_main_process: bool = True,
 ) -> tuple[list[CVRecord] | DiskBackedRecordStore, list[CVRecord] | DiskBackedRecordStore]:
     validation_dataset_sources = validation_dataset_sources or []
     use_external_validation = bool(validation_dataset_sources)
@@ -1168,24 +1185,35 @@ def _load_train_val_records(
             if args.record_cache_dir is not None
             else output_dir / "record_cache"
         )
-        train_records = _build_disk_backed_record_store(
-            train_dataset_sources,
-            split="train",
-            val_fraction=train_val_fraction,
-            test_fraction=train_test_fraction,
-            max_samples=args.max_train_samples,
-            records_path=record_store_dir / "train.jsonl",
-            **common_record_store_kwargs,
-        )
-        val_records = _build_disk_backed_record_store(
-            validation_dataset_sources or train_dataset_sources,
-            split=validation_split,
-            val_fraction=validation_val_fraction,
-            test_fraction=validation_test_fraction,
-            max_samples=args.max_val_samples,
-            records_path=record_store_dir / "validation.jsonl",
-            **common_record_store_kwargs,
-        )
+        train_records_path = record_store_dir / "train.jsonl"
+        val_records_path = record_store_dir / "validation.jsonl"
+        if distributed and not is_main_process:
+            if not dist.is_initialized():
+                raise RuntimeError("Distributed record cache loading requires initialized process group.")
+            dist.barrier()
+            train_records = _open_disk_backed_record_store(train_records_path)
+            val_records = _open_disk_backed_record_store(val_records_path)
+        else:
+            train_records = _build_disk_backed_record_store(
+                train_dataset_sources,
+                split="train",
+                val_fraction=train_val_fraction,
+                test_fraction=train_test_fraction,
+                max_samples=args.max_train_samples,
+                records_path=train_records_path,
+                **common_record_store_kwargs,
+            )
+            val_records = _build_disk_backed_record_store(
+                validation_dataset_sources or train_dataset_sources,
+                split=validation_split,
+                val_fraction=validation_val_fraction,
+                test_fraction=validation_test_fraction,
+                max_samples=args.max_val_samples,
+                records_path=val_records_path,
+                **common_record_store_kwargs,
+            )
+            if distributed and dist.is_initialized():
+                dist.barrier()
         if args.prevalidate_audio:
             raise ValueError(
                 "--prevalidate-audio is not supported with the disk-backed training record store. "
@@ -2766,6 +2794,8 @@ def main() -> None:
         validation_dataset_sources,
         lowercase_transcripts=lowercase_transcripts,
         output_dir=output_dir,
+        distributed=distributed,
+        is_main_process=is_main_process,
     )
     _ensure_opus_decode_support(train_records, split="train")
     _ensure_opus_decode_support(val_records, split="validation")
