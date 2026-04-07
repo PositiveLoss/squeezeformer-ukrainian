@@ -90,8 +90,8 @@ except ImportError:
     ExternalMuon = None
 
 
-def _checkpoint_name(epoch: int, val_wer: float) -> str:
-    return f"checkpoint_epoch={epoch:04d}_valwer={val_wer:.6f}.pt"
+def _checkpoint_name(epoch: int, global_step: int, val_wer: float) -> str:
+    return f"checkpoint_epoch={epoch:04d}_step={global_step:08d}_valwer={val_wer:.6f}.pt"
 
 
 def _safetensors_path(checkpoint_path: Path) -> Path:
@@ -486,6 +486,8 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
         positive_int_arguments["--max-batch-frames"] = args.max_batch_frames
     if args.adaptive_batch_budget is not None:
         positive_int_arguments["--adaptive-batch-budget"] = args.adaptive_batch_budget
+    if args.validate_every_steps is not None and args.validate_every_steps > 0:
+        positive_int_arguments["--validate-every-steps"] = args.validate_every_steps
     for name, value in positive_int_arguments.items():
         if value <= 0:
             raise ValueError(f"{name} must be > 0, got {value}.")
@@ -1866,6 +1868,7 @@ def _update_top_checkpoints(
     output_dir: Path,
     checkpoint: dict[str, object],
     epoch: int,
+    global_step: int,
     val_wer: float,
     keep_top_k: int,
 ) -> None:
@@ -1905,18 +1908,25 @@ def _update_top_checkpoints(
         )
     metadata = compatible_metadata
 
-    filename = _checkpoint_name(epoch=epoch, val_wer=val_wer)
+    filename = _checkpoint_name(epoch=epoch, global_step=global_step, val_wer=val_wer)
     checkpoint_path = topk_dir / filename
     save_checkpoint(checkpoint, checkpoint_path)
 
     metadata.append(
         {
             "epoch": epoch,
+            "global_step": global_step,
             "val_wer": val_wer,
             "path": str(checkpoint_path.name),
         }
     )
-    metadata.sort(key=lambda item: (float(item["val_wer"]), int(item["epoch"])))
+    metadata.sort(
+        key=lambda item: (
+            float(item["val_wer"]),
+            int(item.get("global_step", 0)),
+            int(item["epoch"]),
+        )
+    )
 
     removed = metadata[keep_top_k:]
     metadata = metadata[:keep_top_k]
@@ -2172,6 +2182,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument(
+        "--validate-every-steps",
+        type=int,
+        default=0,
+        help=(
+            "Run validation and write step-based checkpoints every N optimizer steps. "
+            "Set to 0 to validate only at epoch end."
+        ),
+    )
     parser.add_argument("--keep-top-k", type=int, default=5)
     parser.add_argument(
         "--tokenizer",
@@ -2684,6 +2703,172 @@ def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, 
         payload[f"{prefix}_example_{index}_ref"] = example["reference"]
         payload[f"{prefix}_example_{index}_hyp"] = example["hypothesis"]
     return payload
+
+
+def _evaluate_and_checkpoint(
+    *,
+    model: SqueezeformerCTC,
+    val_loader,
+    criterion: nn.CTCLoss,
+    tokenizer: Tokenizer,
+    device: torch.device,
+    dtype: DTypeChoice,
+    fp8_recipe,
+    decode_strategy: DecodeStrategy,
+    beam_size: int,
+    lm_scorer,
+    lm_weight: float,
+    example_limit: int,
+    intermediate_ctc_weight: float,
+    aed_loss_weight: float,
+    liberta_teacher: FrozenLibertaTeacher | None,
+    liberta_distill_weight: float,
+    ema: ExponentialMovingAverage | None,
+    train_metrics: dict[str, float],
+    epoch: int,
+    global_step: int,
+    output_dir: Path,
+    encoder_config: SqueezeformerConfig,
+    featurizer: AudioFeaturizer,
+    optimizers: list[torch.optim.Optimizer],
+    optimizer_names: list[str],
+    schedulers: list[torch.optim.lr_scheduler.LRScheduler],
+    scaler: torch.amp.GradScaler,
+    args: argparse.Namespace,
+    best_val_wer: float,
+    split_audit: dict[str, object],
+    logger: logging.Logger,
+    save_last_checkpoint: bool,
+    report_stem: str,
+) -> float:
+    ema_backup = ema.apply_to(model) if ema is not None else None
+    validation = evaluate(
+        model,
+        val_loader,
+        criterion,
+        tokenizer,
+        device,
+        dtype,
+        fp8_recipe=fp8_recipe,
+        decode_strategy=decode_strategy,
+        beam_size=beam_size,
+        lm_scorer=lm_scorer,
+        lm_weight=lm_weight,
+        example_limit=example_limit,
+        intermediate_ctc_weight=intermediate_ctc_weight,
+        aed_loss_weight=aed_loss_weight,
+        liberta_teacher=liberta_teacher,
+        liberta_distill_weight=liberta_distill_weight,
+    )
+    if ema_backup is not None:
+        ExponentialMovingAverage.restore(model, ema_backup)
+
+    val_metrics = validation["metrics"]
+    log_payload = {
+        "epoch": epoch,
+        "global_step": global_step,
+        **train_metrics,
+        "val_loss": val_metrics["loss"],
+        "val_cer": val_metrics["cer"],
+        "val_wer": val_metrics["wer"],
+    }
+    for key, value in val_metrics.items():
+        if key not in {"loss", "cer", "wer"}:
+            log_payload[f"val_{key}"] = value
+    log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
+    log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
+    trackio.log(log_payload)
+
+    report = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "metrics": val_metrics,
+        "hardest_examples": validation["hardest_examples"],
+        "random_examples": validation["random_examples"],
+        "speaker_metrics": validation["speaker_metrics"],
+        "split_audit": split_audit,
+    }
+    reports_dir = output_dir / "eval_reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / f"{report_stem}.json"
+    report_path.write_text(
+        json.dumps(report, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    updated_best_val_wer = min(best_val_wer, float(val_metrics["wer"]))
+    checkpoint = _build_checkpoint(
+        model=model,
+        encoder_config=encoder_config,
+        tokenizer=tokenizer,
+        featurizer=featurizer,
+        epoch=epoch,
+        global_step=global_step,
+        best_val_wer=updated_best_val_wer,
+        metrics=log_payload,
+        optimizers=optimizers,
+        optimizer_names=optimizer_names,
+        schedulers=schedulers,
+        scaler=scaler,
+        ema=ema,
+        args=args,
+    )
+
+    if save_last_checkpoint:
+        latest_path = output_dir / "checkpoint_last.pt"
+    else:
+        latest_path = output_dir / "checkpoint_step_last.pt"
+    save_checkpoint(checkpoint, latest_path)
+    latest_safetensors_path = _export_inference_checkpoint(checkpoint, latest_path)
+
+    if float(val_metrics["wer"]) < best_val_wer:
+        updated_best_val_wer = float(val_metrics["wer"])
+        best_path = output_dir / "checkpoint_best.pt"
+        save_checkpoint(checkpoint, best_path)
+        best_safetensors_path = _export_inference_checkpoint(checkpoint, best_path)
+    else:
+        best_safetensors_path = _safetensors_path(output_dir / "checkpoint_best.pt")
+
+    _update_top_checkpoints(
+        output_dir=output_dir,
+        checkpoint=checkpoint,
+        epoch=epoch,
+        global_step=global_step,
+        val_wer=float(val_metrics["wer"]),
+        keep_top_k=args.keep_top_k,
+    )
+    averaged_path = _average_topk_checkpoints(output_dir)
+    logger.info(
+        (
+            "%s complete train_loss=%.4f val_loss=%.4f "
+            "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
+            "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
+            "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
+            "best_val_wer=%.4f report=%s latest=%s best=%s averaged=%s"
+        ),
+        report_stem,
+        float(train_metrics["train_loss"]),
+        float(val_metrics["loss"]),
+        float(val_metrics["main_ctc_loss"]),
+        float(val_metrics["intermediate_ctc_loss"]),
+        float(val_metrics["combined_ctc_loss"]),
+        float(val_metrics["aed_loss"]),
+        float(val_metrics["liberta_distill_loss"]),
+        float(val_metrics["cer"]),
+        float(val_metrics["wer"]),
+        updated_best_val_wer,
+        report_path,
+        latest_path,
+        output_dir / "checkpoint_best.pt",
+        averaged_path if averaged_path is not None else "n/a",
+    )
+    logger.info(
+        "exported inference artifacts latest_safe=%s best_safe=%s averaged_safe=%s",
+        latest_safetensors_path,
+        best_safetensors_path if best_safetensors_path.exists() else "n/a",
+        _safetensors_path(averaged_path).as_posix() if averaged_path is not None else "n/a",
+    )
+    return updated_best_val_wer
 
 
 def _build_checkpoint(
@@ -3450,13 +3635,74 @@ def main() -> None:
                         }
                     )
 
+                if (
+                    is_main_process
+                    and args.validate_every_steps > 0
+                    and global_step % args.validate_every_steps == 0
+                ):
+                    train_metrics = {
+                        "train_loss": running_loss / max(1, batch_index),
+                        "train_main_ctc_loss": running_main_ctc_loss / max(1, batch_index),
+                        "train_intermediate_ctc_loss": (
+                            running_intermediate_ctc_loss / max(1, batch_index)
+                        ),
+                        "train_aed_loss": running_aed_loss / max(1, batch_index),
+                        "train_liberta_distill_loss": (
+                            running_liberta_distill_loss / max(1, batch_index)
+                        ),
+                    }
+                    logger.info(
+                        (
+                            "epoch %s step=%s/%s global_step=%s reached validation interval; "
+                            "starting validation"
+                        ),
+                        epoch,
+                        batch_index,
+                        len(train_loader),
+                        global_step,
+                    )
+                    best_val_wer = _evaluate_and_checkpoint(
+                        model=model,
+                        val_loader=val_loader,
+                        criterion=criterion,
+                        tokenizer=tokenizer,
+                        device=device,
+                        dtype=args.dtype,
+                        fp8_recipe=fp8_recipe,
+                        decode_strategy=args.decode_strategy,
+                        beam_size=args.beam_size,
+                        lm_scorer=lm_scorer,
+                        lm_weight=args.lm_weight,
+                        example_limit=args.example_limit,
+                        intermediate_ctc_weight=intermediate_ctc_weight,
+                        aed_loss_weight=args.aed_loss_weight,
+                        liberta_teacher=liberta_teacher,
+                        liberta_distill_weight=args.liberta_distill_weight,
+                        ema=ema,
+                        train_metrics=train_metrics,
+                        epoch=epoch,
+                        global_step=global_step,
+                        output_dir=output_dir,
+                        encoder_config=encoder_config,
+                        featurizer=featurizer,
+                        optimizers=optimizers,
+                        optimizer_names=optimizer_names,
+                        schedulers=schedulers,
+                        scaler=scaler,
+                        args=args,
+                        best_val_wer=best_val_wer,
+                        split_audit=split_audit,
+                        logger=logger,
+                        save_last_checkpoint=False,
+                        report_stem=f"epoch_{epoch:04d}_step_{global_step:08d}",
+                    )
+
         train_loss = running_loss / max(1, len(train_loader))
         train_main_ctc_loss = running_main_ctc_loss / max(1, len(train_loader))
         train_intermediate_ctc_loss = running_intermediate_ctc_loss / max(1, len(train_loader))
         train_aed_loss = running_aed_loss / max(1, len(train_loader))
         train_liberta_distill_loss = running_liberta_distill_loss / max(1, len(train_loader))
         if is_main_process:
-            ema_backup = ema.apply_to(model) if ema is not None else None
             logger.info(
                 "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f elapsed=%s, starting validation",
                 epoch,
@@ -3467,13 +3713,13 @@ def main() -> None:
                 train_liberta_distill_loss,
                 _format_elapsed_seconds(time.perf_counter() - epoch_start_time),
             )
-            validation = evaluate(
-                model,
-                val_loader,
-                criterion,
-                tokenizer,
-                device,
-                args.dtype,
+            best_val_wer = _evaluate_and_checkpoint(
+                model=model,
+                val_loader=val_loader,
+                criterion=criterion,
+                tokenizer=tokenizer,
+                device=device,
+                dtype=args.dtype,
                 fp8_recipe=fp8_recipe,
                 decode_strategy=args.decode_strategy,
                 beam_size=args.beam_size,
@@ -3484,108 +3730,29 @@ def main() -> None:
                 aed_loss_weight=args.aed_loss_weight,
                 liberta_teacher=liberta_teacher,
                 liberta_distill_weight=args.liberta_distill_weight,
-            )
-            if ema_backup is not None:
-                ExponentialMovingAverage.restore(model, ema_backup)
-            val_metrics = validation["metrics"]
-            log_payload = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "train_loss": train_loss,
-                "train_main_ctc_loss": train_main_ctc_loss,
-                "train_intermediate_ctc_loss": train_intermediate_ctc_loss,
-                "train_aed_loss": train_aed_loss,
-                "train_liberta_distill_loss": train_liberta_distill_loss,
-                "val_loss": val_metrics["loss"],
-                "val_cer": val_metrics["cer"],
-                "val_wer": val_metrics["wer"],
-            }
-            for key, value in val_metrics.items():
-                if key not in {"loss", "cer", "wer"}:
-                    log_payload[f"val_{key}"] = value
-            log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
-            log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
-            trackio.log(log_payload)
-            report = {
-                "epoch": epoch,
-                "global_step": global_step,
-                "metrics": val_metrics,
-                "hardest_examples": validation["hardest_examples"],
-                "random_examples": validation["random_examples"],
-                "speaker_metrics": validation["speaker_metrics"],
-                "split_audit": split_audit,
-            }
-            reports_dir = output_dir / "eval_reports"
-            reports_dir.mkdir(parents=True, exist_ok=True)
-            report_path = reports_dir / f"epoch_{epoch:04d}.json"
-            report_path.write_text(
-                json.dumps(report, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-            checkpoint = _build_checkpoint(
-                model=model,
-                encoder_config=encoder_config,
-                tokenizer=tokenizer,
-                featurizer=featurizer,
+                ema=ema,
+                train_metrics={
+                    "train_loss": train_loss,
+                    "train_main_ctc_loss": train_main_ctc_loss,
+                    "train_intermediate_ctc_loss": train_intermediate_ctc_loss,
+                    "train_aed_loss": train_aed_loss,
+                    "train_liberta_distill_loss": train_liberta_distill_loss,
+                },
                 epoch=epoch,
                 global_step=global_step,
-                best_val_wer=min(best_val_wer, val_metrics["wer"]),
-                metrics=log_payload,
+                output_dir=output_dir,
+                encoder_config=encoder_config,
+                featurizer=featurizer,
                 optimizers=optimizers,
                 optimizer_names=optimizer_names,
                 schedulers=schedulers,
                 scaler=scaler,
-                ema=ema,
                 args=args,
-            )
-            latest_path = output_dir / "checkpoint_last.pt"
-            save_checkpoint(checkpoint, latest_path)
-            latest_safetensors_path = _export_inference_checkpoint(checkpoint, latest_path)
-            if val_metrics["wer"] < best_val_wer:
-                best_val_wer = val_metrics["wer"]
-                best_path = output_dir / "checkpoint_best.pt"
-                save_checkpoint(checkpoint, best_path)
-                best_safetensors_path = _export_inference_checkpoint(checkpoint, best_path)
-            else:
-                best_safetensors_path = _safetensors_path(output_dir / "checkpoint_best.pt")
-            _update_top_checkpoints(
-                output_dir=output_dir,
-                checkpoint=checkpoint,
-                epoch=epoch,
-                val_wer=val_metrics["wer"],
-                keep_top_k=args.keep_top_k,
-            )
-            averaged_path = _average_topk_checkpoints(output_dir)
-            logger.info(
-                (
-                    "epoch %s complete train_loss=%.4f val_loss=%.4f "
-                    "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
-                    "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
-                    "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
-                    "best_val_wer=%.4f report=%s latest=%s best=%s averaged=%s"
-                ),
-                epoch,
-                train_loss,
-                float(val_metrics["loss"]),
-                float(val_metrics["main_ctc_loss"]),
-                float(val_metrics["intermediate_ctc_loss"]),
-                float(val_metrics["combined_ctc_loss"]),
-                float(val_metrics["aed_loss"]),
-                float(val_metrics["liberta_distill_loss"]),
-                float(val_metrics["cer"]),
-                float(val_metrics["wer"]),
-                best_val_wer,
-                report_path,
-                latest_path,
-                output_dir / "checkpoint_best.pt",
-                averaged_path if averaged_path is not None else "n/a",
-            )
-            logger.info(
-                "exported inference artifacts latest_safe=%s best_safe=%s averaged_safe=%s",
-                latest_safetensors_path,
-                best_safetensors_path if best_safetensors_path.exists() else "n/a",
-                _safetensors_path(averaged_path).as_posix() if averaged_path is not None else "n/a",
+                best_val_wer=best_val_wer,
+                split_audit=split_audit,
+                logger=logger,
+                save_last_checkpoint=True,
+                report_stem=f"epoch_{epoch:04d}",
             )
         if distributed:
             dist.barrier()
