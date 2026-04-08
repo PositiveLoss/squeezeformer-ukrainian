@@ -484,6 +484,33 @@ def _flatten_examples(prefix: str, examples: list[dict[str, str]]) -> dict[str, 
     return payload
 
 
+def _examples_table(
+    examples: list[dict[str, str]],
+    *,
+    split: str,
+    category: str,
+    epoch: int,
+    global_step: int,
+) -> trackio.Table | None:
+    if not examples:
+        return None
+    rows = [
+        {
+            "split": split,
+            "category": category,
+            "rank": index,
+            "epoch": epoch,
+            "global_step": global_step,
+            "utterance_id": example["utterance_id"],
+            "speaker_id": example["speaker_id"],
+            "reference": example["reference"],
+            "hypothesis": example["hypothesis"],
+        }
+        for index, example in enumerate(examples, start=1)
+    ]
+    return trackio.Table(data=rows)
+
+
 def _evaluate_and_checkpoint(
     *,
     model: SqueezeformerCTC,
@@ -567,6 +594,24 @@ def _evaluate_and_checkpoint(
             log_payload[f"val_{key}"] = value
     log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
     log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
+    hardest_examples_table = _examples_table(
+        validation["hardest_examples"],
+        split="validation",
+        category="hardest",
+        epoch=epoch,
+        global_step=global_step,
+    )
+    if hardest_examples_table is not None:
+        log_payload["val_hardest_samples"] = hardest_examples_table
+    random_examples_table = _examples_table(
+        validation["random_examples"],
+        split="validation",
+        category="random",
+        epoch=epoch,
+        global_step=global_step,
+    )
+    if random_examples_table is not None:
+        log_payload["val_random_samples"] = random_examples_table
     trackio.log(log_payload)
 
     report = {
