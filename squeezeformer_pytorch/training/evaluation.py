@@ -36,13 +36,22 @@ from squeezeformer_pytorch.training.runtime import (
 logger = logging.getLogger("train")
 
 
-def greedy_decode(log_probs: torch.Tensor, tokenizer: Tokenizer) -> list[str]:
+def greedy_decode(
+    log_probs: torch.Tensor,
+    output_lengths: torch.Tensor,
+    tokenizer: Tokenizer,
+) -> list[str]:
     token_ids = log_probs.argmax(dim=-1).cpu().tolist()
-    return [tokenizer.decode_ctc(sequence) for sequence in token_ids]
+    lengths = output_lengths.cpu().tolist()
+    return [
+        tokenizer.decode_ctc(sequence[: int(length)])
+        for sequence, length in zip(token_ids, lengths, strict=True)
+    ]
 
 
 def decode_batch(
     log_probs: torch.Tensor,
+    output_lengths: torch.Tensor,
     tokenizer: Tokenizer,
     strategy: DecodeStrategy,
     beam_size: int = 8,
@@ -50,16 +59,16 @@ def decode_batch(
     lm_weight: float = 0.0,
 ) -> list[str]:
     if strategy == DecodeStrategy.GREEDY:
-        return greedy_decode(log_probs, tokenizer)
+        return greedy_decode(log_probs, output_lengths, tokenizer)
     return [
         ctc_prefix_beam_search(
-            sequence.cpu(),
+            sequence[: int(length)].cpu(),
             tokenizer=tokenizer,
             beam_size=beam_size,
             lm_scorer=lm_scorer,
             lm_weight=lm_weight,
         )
-        for sequence in log_probs
+        for sequence, length in zip(log_probs, output_lengths.cpu().tolist(), strict=True)
     ]
 
 
@@ -381,6 +390,7 @@ def evaluate(
                 decode_start_time = time.perf_counter()
                 decoded_hypotheses = decode_batch(
                     log_probs,
+                    output_lengths,
                     tokenizer=tokenizer,
                     strategy=decode_strategy,
                     beam_size=beam_size,

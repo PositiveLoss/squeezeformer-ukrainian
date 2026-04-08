@@ -10,8 +10,59 @@ sys.modules.setdefault(
     types.SimpleNamespace(init=lambda **_kwargs: None, log=lambda *_args, **_kwargs: None),
 )
 
+from squeezeformer_pytorch.asr import CharacterTokenizer
 from squeezeformer_pytorch.runtime_types import DTypeChoice
 from squeezeformer_pytorch.training import evaluation as training_evaluation
+
+
+def test_greedy_decode_ignores_padded_frames() -> None:
+    tokenizer = CharacterTokenizer(symbols=["a", "b"])
+    log_probs = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.01, 0.98, 0.01],
+                    [0.01, 0.98, 0.01],
+                    [0.01, 0.01, 0.98],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    decoded = training_evaluation.greedy_decode(
+        log_probs,
+        output_lengths=torch.tensor([2]),
+        tokenizer=tokenizer,
+    )
+
+    assert decoded == ["a"]
+
+
+def test_beam_decode_ignores_padded_frames() -> None:
+    tokenizer = CharacterTokenizer(symbols=["a", "b"])
+    log_probs = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.01, 0.98, 0.01],
+                    [0.01, 0.98, 0.01],
+                    [0.01, 0.01, 0.98],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    decoded = training_evaluation.decode_batch(
+        log_probs,
+        output_lengths=torch.tensor([2]),
+        tokenizer=tokenizer,
+        strategy=training_evaluation.DecodeStrategy.BEAM,
+        beam_size=2,
+    )
+
+    assert decoded == ["a"]
 
 
 def test_evaluate_restores_model_mode(monkeypatch) -> None:
