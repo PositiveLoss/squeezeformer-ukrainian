@@ -397,11 +397,6 @@ def main() -> None:
             shallow_fusion_lm_path,
             _format_elapsed_seconds(time.perf_counter() - stage_start_time),
         )
-    if hasattr(train_records, "close"):
-        train_records.close()
-    if hasattr(val_records, "close"):
-        val_records.close()
-
     featurizer = AudioFeaturizer(
         n_fft=args.n_fft,
         hop_length=args.hop_length,
@@ -1235,6 +1230,10 @@ def main() -> None:
             best_val_wer,
             output_dir / "train_summary.json",
         )
+    if hasattr(train_records, "close"):
+        train_records.close()
+    if hasattr(val_records, "close"):
+        val_records.close()
     if distributed and dist.is_initialized():
         _distributed_barrier()
         dist.destroy_process_group()
