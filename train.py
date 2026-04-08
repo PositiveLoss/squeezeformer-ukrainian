@@ -43,6 +43,7 @@ from squeezeformer_pytorch.training.cli import (
 from squeezeformer_pytorch.training.data_loading import (
     _build_split_audit,
     _ensure_opus_decode_support,
+    _frames_to_minutes,
     _load_train_val_records,
     _record_store_duration_hours,
     _resolve_dataset_sources,
@@ -64,7 +65,6 @@ from squeezeformer_pytorch.training.runtime import (
     _configure_trackio_storage,
     _format_elapsed_seconds,
     _format_memory_snapshot,
-    _frames_to_minutes,
     _log_batch_autotune_snapshot,
     _peak_process_memory_bytes,
     _read_proc_status_memory_bytes,
