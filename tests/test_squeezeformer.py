@@ -470,6 +470,27 @@ def test_ctc_blank_pruning_shortens_reduced_region() -> None:
     assert torch.equal(intermediate_lengths[8], torch.tensor([1, 1]))
 
 
+@torch.no_grad()
+def test_ctc_blank_pruning_respects_supervised_target_lengths() -> None:
+    features = torch.randn(2, 10, 4)
+    lengths = torch.tensor([10, 8], dtype=torch.int64)
+    blank_probabilities = torch.full((2, 10), 0.99)
+    blank_probabilities[1, 8:] = 0.0
+    minimum_required_lengths = torch.tensor([4, 3], dtype=torch.int64)
+
+    pruned, pruned_lengths = prune_encoder_frames_by_blank_probability(
+        features,
+        lengths,
+        blank_probabilities,
+        threshold=0.6,
+        min_keep_frames=1,
+        minimum_required_lengths=minimum_required_lengths,
+    )
+
+    assert pruned.shape == (2, 4, 4)
+    assert torch.equal(pruned_lengths, minimum_required_lengths)
+
+
 def test_variant_table_matches_paper() -> None:
     expected = {
         "xs": (16, 144, 4),

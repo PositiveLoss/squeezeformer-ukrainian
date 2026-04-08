@@ -222,6 +222,7 @@ def prune_encoder_frames_by_blank_probability(
     *,
     threshold: float,
     min_keep_frames: int = 1,
+    minimum_required_lengths: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     batch_size, max_time, hidden_dim = x.shape
     valid_mask = torch.arange(max_time, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
@@ -229,7 +230,17 @@ def prune_encoder_frames_by_blank_probability(
     pruned_lengths = threshold_keep_mask.sum(dim=1)
 
     required_keep = lengths.clamp(min=0, max=max(1, min_keep_frames))
+    if minimum_required_lengths is not None:
+        required_keep = torch.minimum(
+            lengths,
+            torch.maximum(
+                required_keep,
+                minimum_required_lengths.to(device=lengths.device, dtype=lengths.dtype),
+            ),
+        )
     needs_fallback = pruned_lengths < min_keep_frames
+    if minimum_required_lengths is not None:
+        needs_fallback = pruned_lengths < required_keep
     if needs_fallback.any():
         # Preserve threshold-selected frames when possible; if none survived the threshold,
         # fall back to the lowest-blank frames instead.
@@ -503,7 +514,9 @@ class SqueezeformerCTC(nn.Module):
             feature_lengths,
             intermediate_layer_indices=self.intermediate_ctc_layers,
             intermediate_layer_callback=accumulate_intermediate_ctc_loss,
-            post_block_transforms=self._post_block_transforms(),
+            post_block_transforms=self._post_block_transforms(
+                minimum_required_lengths=target_lengths,
+            ),
         )
         return encoded, output_lengths, intermediate_ctc_losses
 
@@ -654,6 +667,8 @@ class SqueezeformerCTC(nn.Module):
 
     def _post_block_transforms(
         self,
+        *,
+        minimum_required_lengths: Tensor | None = None,
     ) -> dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]]:
         post_block_transforms: dict[int, Callable[[Tensor, Tensor], tuple[Tensor, Tensor]]] = {}
         if self.blank_prune_layer is None or self.blank_prune_threshold <= 0.0:
@@ -676,6 +691,7 @@ class SqueezeformerCTC(nn.Module):
                 blank_probabilities,
                 threshold=self.blank_prune_threshold,
                 min_keep_frames=self.blank_prune_min_keep_frames,
+                minimum_required_lengths=minimum_required_lengths,
             )
 
         post_block_transforms[self.blank_prune_layer] = blank_prune_transform
