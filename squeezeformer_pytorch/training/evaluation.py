@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import random
+import time
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
@@ -177,6 +178,9 @@ def _merge_evaluation_shards(
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
     total_batches = 0
+    total_forward_seconds = 0.0
+    total_teacher_seconds = 0.0
+    total_decode_seconds = 0.0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -190,6 +194,9 @@ def _merge_evaluation_shards(
         total_aed_loss += float(shard["total_aed_loss"])
         total_liberta_distill_loss += float(shard["total_liberta_distill_loss"])
         total_batches += int(shard["total_batches"])
+        total_forward_seconds += float(shard.get("total_forward_seconds", 0.0))
+        total_teacher_seconds += float(shard.get("total_teacher_seconds", 0.0))
+        total_decode_seconds += float(shard.get("total_decode_seconds", 0.0))
         references.extend(shard["references"])
         hypotheses.extend(shard["hypotheses"])
         utterance_ids.extend(shard["utterance_ids"])
@@ -221,6 +228,11 @@ def _merge_evaluation_shards(
     )
     return {
         "metrics": metrics,
+        "timings": {
+            "forward_seconds": total_forward_seconds,
+            "teacher_seconds": total_teacher_seconds,
+            "decode_seconds": total_decode_seconds,
+        },
         "hardest_examples": hardest_examples,
         "random_examples": random_examples,
         "speaker_metrics": speaker_metrics,
@@ -256,6 +268,9 @@ def evaluate(
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
     total_batches = 0
+    total_forward_seconds = 0.0
+    total_teacher_seconds = 0.0
+    total_decode_seconds = 0.0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -289,6 +304,7 @@ def evaluate(
                     decoder_target_lengths = None
 
                 with _autocast_context(device, dtype, fp8_recipe=fp8_recipe):
+                    forward_start_time = time.perf_counter()
                     forward_outputs = model(
                         features,
                         feature_lengths,
@@ -329,10 +345,12 @@ def evaluate(
                         aed_loss = None
                         aed_hidden = None
                         loss = combined_ctc_loss
+                total_forward_seconds += time.perf_counter() - forward_start_time
                 if (
                     liberta_teacher is not None
                     and liberta_student_embeddings is not None
                 ):
+                    teacher_start_time = time.perf_counter()
                     teacher_embeddings = liberta_teacher.encode(batch["transcripts"]).to(
                         device=liberta_student_embeddings.device,
                         dtype=liberta_student_embeddings.dtype,
@@ -342,6 +360,7 @@ def evaluate(
                         F.normalize(teacher_embeddings.float(), dim=-1),
                     )
                     loss = loss + (liberta_distill_weight * liberta_distill_loss)
+                    total_teacher_seconds += time.perf_counter() - teacher_start_time
                 else:
                     liberta_distill_loss = None
                 total_loss += float(loss.item())
@@ -359,16 +378,17 @@ def evaluate(
                 utterance_ids.extend(batch["utterance_ids"])
                 speaker_ids.extend(batch["speaker_ids"])
                 has_speaker_ids.extend(batch["has_speaker_ids"])
-                hypotheses.extend(
-                    decode_batch(
-                        log_probs,
-                        tokenizer=tokenizer,
-                        strategy=decode_strategy,
-                        beam_size=beam_size,
-                        lm_scorer=lm_scorer,
-                        lm_weight=lm_weight,
-                    )
+                decode_start_time = time.perf_counter()
+                decoded_hypotheses = decode_batch(
+                    log_probs,
+                    tokenizer=tokenizer,
+                    strategy=decode_strategy,
+                    beam_size=beam_size,
+                    lm_scorer=lm_scorer,
+                    lm_weight=lm_weight,
                 )
+                total_decode_seconds += time.perf_counter() - decode_start_time
+                hypotheses.extend(decoded_hypotheses)
     finally:
         if was_training:
             model.train()
@@ -380,6 +400,9 @@ def evaluate(
         "total_aed_loss": total_aed_loss,
         "total_liberta_distill_loss": total_liberta_distill_loss,
         "total_batches": total_batches,
+        "total_forward_seconds": total_forward_seconds,
+        "total_teacher_seconds": total_teacher_seconds,
+        "total_decode_seconds": total_decode_seconds,
         "references": references,
         "hypotheses": hypotheses,
         "utterance_ids": utterance_ids,
@@ -388,15 +411,21 @@ def evaluate(
     }
     if distributed and dist.is_initialized():
         gathered_results = [None] * dist.get_world_size() if is_main_process else None
+        gather_start_time = time.perf_counter()
         dist.gather_object(
             local_results,
             object_gather_list=gathered_results,
             dst=0,
         )
+        gather_seconds = time.perf_counter() - gather_start_time
         if not is_main_process:
             return None
-        return _merge_evaluation_shards(gathered_results, example_limit=example_limit)
-    return _merge_evaluation_shards([local_results], example_limit=example_limit)
+        merged_results = _merge_evaluation_shards(gathered_results, example_limit=example_limit)
+        merged_results["timings"]["gather_seconds"] = gather_seconds
+        return merged_results
+    merged_results = _merge_evaluation_shards([local_results], example_limit=example_limit)
+    merged_results["timings"]["gather_seconds"] = 0.0
+    return merged_results
 
 
 def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
@@ -520,6 +549,7 @@ def _evaluate_and_checkpoint(
         return best_val_wer
 
     val_metrics = validation["metrics"]
+    validation_timings = validation.get("timings", {})
     log_payload = {
         "epoch": epoch,
         "global_step": global_step,
@@ -527,6 +557,10 @@ def _evaluate_and_checkpoint(
         "val_loss": val_metrics["loss"],
         "val_cer": val_metrics["cer"],
         "val_wer": val_metrics["wer"],
+        "val_forward_seconds": float(validation_timings.get("forward_seconds", 0.0)),
+        "val_teacher_seconds": float(validation_timings.get("teacher_seconds", 0.0)),
+        "val_decode_seconds": float(validation_timings.get("decode_seconds", 0.0)),
+        "val_gather_seconds": float(validation_timings.get("gather_seconds", 0.0)),
     }
     for key, value in val_metrics.items():
         if key not in {"loss", "cer", "wer"}:
@@ -547,12 +581,15 @@ def _evaluate_and_checkpoint(
     reports_dir = output_dir / "eval_reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{report_stem}.json"
+    report_start_time = time.perf_counter()
     report_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    report_seconds = time.perf_counter() - report_start_time
 
     updated_best_val_wer = min(best_val_wer, float(val_metrics["wer"]))
+    checkpoint_build_start_time = time.perf_counter()
     checkpoint = _build_checkpoint(
         model=model,
         encoder_config=encoder_config,
@@ -569,22 +606,29 @@ def _evaluate_and_checkpoint(
         ema=ema,
         args=args,
     )
+    checkpoint_build_seconds = time.perf_counter() - checkpoint_build_start_time
 
     if save_last_checkpoint:
         latest_path = output_dir / "checkpoint_last.pt"
     else:
         latest_path = output_dir / "checkpoint_step_last.pt"
+    latest_export_start_time = time.perf_counter()
     save_checkpoint(checkpoint, latest_path)
     latest_safetensors_path = _export_inference_checkpoint(checkpoint, latest_path)
+    latest_export_seconds = time.perf_counter() - latest_export_start_time
 
     if float(val_metrics["wer"]) < best_val_wer:
         updated_best_val_wer = float(val_metrics["wer"])
         best_path = output_dir / "checkpoint_best.pt"
+        best_export_start_time = time.perf_counter()
         save_checkpoint(checkpoint, best_path)
         best_safetensors_path = _export_inference_checkpoint(checkpoint, best_path)
+        best_export_seconds = time.perf_counter() - best_export_start_time
     else:
         best_safetensors_path = _safetensors_path(output_dir / "checkpoint_best.pt")
+        best_export_seconds = 0.0
 
+    topk_update_start_time = time.perf_counter()
     _update_top_checkpoints(
         output_dir=output_dir,
         checkpoint=checkpoint,
@@ -593,14 +637,27 @@ def _evaluate_and_checkpoint(
         val_wer=float(val_metrics["wer"]),
         keep_top_k=args.keep_top_k,
     )
+    topk_update_seconds = time.perf_counter() - topk_update_start_time
+    topk_average_start_time = time.perf_counter()
     averaged_path = _average_topk_checkpoints(output_dir)
+    topk_average_seconds = time.perf_counter() - topk_average_start_time
+    checkpoint_export_seconds = (
+        report_seconds
+        + checkpoint_build_seconds
+        + latest_export_seconds
+        + best_export_seconds
+        + topk_update_seconds
+        + topk_average_seconds
+    )
     logger.info(
         (
             "%s complete train_loss=%.4f val_loss=%.4f "
             "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
             "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
             "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
-            "best_val_wer=%.4f report=%s latest=%s best=%s averaged=%s"
+            "best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
+            "timing_decode=%.2fs timing_gather=%.2fs timing_checkpoint_export=%.2fs "
+            "report=%s latest=%s best=%s averaged=%s"
         ),
         report_stem,
         float(train_metrics["train_loss"]),
@@ -613,10 +670,28 @@ def _evaluate_and_checkpoint(
         float(val_metrics["cer"]),
         float(val_metrics["wer"]),
         updated_best_val_wer,
+        float(validation_timings.get("forward_seconds", 0.0)),
+        float(validation_timings.get("teacher_seconds", 0.0)),
+        float(validation_timings.get("decode_seconds", 0.0)),
+        float(validation_timings.get("gather_seconds", 0.0)),
+        checkpoint_export_seconds,
         report_path,
         latest_path,
         output_dir / "checkpoint_best.pt",
         averaged_path if averaged_path is not None else "n/a",
+    )
+    logger.info(
+        (
+            "%s timing detail report_write=%.2fs checkpoint_build=%.2fs "
+            "latest_export=%.2fs best_export=%.2fs topk_update=%.2fs topk_average=%.2fs"
+        ),
+        report_stem,
+        report_seconds,
+        checkpoint_build_seconds,
+        latest_export_seconds,
+        best_export_seconds,
+        topk_update_seconds,
+        topk_average_seconds,
     )
     logger.info(
         "exported inference artifacts latest_safe=%s best_safe=%s averaged_safe=%s",
