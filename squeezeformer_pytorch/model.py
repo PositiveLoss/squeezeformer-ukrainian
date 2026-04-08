@@ -25,6 +25,7 @@ except (ImportError, OSError):
 
 
 FP8_SHAPE_ALIGNMENT = 16
+_CUDA_CONV2D_32BIT_INDEX_LIMIT = torch.iinfo(torch.int32).max
 _FLASH_ATTN2_REPO_ID = "kernels-community/flash-attn2"
 _FLASH_ATTN2_WARNING_CACHE: set[str] = set()
 logger = logging.getLogger(__name__)
@@ -98,6 +99,52 @@ def _pad_attn_mask_to_length(mask: Tensor | None, target_length: int) -> Tensor 
 
 def _padded_sequence_length(length: int) -> int:
     return math.ceil(length / FP8_SHAPE_ALIGNMENT) * FP8_SHAPE_ALIGNMENT
+
+
+def _conv2d_output_size(
+    input_size: int,
+    *,
+    kernel_size: int,
+    stride: int,
+    padding: int,
+    dilation: int,
+) -> int:
+    return math.floor(
+        ((input_size + (2 * padding) - (dilation * (kernel_size - 1)) - 1) / stride) + 1
+    )
+
+
+def _conv2d_numel_limit_per_example(x: Tensor, conv: nn.Conv2d) -> int:
+    kernel_h, kernel_w = conv.kernel_size
+    stride_h, stride_w = conv.stride
+    pad_h, pad_w = conv.padding
+    dilation_h, dilation_w = conv.dilation
+    output_h = _conv2d_output_size(
+        x.size(-2),
+        kernel_size=kernel_h,
+        stride=stride_h,
+        padding=pad_h,
+        dilation=dilation_h,
+    )
+    output_w = _conv2d_output_size(
+        x.size(-1),
+        kernel_size=kernel_w,
+        stride=stride_w,
+        padding=pad_w,
+        dilation=dilation_w,
+    )
+    input_numel = x[0].numel()
+    output_numel = conv.out_channels * output_h * output_w
+    return max(input_numel, output_numel)
+
+
+def _conv2d_requires_chunking(x: Tensor, conv: nn.Conv2d) -> bool:
+    return (x.size(0) * _conv2d_numel_limit_per_example(x, conv)) > _CUDA_CONV2D_32BIT_INDEX_LIMIT
+
+
+def _safe_conv2d_batch_size(x: Tensor, conv: nn.Conv2d) -> int:
+    per_example_numel = max(1, _conv2d_numel_limit_per_example(x, conv))
+    return max(1, _CUDA_CONV2D_32BIT_INDEX_LIMIT // per_example_numel)
 
 
 def make_linear(
@@ -709,15 +756,41 @@ class Conv2dSubsampling(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = x.unsqueeze(1)
         x = F.pad(x, (0, 1, 0, 1))
-        x = self.activation(self.conv1(x))
+        x = self.activation(self._apply_conv1(x))
         x = F.pad(x, (0, 1, 0, 1))
         if self.depthwise_separable:
-            x = self.conv2_pw(self.conv2_dw(x))
+            x = self._apply_depthwise_separable_conv2(x)
         else:
-            x = self.conv2(x)
+            x = self._apply_conv2(x)
         x = self.activation(x)
         batch, channels, time, freq = x.shape
         return x.permute(0, 2, 1, 3).contiguous().view(batch, time, channels * freq)
+
+    def _apply_conv1(self, x: Tensor) -> Tensor:
+        if not _conv2d_requires_chunking(x, self.conv1):
+            return self.conv1(x)
+        max_batch = _safe_conv2d_batch_size(x, self.conv1)
+        return torch.cat([self.conv1(chunk) for chunk in x.split(max_batch, dim=0)], dim=0)
+
+    def _apply_conv2(self, x: Tensor) -> Tensor:
+        if not _conv2d_requires_chunking(x, self.conv2):
+            return self.conv2(x)
+        max_batch = _safe_conv2d_batch_size(x, self.conv2)
+        return torch.cat([self.conv2(chunk) for chunk in x.split(max_batch, dim=0)], dim=0)
+
+    def _apply_depthwise_separable_conv2(self, x: Tensor) -> Tensor:
+        if not _conv2d_requires_chunking(x, self.conv2_dw) and not _conv2d_requires_chunking(
+            x, self.conv2_pw
+        ):
+            return self.conv2_pw(self.conv2_dw(x))
+        max_batch = min(
+            _safe_conv2d_batch_size(x, self.conv2_dw),
+            _safe_conv2d_batch_size(x, self.conv2_pw),
+        )
+        return torch.cat(
+            [self.conv2_pw(self.conv2_dw(chunk)) for chunk in x.split(max_batch, dim=0)],
+            dim=0,
+        )
 
 
 class TimeReductionLayer(nn.Module):

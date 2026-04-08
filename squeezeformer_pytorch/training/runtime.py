@@ -124,6 +124,9 @@ class FrozenLibertaTeacher:
         self.hidden_size = int(self.model.config.hidden_size)
 
     def encode(self, texts: list[str]) -> Tensor:
+        return self._encode_recursive(texts)
+
+    def _encode_recursive(self, texts: list[str]) -> Tensor:
         tokenized = self.tokenizer(
             texts,
             padding=True,
@@ -132,8 +135,17 @@ class FrozenLibertaTeacher:
             return_tensors="pt",
         )
         tokenized = {key: value.to(self.device) for key, value in tokenized.items()}
-        with torch.no_grad():
-            outputs = self.model(**tokenized)
+        try:
+            with torch.inference_mode():
+                outputs = self.model(**tokenized)
+        except torch.OutOfMemoryError:
+            if self.device.type != "cuda" or len(texts) <= 1:
+                raise
+            torch.cuda.empty_cache()
+            midpoint = max(1, len(texts) // 2)
+            first_half = self._encode_recursive(texts[:midpoint])
+            second_half = self._encode_recursive(texts[midpoint:])
+            return torch.cat((first_half, second_half), dim=0)
         hidden = outputs.last_hidden_state
         mask = tokenized["attention_mask"].unsqueeze(-1).to(dtype=hidden.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
