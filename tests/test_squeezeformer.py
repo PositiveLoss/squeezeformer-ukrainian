@@ -843,6 +843,47 @@ def test_parse_args_supports_max_batch_duration_sec(monkeypatch: pytest.MonkeyPa
     assert args.max_batch_duration_sec == 12.5
 
 
+def test_parse_args_supports_alignment_filter_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--device",
+            "cpu",
+            "--min-chars-per-second",
+            "1.5",
+            "--max-chars-per-second",
+            "18",
+            "--min-tokens-per-second",
+            "0.5",
+            "--max-tokens-per-second",
+            "5",
+            "--min-duration-per-char",
+            "0.02",
+            "--max-duration-per-char",
+            "0.6",
+            "--min-duration-per-token",
+            "0.15",
+            "--max-duration-per-token",
+            "3.0",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.min_chars_per_second == 1.5
+    assert args.max_chars_per_second == 18.0
+    assert args.min_tokens_per_second == 0.5
+    assert args.max_tokens_per_second == 5.0
+    assert args.min_duration_per_char == 0.02
+    assert args.max_duration_per_char == 0.6
+    assert args.min_duration_per_token == 0.15
+    assert args.max_duration_per_token == 3.0
+
+
 def test_load_records_from_dataset_roots_combines_sources_with_global_limit(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -985,8 +1026,17 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
         min_transcript_chars: int,
         max_transcript_chars: int,
         max_symbol_ratio: float,
+        min_chars_per_second: float,
+        max_chars_per_second: float,
+        min_tokens_per_second: float,
+        max_tokens_per_second: float,
+        min_duration_per_char: float,
+        max_duration_per_char: float,
+        min_duration_per_token: float,
+        max_duration_per_token: float,
         lowercase_transcripts: bool,
         hf_token: str | None = None,
+        cache_dir: str | None = None,
     ) -> list[AudioRecord]:
         del (
             dataset_sources,
@@ -997,8 +1047,17 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
             min_transcript_chars,
             max_transcript_chars,
             max_symbol_ratio,
+            min_chars_per_second,
+            max_chars_per_second,
+            min_tokens_per_second,
+            max_tokens_per_second,
+            min_duration_per_char,
+            max_duration_per_char,
+            min_duration_per_token,
+            max_duration_per_token,
             lowercase_transcripts,
             hf_token,
+            cache_dir,
         )
         calls.append(split)
         return train_rows if split == "train" else val_rows
@@ -1027,7 +1086,16 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
             "min_transcript_chars": 1,
             "max_transcript_chars": 400,
             "max_symbol_ratio": 0.5,
+            "min_chars_per_second": 0.0,
+            "max_chars_per_second": float("inf"),
+            "min_tokens_per_second": 0.0,
+            "max_tokens_per_second": float("inf"),
+            "min_duration_per_char": 0.0,
+            "max_duration_per_char": float("inf"),
+            "min_duration_per_token": 0.0,
+            "max_duration_per_token": float("inf"),
             "hf_token": None,
+            "cache_dir": None,
             "prevalidate_audio": False,
             "prevalidate_workers": 1,
         },
@@ -1351,6 +1419,37 @@ def test_transcript_filter_rejects_pathological_rows() -> None:
     assert not transcript_is_usable("а", min_chars=3, max_chars=40, max_symbol_ratio=0.5)
     assert not transcript_is_usable("!" * 8, min_chars=1, max_chars=40, max_symbol_ratio=0.5)
     assert not transcript_is_usable("дуже" * 20, min_chars=1, max_chars=10, max_symbol_ratio=0.5)
+
+
+def test_iter_records_filters_alignment_outliers(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tid\tduration\n"
+        "a.wav\tце нормальний приклад\tutt0\t1.5\n"
+        "b.wav\tдуже довгий текст для короткого аудіо\tutt1\t0.2\n"
+        "c.wav\tтак\tutt2\t8.0\n",
+        encoding="utf-8",
+    )
+
+    records = list(
+        iter_records(
+            dataset_root=tmp_path,
+            split="train",
+            seed=13,
+            val_fraction=0.0,
+            test_fraction=0.0,
+            min_chars_per_second=2.0,
+            max_chars_per_second=20.0,
+            min_tokens_per_second=0.5,
+            max_tokens_per_second=6.0,
+            min_duration_per_char=0.03,
+            max_duration_per_char=0.5,
+            min_duration_per_token=0.2,
+            max_duration_per_token=3.0,
+        )
+    )
+
+    assert [record.utterance_id for record in records] == ["utt0"]
 
 
 def test_max_frames_batch_sampler_respects_frame_budget() -> None:

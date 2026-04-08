@@ -183,6 +183,26 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
             "--max-audio-duration-sec must be >= --min-audio-duration-sec, got "
             f"{args.max_audio_duration_sec} < {args.min_audio_duration_sec}."
         )
+    if args.max_chars_per_second < args.min_chars_per_second:
+        raise ValueError(
+            "--max-chars-per-second must be >= --min-chars-per-second, got "
+            f"{args.max_chars_per_second} < {args.min_chars_per_second}."
+        )
+    if args.max_tokens_per_second < args.min_tokens_per_second:
+        raise ValueError(
+            "--max-tokens-per-second must be >= --min-tokens-per-second, got "
+            f"{args.max_tokens_per_second} < {args.min_tokens_per_second}."
+        )
+    if args.max_duration_per_char < args.min_duration_per_char:
+        raise ValueError(
+            "--max-duration-per-char must be >= --min-duration-per-char, got "
+            f"{args.max_duration_per_char} < {args.min_duration_per_char}."
+        )
+    if args.max_duration_per_token < args.min_duration_per_token:
+        raise ValueError(
+            "--max-duration-per-token must be >= --min-duration-per-token, got "
+            f"{args.max_duration_per_token} < {args.min_duration_per_token}."
+        )
     if args.noise_snr_db_max < args.noise_snr_db_min:
         raise ValueError(
             "--noise-snr-db-max must be >= --noise-snr-db-min, got "
@@ -313,6 +333,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-symbol-ratio", type=float, default=0.5)
     parser.add_argument("--min-audio-duration-sec", type=float, default=0.01)
     parser.add_argument("--max-audio-duration-sec", type=float, default=30.0)
+    parser.add_argument("--min-chars-per-second", type=float, default=0.0)
+    parser.add_argument("--max-chars-per-second", type=float, default=float("inf"))
+    parser.add_argument("--min-tokens-per-second", type=float, default=0.0)
+    parser.add_argument("--max-tokens-per-second", type=float, default=float("inf"))
+    parser.add_argument("--min-duration-per-char", type=float, default=0.0)
+    parser.add_argument("--max-duration-per-char", type=float, default=float("inf"))
+    parser.add_argument("--min-duration-per-token", type=float, default=0.0)
+    parser.add_argument("--max-duration-per-token", type=float, default=float("inf"))
     parser.add_argument("--feature-cache-dir", default=None)
     parser.add_argument(
         "--max-batch-duration-sec",
