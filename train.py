@@ -2183,6 +2183,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--metadata-workers", type=int, default=4)
     parser.add_argument(
+        "--longest-batches-first",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When using length-aware batching, emit the heaviest batches first so oversized "
+            "frame budgets fail early."
+        ),
+    )
+    parser.add_argument(
         "--prevalidate-audio",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -3201,6 +3210,7 @@ def main() -> None:
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         metadata_workers=args.metadata_workers,
+        longest_batches_first=args.longest_batches_first,
     )
     val_loader = create_dataloader(
         val_dataset,
@@ -3215,6 +3225,7 @@ def main() -> None:
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         metadata_workers=args.metadata_workers,
+        longest_batches_first=False,
     )
     train_batches = len(train_loader)
     val_batches = len(val_loader)

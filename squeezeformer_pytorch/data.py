@@ -962,10 +962,21 @@ class CV22ASRDataset(Dataset[dict[str, Any]]):
 
 
 class LengthBucketBatchSampler(BatchSampler):
-    def __init__(self, records: list[CVRecord], batch_size: int, shuffle: bool) -> None:
+    def __init__(
+        self,
+        records: list[CVRecord],
+        batch_size: int,
+        shuffle: bool,
+        longest_first: bool = False,
+    ) -> None:
         self.records = records
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.longest_first = longest_first
+
+    def _batch_order_key(self, batch: list[int]) -> tuple[int, int]:
+        max_frames = max(max(1, self.records[index].estimated_frames) for index in batch)
+        return max_frames, len(batch)
 
     def __iter__(self):
         indices = sorted(
@@ -975,7 +986,9 @@ class LengthBucketBatchSampler(BatchSampler):
             indices[start : start + self.batch_size]
             for start in range(0, len(indices), self.batch_size)
         ]
-        if self.shuffle:
+        if self.longest_first:
+            batches.sort(key=self._batch_order_key, reverse=True)
+        elif self.shuffle:
             order = torch.randperm(len(batches)).tolist()
             batches = [batches[index] for index in order]
         yield from batches
@@ -990,14 +1003,20 @@ class MaxFramesBatchSampler(BatchSampler):
         records: list[CVRecord],
         max_batch_frames: int,
         shuffle: bool,
+        longest_first: bool = False,
     ) -> None:
         self.records = records
         self.max_batch_frames = max_batch_frames
         self.shuffle = shuffle
+        self.longest_first = longest_first
         self._sorted_indices = sorted(
             range(len(self.records)), key=lambda index: self.records[index].estimated_frames
         )
         self._num_batches = self._count_batches()
+
+    def _batch_order_key(self, batch: list[int]) -> tuple[int, int]:
+        max_frames = max(max(1, self.records[index].estimated_frames) for index in batch)
+        return len(batch) * max_frames, max_frames
 
     def _iter_batches(self) -> Iterable[list[int]]:
         current_batch: list[int] = []
@@ -1019,12 +1038,13 @@ class MaxFramesBatchSampler(BatchSampler):
         return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
-        if not self.shuffle:
-            yield from self._iter_batches()
-            return
         batches = list(self._iter_batches())
-        order = torch.randperm(len(batches)).tolist()
-        yield from (batches[index] for index in order)
+        if self.longest_first:
+            batches.sort(key=self._batch_order_key, reverse=True)
+        elif self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in order]
+        yield from batches
 
     def __len__(self) -> int:
         return self._num_batches
@@ -1037,6 +1057,7 @@ class AdaptiveBatchSampler(BatchSampler):
         target_batch_units: int,
         unit: str,
         shuffle: bool,
+        longest_first: bool = False,
     ) -> None:
         if unit not in {"frames", "tokens"}:
             raise ValueError("unit must be one of {'frames', 'tokens'}")
@@ -1044,6 +1065,7 @@ class AdaptiveBatchSampler(BatchSampler):
         self.target_batch_units = target_batch_units
         self.unit = unit
         self.shuffle = shuffle
+        self.longest_first = longest_first
         self._sorted_indices = sorted(
             range(len(self.records)),
             key=lambda index: (
@@ -1072,16 +1094,22 @@ class AdaptiveBatchSampler(BatchSampler):
         if current_batch:
             yield current_batch
 
+    def _batch_order_key(self, batch: list[int]) -> tuple[int, int]:
+        total_units = sum(self._record_units(self.records[index]) for index in batch)
+        max_frames = max(max(1, self.records[index].estimated_frames) for index in batch)
+        return total_units, max_frames
+
     def _count_batches(self) -> int:
         return sum(1 for _ in self._iter_batches())
 
     def __iter__(self):
-        if not self.shuffle:
-            yield from self._iter_batches()
-            return
         batches = list(self._iter_batches())
-        order = torch.randperm(len(batches)).tolist()
-        yield from (batches[index] for index in order)
+        if self.longest_first:
+            batches.sort(key=self._batch_order_key, reverse=True)
+        elif self.shuffle:
+            order = torch.randperm(len(batches)).tolist()
+            batches = [batches[index] for index in order]
+        yield from batches
 
     def __len__(self) -> int:
         return self._num_batches
@@ -1200,6 +1228,7 @@ def create_dataloader(
     persistent_workers: bool = True,
     prefetch_factor: int = 2,
     metadata_workers: int = 4,
+    longest_batches_first: bool = False,
 ) -> DataLoader[dict[str, Any]]:
     if hasattr(dataset.records, "populate_metadata"):
         dataset.records.populate_metadata(
@@ -1228,6 +1257,7 @@ def create_dataloader(
             target_batch_units=adaptive_batch_budget,
             unit=adaptive_batch_unit,
             shuffle=shuffle,
+            longest_first=longest_batches_first,
         )
         return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     if max_batch_frames is not None:
@@ -1235,11 +1265,15 @@ def create_dataloader(
             dataset.records,
             max_batch_frames=max_batch_frames,
             shuffle=shuffle,
+            longest_first=longest_batches_first,
         )
         return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     if bucket_by_length:
         batch_sampler = LengthBucketBatchSampler(
-            dataset.records, batch_size=batch_size, shuffle=shuffle
+            dataset.records,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            longest_first=longest_batches_first,
         )
         return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
     return DataLoader(
