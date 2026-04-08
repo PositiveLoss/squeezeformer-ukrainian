@@ -570,7 +570,18 @@ def main() -> None:
             )
         )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
-    liberta_device = resolve_device(args.liberta_device)
+    requested_liberta_device = resolve_device(args.liberta_device)
+    if distributed and requested_liberta_device.type == "cuda":
+        if requested_liberta_device.index not in {None, local_rank}:
+            logger.warning(
+                "--liberta-device %s conflicts with LOCAL_RANK=%s; using cuda:%s for this rank.",
+                args.liberta_device,
+                local_rank,
+                local_rank,
+            )
+        liberta_device = torch.device(f"cuda:{local_rank}")
+    else:
+        liberta_device = requested_liberta_device
     liberta_teacher = (
         FrozenLibertaTeacher(
             str(Path(liberta_model_path).expanduser().resolve())
