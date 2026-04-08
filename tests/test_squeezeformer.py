@@ -154,7 +154,7 @@ def test_flash_attention_backend_uses_hf_varlen_kernel_when_available(
 
     x = torch.randn(2, 4, 4)
     lengths = torch.tensor([4, 2], dtype=torch.int64)
-    mask = make_attention_mask(lengths, max_length=4)
+    mask = make_sequence_mask(lengths, max_length=4)
 
     out = attn(x, mask=mask)
 
@@ -168,6 +168,37 @@ def test_flash_attention_backend_uses_hf_varlen_kernel_when_available(
     assert torch.all(out[0] == 2.0)
     assert torch.all(out[1, :2] == 2.0)
     assert torch.all(out[1, 2:] == 0.0)
+
+
+@torch.no_grad()
+def test_flash_attention_backend_accepts_sequence_mask_for_sdpa_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_sdpa(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        attn_mask: torch.Tensor | None = None,
+        dropout_p: float = 0.0,
+        is_causal: bool = False,
+    ) -> torch.Tensor:
+        captured["attn_mask_shape"] = None if attn_mask is None else attn_mask.shape
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
+
+    attn = squeezeformer_model.FlashMultiHeadAttention(dim=4, num_heads=2, dropout=0.0)
+    attn.eval()
+    x = torch.randn(2, 4, 4)
+    mask = make_sequence_mask(torch.tensor([4, 2], dtype=torch.int64), max_length=4)
+
+    out = attn(x, mask=mask)
+
+    assert captured["attn_mask_shape"] == (2, 1, 1, 4)
+    assert out.shape == x.shape
 
 
 @torch.no_grad()

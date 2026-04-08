@@ -317,6 +317,8 @@ class FlashMultiHeadAttention(nn.Module):
 
     @staticmethod
     def _to_sdpa_mask(mask: Tensor) -> Tensor:
+        if mask.dim() == 2:
+            return mask.unsqueeze(1).unsqueeze(1)
         return mask.unsqueeze(1)
 
     @staticmethod
@@ -329,6 +331,8 @@ class FlashMultiHeadAttention(nn.Module):
 
     @staticmethod
     def _infer_sequence_lengths(mask: Tensor) -> Tensor:
+        if mask.dim() == 2:
+            return mask.sum(dim=-1, dtype=torch.int32)
         return mask.any(dim=-1).sum(dim=-1, dtype=torch.int32)
 
     @staticmethod
@@ -1036,18 +1040,26 @@ class SqueezeformerEncoder(nn.Module):
                 padded_time = _padded_sequence_length(x.size(1))
                 x = _pad_tensor_along_dim(x, dim=1, target_size=padded_time)
                 pos = self.positional_encoding(x)
-                attn_mask = _pad_attn_mask_to_length(
-                    make_attention_mask(lengths, max_length=x.size(1)),
-                    target_length=padded_time,
-                )
                 pad_mask = _pad_mask_to_length(
                     make_sequence_mask(lengths, max_length=x.size(1)),
                     target_length=padded_time,
                 )
+                attn_mask = (
+                    pad_mask
+                    if self.config.attention_backend == "flash"
+                    else _pad_attn_mask_to_length(
+                        make_attention_mask(lengths, max_length=x.size(1)),
+                        target_length=padded_time,
+                    )
+                )
             else:
                 pos = self.positional_encoding(x)
-                attn_mask = make_attention_mask(lengths, max_length=x.size(1))
                 pad_mask = make_sequence_mask(lengths, max_length=x.size(1))
+                attn_mask = (
+                    pad_mask
+                    if self.config.attention_backend == "flash"
+                    else make_attention_mask(lengths, max_length=x.size(1))
+                )
             if self.config.activation_checkpointing and self.training:
                 x = activation_checkpoint(
                     lambda a, b, c, d: block(a, pos=b, attn_mask=c, pad_mask=d),
