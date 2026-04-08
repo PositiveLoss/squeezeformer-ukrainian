@@ -30,6 +30,7 @@ from squeezeformer_pytorch.data import (
     MaxFramesBatchSampler,
     SpecAugment,
     WaveformAugment,
+    collate_asr_batch,
     create_dataloader,
     iter_corpus_texts,
     iter_records,
@@ -51,6 +52,7 @@ from train import (
     DiskBackedRecordStore,
     ExponentialMovingAverage,
     _average_topk_checkpoints,
+    _aed_cross_entropy_loss,
     _build_disk_backed_record_store,
     _build_fp8_recipe,
     _configure_console_logger,
@@ -1475,6 +1477,77 @@ def test_feature_cache_is_used_when_waveform_augment_is_effectively_disabled(
 
     assert load_calls == 1
     assert torch.equal(first_item["features"], second_item["features"])
+
+
+def test_invalid_cached_features_are_recomputed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class DummyTokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [len(text)]
+
+    load_calls = 0
+
+    def fake_load_audio(
+        audio_path: str | None, audio_bytes: bytes | None
+    ) -> tuple[torch.Tensor, int]:
+        nonlocal load_calls
+        load_calls += 1
+        return torch.ones(1, 320), 16_000
+
+    monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
+
+    dataset = ASRDataset(
+        records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        tokenizer=DummyTokenizer(),
+        featurizer=AudioFeaturizer(),
+        feature_cache_dir=tmp_path,
+    )
+    cache_path = dataset._feature_cache_path(dataset.records[0])
+    assert cache_path is not None
+    torch.save(torch.ones(25_000, dataset.featurizer.n_mels), cache_path)
+
+    item = dataset[0]
+
+    assert item is not None
+    assert load_calls == 1
+    assert item["features"].shape == (3, dataset.featurizer.n_mels)
+
+
+def test_collate_asr_batch_filters_invalid_items() -> None:
+    batch = collate_asr_batch(
+        [
+            None,
+            {
+                "features": torch.ones(4, 80),
+                "feature_length": 4,
+                "targets": torch.tensor([1, 2], dtype=torch.long),
+                "target_length": 2,
+                "transcript": "це тест",
+                "utterance_id": "utt0",
+                "speaker_id": None,
+                "has_speaker_id": False,
+            },
+        ]
+    )
+
+    assert batch is not None
+    assert batch["features"].shape == (1, 4, 80)
+    assert batch["feature_lengths"].tolist() == [4]
+
+
+def test_aed_cross_entropy_loss_matches_transposed_reference() -> None:
+    logits = torch.randn(2, 3, 5)
+    targets = torch.tensor([[1, 2, 0], [3, 0, 4]], dtype=torch.long)
+
+    expected = torch.nn.functional.cross_entropy(
+        logits.float().transpose(1, 2),
+        targets,
+        ignore_index=0,
+        reduction="sum",
+    ) / targets.ne(0).sum().clamp_min(1)
+
+    observed = _aed_cross_entropy_loss(logits, targets, pad_id=0)
+
+    torch.testing.assert_close(observed, expected)
 
 
 def test_create_dataloader_uses_fork_context_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:

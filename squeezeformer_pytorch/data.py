@@ -927,10 +927,40 @@ class ASRDataset(Dataset[dict[str, Any]]):
     def _feature_cache_path(self, record: CVRecord) -> Path | None:
         return feature_cache_path(self.feature_cache_dir, record.utterance_id, self.featurizer)
 
+    def _max_reasonable_feature_frames(self, record: CVRecord) -> int:
+        estimated_frames = max(1, int(record.estimated_frames))
+        return max(20_000, estimated_frames * 4, estimated_frames + 1_024)
+
+    def _normalize_feature_tensor(self, features: Tensor) -> Tensor | None:
+        if features.dim() != 2:
+            return None
+        if features.size(1) == self.featurizer.n_mels:
+            return features
+        if features.size(0) == self.featurizer.n_mels and features.size(1) > 0:
+            return features.transpose(0, 1).contiguous()
+        return None
+
+    def _features_are_plausible(self, record: CVRecord, features: Tensor) -> bool:
+        normalized = self._normalize_feature_tensor(features)
+        if normalized is None:
+            return False
+        return 0 < normalized.size(0) <= self._max_reasonable_feature_frames(record)
+
+    def _compute_features(
+        self,
+        record: CVRecord,
+        *,
+        waveform_augment_enabled: bool,
+    ) -> Tensor:
+        waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
+        if waveform_augment_enabled and self.waveform_augment is not None:
+            waveform, sample_rate = self.waveform_augment(waveform, sample_rate)
+        return self.featurizer(waveform, sample_rate)
+
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> dict[str, Any] | None:
         record = self.records[index]
         cache_path = self._feature_cache_path(record)
         waveform_augment_enabled = (
@@ -939,13 +969,39 @@ class ASRDataset(Dataset[dict[str, Any]]):
         use_cache = cache_path is not None and not waveform_augment_enabled
         if use_cache and cache_path.exists():
             features = torch.load(cache_path, map_location="cpu")
+            if not self._features_are_plausible(record, features):
+                logger.warning(
+                    "discarding suspicious cached features for utterance_id=%s shape=%s "
+                    "estimated_frames=%s",
+                    record.utterance_id,
+                    tuple(features.shape),
+                    int(record.estimated_frames),
+                )
+                cache_path.unlink(missing_ok=True)
+                features = self._compute_features(
+                    record,
+                    waveform_augment_enabled=waveform_augment_enabled,
+                )
+                if use_cache:
+                    torch.save(features, cache_path)
         else:
-            waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
-            if waveform_augment_enabled:
-                waveform, sample_rate = self.waveform_augment(waveform, sample_rate)
-            features = self.featurizer(waveform, sample_rate)
+            features = self._compute_features(
+                record,
+                waveform_augment_enabled=waveform_augment_enabled,
+            )
             if use_cache:
                 torch.save(features, cache_path)
+        features = self._normalize_feature_tensor(features)
+        if features is None or not self._features_are_plausible(record, features):
+            logger.warning(
+                "skipping utterance_id=%s due to invalid feature shape/length shape=%s "
+                "estimated_frames=%s max_reasonable_frames=%s",
+                record.utterance_id,
+                tuple(features.shape) if features is not None else None,
+                int(record.estimated_frames),
+                self._max_reasonable_feature_frames(record),
+            )
+            return None
         if self.specaugment is not None:
             features = self.specaugment(features)
         target_ids = torch.tensor(self.tokenizer.encode(record.transcript), dtype=torch.long)
@@ -1181,7 +1237,10 @@ def materialize_record_metadata(
     return records
 
 
-def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
+def collate_asr_batch(batch: list[dict[str, Any] | None]) -> dict[str, Any] | None:
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
     feature_lengths = torch.tensor([item["feature_length"] for item in batch], dtype=torch.long)
     target_lengths = torch.tensor([item["target_length"] for item in batch], dtype=torch.long)
     max_feature_length = int(feature_lengths.max().item())

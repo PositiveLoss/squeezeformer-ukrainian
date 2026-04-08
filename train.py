@@ -1576,9 +1576,22 @@ def _aed_cross_entropy_loss(
     *,
     pad_id: int,
 ) -> Tensor:
+    if logits.dim() != 3:
+        raise ValueError(
+            f"Expected AED logits with shape [batch, time, vocab], got {tuple(logits.shape)}"
+        )
+    if targets.dim() != 2:
+        raise ValueError(
+            f"Expected AED targets with shape [batch, time], got {tuple(targets.shape)}"
+        )
+    if logits.shape[:2] != targets.shape:
+        raise ValueError(
+            "AED logits and targets must agree on batch/time dimensions, got "
+            f"{tuple(logits.shape[:2])} vs {tuple(targets.shape)}"
+        )
     loss = F.cross_entropy(
-        logits.float().transpose(1, 2),
-        targets,
+        logits.float().reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
         ignore_index=pad_id,
         reduction="sum",
     )
@@ -2568,6 +2581,9 @@ def evaluate(
     has_speaker_ids: list[bool] = []
     with torch.no_grad():
         for batch in dataloader:
+            if batch is None:
+                logger.warning("skipping empty validation batch after dataset filtering")
+                continue
             features = batch["features"].to(device)
             feature_lengths = batch["feature_lengths"].to(device)
             targets = batch["targets"].to(device)
@@ -3491,6 +3507,9 @@ def main() -> None:
         for optimizer in optimizers:
             optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(train_loader, start=1):
+            if batch is None:
+                logger.warning("skipping empty training batch after dataset filtering")
+                continue
             if (batch_index - 1) % args.gradient_accumulation_steps == 0:
                 tune_effective_frames = 0
                 tune_padded_frames = 0
