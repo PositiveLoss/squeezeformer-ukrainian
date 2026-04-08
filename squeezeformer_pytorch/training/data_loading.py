@@ -120,6 +120,20 @@ class DiskBackedRecordStore:
         self._handle = None
         self._handle_pid = None
 
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        handle = state.get("_handle")
+        if handle is not None and not handle.closed:
+            handle.close()
+        state["_handle"] = None
+        state["_handle_pid"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self._handle = None
+        self._handle_pid = None
+
     def __len__(self) -> int:
         total = len(self.offsets)
         if self.start >= total:
@@ -226,6 +240,25 @@ class _BinaryIndexView:
             self._mmap.close()
         if self._handle is not None and not self._handle.closed:
             self._handle.close()
+        self._mmap = None
+        self._handle = None
+        self._pid = None
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        mmap_handle = state.get("_mmap")
+        file_handle = state.get("_handle")
+        if mmap_handle is not None:
+            mmap_handle.close()
+        if file_handle is not None and not file_handle.closed:
+            file_handle.close()
+        state["_mmap"] = None
+        state["_handle"] = None
+        state["_pid"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
         self._mmap = None
         self._handle = None
         self._pid = None

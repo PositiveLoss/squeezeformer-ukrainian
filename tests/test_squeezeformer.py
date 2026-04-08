@@ -2,6 +2,7 @@ import array
 import json
 import logging
 import math
+import pickle
 import sys
 from dataclasses import asdict
 from io import BytesIO
@@ -1628,6 +1629,32 @@ def test_create_dataloader_uses_spawn_context_when_distributed_initialized(
         assert kwargs["multiprocessing_context"].get_start_method() == "spawn"
     else:
         assert "multiprocessing_context" not in kwargs
+
+
+def test_disk_backed_record_store_is_pickle_safe_after_open(tmp_path: Path) -> None:
+    records_path = tmp_path / "records.jsonl"
+    payload = {
+        "audio_path": "dummy.wav",
+        "audio_blob_path": None,
+        "transcript": "це тест",
+        "utterance_id": "utt0",
+        "speaker_id": None,
+        "has_speaker_id": False,
+    }
+    records_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    offsets = array.array("Q", [0])
+    estimated_frames = array.array("I", [2])
+    store = DiskBackedRecordStore(records_path, offsets, estimated_frames)
+
+    # Force the store to open its underlying file handle before pickling.
+    record = store[0]
+    assert record.transcript == "це тест"
+
+    restored = pickle.loads(pickle.dumps(store))
+
+    assert len(restored) == 1
+    assert restored[0].utterance_id == "utt0"
 
 
 def test_muon_optimizer_partition_uses_encoder_hidden_weights(
