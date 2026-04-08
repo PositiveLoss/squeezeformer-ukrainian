@@ -335,6 +335,19 @@ class TrainingOnlyAEDDecoder(nn.Module):
         self.output_projection = nn.Linear(model_dim, self.decoder_vocab_size)
         self.dropout = nn.Dropout(dropout)
         self.activation_checkpointing = activation_checkpointing
+        self.max_target_length = max_target_length
+        self.register_buffer(
+            "_causal_mask",
+            torch.triu(torch.ones(max_target_length, max_target_length, dtype=torch.bool), diagonal=1),
+            persistent=False,
+        )
+
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> Tensor:
+        if seq_len > self._causal_mask.size(0):
+            raise ValueError(
+                f"decoder_inputs length {seq_len} exceeds max_target_length={self.max_target_length}"
+            )
+        return self._causal_mask[:seq_len, :seq_len].to(device=device)
 
     def forward(
         self,
@@ -346,10 +359,7 @@ class TrainingOnlyAEDDecoder(nn.Module):
         positions = torch.arange(seq_len, device=decoder_inputs.device)
         x = self.embedding(decoder_inputs) + self.position_embedding(positions).unsqueeze(0)
         x = self.dropout(x)
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=decoder_inputs.device, dtype=torch.bool),
-            diagonal=1,
-        )
+        causal_mask = self._get_causal_mask(seq_len, decoder_inputs.device)
         target_padding_mask = decoder_inputs.eq(self.pad_id)
         memory_padding_mask = make_padding_mask(memory_lengths, memory.size(1))
         if self.activation_checkpointing and self.training:
