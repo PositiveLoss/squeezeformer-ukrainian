@@ -87,6 +87,31 @@ from squeezeformer_pytorch.training.runtime import (
 )
 
 
+def _distributed_mean(value: float, *, device: torch.device, distributed: bool) -> float:
+    if not distributed or not dist.is_initialized():
+        return value
+    reduced = torch.tensor(value, device=device, dtype=torch.float64)
+    dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+    reduced /= dist.get_world_size()
+    return float(reduced.item())
+
+
+def _synchronize_best_val_wer(best_val_wer: float, *, device: torch.device, distributed: bool) -> float:
+    if not distributed or not dist.is_initialized():
+        return best_val_wer
+    payload = torch.tensor(best_val_wer, device=device, dtype=torch.float64)
+    dist.broadcast(payload, src=0)
+    return float(payload.item())
+
+
+def _distributed_min_int(value: int, *, device: torch.device, distributed: bool) -> int:
+    if not distributed or not dist.is_initialized():
+        return value
+    reduced = torch.tensor(value, device=device, dtype=torch.int64)
+    dist.all_reduce(reduced, op=dist.ReduceOp.MIN)
+    return int(reduced.item())
+
+
 def main() -> None:
     args = parse_args()
     process_start_time = time.perf_counter()
@@ -96,6 +121,11 @@ def main() -> None:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     requested_device = resolve_device(args.device)
+    sync_device = (
+        torch.device(f"cuda:{local_rank}")
+        if distributed and torch.cuda.is_available()
+        else requested_device
+    )
     is_main_process = rank == 0
     if distributed:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -351,6 +381,11 @@ def main() -> None:
     )
     train_batches = len(train_loader)
     val_batches = len(val_loader)
+    train_batches = _distributed_min_int(
+        train_batches,
+        device=sync_device,
+        distributed=distributed,
+    )
     logger.info(
         "dataloaders ready train_batches=%s val_batches=%s elapsed=%s",
         train_batches,
@@ -460,6 +495,7 @@ def main() -> None:
         forward_model: nn.Module = DDP(
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
+            find_unused_parameters=blank_prune_layer is not None and blank_prune_threshold > 0.0,
         )
     else:
         forward_model = torch.compile(model) if args.compile else model
@@ -613,11 +649,13 @@ def main() -> None:
         for optimizer in optimizers:
             optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(train_loader, start=1):
+            if batch_index > train_batches:
+                break
             if batch is None:
                 logger.warning("skipping empty training batch after dataset filtering")
                 continue
-            should_step = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(
-                train_loader
+            should_step = (
+                batch_index % args.gradient_accumulation_steps == 0 or batch_index == train_batches
             )
             if (batch_index - 1) % args.gradient_accumulation_steps == 0:
                 tune_effective_frames = 0
@@ -762,7 +800,7 @@ def main() -> None:
                         epoch=epoch,
                         global_step=global_step,
                         batch_index=batch_index,
-                        total_batches=len(train_loader),
+                        total_batches=train_batches,
                         optimizer_step_index=global_step,
                         effective_frames=tune_effective_frames,
                         padded_frames=tune_padded_frames,
@@ -789,7 +827,7 @@ def main() -> None:
                         ),
                         epoch,
                         batch_index,
-                        len(train_loader),
+                        train_batches,
                         global_step,
                         float(loss.item()),
                         float(main_ctc_loss.item()),
@@ -859,72 +897,119 @@ def main() -> None:
                     )
 
                 if (
-                    is_main_process
-                    and args.validate_every_steps > 0
+                    args.validate_every_steps > 0
                     and global_step % args.validate_every_steps == 0
                 ):
                     train_metrics = {
-                        "train_loss": running_loss / max(1, batch_index),
-                        "train_main_ctc_loss": running_main_ctc_loss / max(1, batch_index),
-                        "train_intermediate_ctc_loss": (
-                            running_intermediate_ctc_loss / max(1, batch_index)
+                        "train_loss": _distributed_mean(
+                            running_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
                         ),
-                        "train_aed_loss": running_aed_loss / max(1, batch_index),
-                        "train_liberta_distill_loss": (
-                            running_liberta_distill_loss / max(1, batch_index)
+                        "train_main_ctc_loss": _distributed_mean(
+                            running_main_ctc_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
+                        ),
+                        "train_intermediate_ctc_loss": _distributed_mean(
+                            running_intermediate_ctc_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
+                        ),
+                        "train_aed_loss": _distributed_mean(
+                            running_aed_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
+                        ),
+                        "train_liberta_distill_loss": _distributed_mean(
+                            running_liberta_distill_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
                         ),
                     }
-                    logger.info(
-                        (
-                            "epoch %s step=%s/%s global_step=%s reached validation interval; "
-                            "starting validation"
-                        ),
-                        epoch,
-                        batch_index,
-                        len(train_loader),
-                        global_step,
-                    )
-                    best_val_wer = _evaluate_and_checkpoint(
-                        model=model,
-                        val_loader=val_loader,
-                        criterion=criterion,
-                        tokenizer=tokenizer,
+                    if distributed:
+                        dist.barrier()
+                    if is_main_process:
+                        logger.info(
+                            (
+                                "epoch %s step=%s/%s global_step=%s reached validation interval; "
+                                "starting validation"
+                            ),
+                            epoch,
+                            batch_index,
+                            train_batches,
+                            global_step,
+                        )
+                        best_val_wer = _evaluate_and_checkpoint(
+                            model=model,
+                            val_loader=val_loader,
+                            criterion=criterion,
+                            tokenizer=tokenizer,
+                            device=device,
+                            dtype=args.dtype,
+                            fp8_recipe=fp8_recipe,
+                            decode_strategy=args.decode_strategy,
+                            beam_size=args.beam_size,
+                            lm_scorer=lm_scorer,
+                            lm_weight=args.lm_weight,
+                            example_limit=args.example_limit,
+                            intermediate_ctc_weight=intermediate_ctc_weight,
+                            aed_loss_weight=args.aed_loss_weight,
+                            liberta_teacher=liberta_teacher,
+                            liberta_distill_weight=args.liberta_distill_weight,
+                            ema=ema,
+                            train_metrics=train_metrics,
+                            epoch=epoch,
+                            global_step=global_step,
+                            output_dir=output_dir,
+                            encoder_config=encoder_config,
+                            featurizer=featurizer,
+                            optimizers=optimizers,
+                            optimizer_names=optimizer_names,
+                            schedulers=schedulers,
+                            scaler=scaler,
+                            args=args,
+                            best_val_wer=best_val_wer,
+                            split_audit=split_audit,
+                            logger=logger,
+                            save_last_checkpoint=False,
+                            report_stem=f"epoch_{epoch:04d}_step_{global_step:08d}",
+                        )
+                    best_val_wer = _synchronize_best_val_wer(
+                        best_val_wer,
                         device=device,
-                        dtype=args.dtype,
-                        fp8_recipe=fp8_recipe,
-                        decode_strategy=args.decode_strategy,
-                        beam_size=args.beam_size,
-                        lm_scorer=lm_scorer,
-                        lm_weight=args.lm_weight,
-                        example_limit=args.example_limit,
-                        intermediate_ctc_weight=intermediate_ctc_weight,
-                        aed_loss_weight=args.aed_loss_weight,
-                        liberta_teacher=liberta_teacher,
-                        liberta_distill_weight=args.liberta_distill_weight,
-                        ema=ema,
-                        train_metrics=train_metrics,
-                        epoch=epoch,
-                        global_step=global_step,
-                        output_dir=output_dir,
-                        encoder_config=encoder_config,
-                        featurizer=featurizer,
-                        optimizers=optimizers,
-                        optimizer_names=optimizer_names,
-                        schedulers=schedulers,
-                        scaler=scaler,
-                        args=args,
-                        best_val_wer=best_val_wer,
-                        split_audit=split_audit,
-                        logger=logger,
-                        save_last_checkpoint=False,
-                        report_stem=f"epoch_{epoch:04d}_step_{global_step:08d}",
+                        distributed=distributed,
                     )
+                    if distributed:
+                        dist.barrier()
 
-        train_loss = running_loss / max(1, len(train_loader))
-        train_main_ctc_loss = running_main_ctc_loss / max(1, len(train_loader))
-        train_intermediate_ctc_loss = running_intermediate_ctc_loss / max(1, len(train_loader))
-        train_aed_loss = running_aed_loss / max(1, len(train_loader))
-        train_liberta_distill_loss = running_liberta_distill_loss / max(1, len(train_loader))
+        train_loss = _distributed_mean(
+            running_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
+        train_main_ctc_loss = _distributed_mean(
+            running_main_ctc_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
+        train_intermediate_ctc_loss = _distributed_mean(
+            running_intermediate_ctc_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
+        train_aed_loss = _distributed_mean(
+            running_aed_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
+        train_liberta_distill_loss = _distributed_mean(
+            running_liberta_distill_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
+        if distributed:
+            dist.barrier()
         if is_main_process:
             logger.info(
                 "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f elapsed=%s, starting validation",
@@ -977,6 +1062,11 @@ def main() -> None:
                 save_last_checkpoint=True,
                 report_stem=f"epoch_{epoch:04d}",
             )
+        best_val_wer = _synchronize_best_val_wer(
+            best_val_wer,
+            device=device,
+            distributed=distributed,
+        )
         if distributed:
             dist.barrier()
 

@@ -85,12 +85,14 @@ class DiskBackedRecordStore:
         *,
         start: int = 0,
         step: int = 1,
+        count: int | None = None,
     ) -> None:
         self.records_path = records_path
         self.offsets = offsets
         self.estimated_frames = estimated_frames
         self.start = start
         self.step = step
+        self.count = count
         self._handle = None
         self._handle_pid: int | None = None
 
@@ -121,7 +123,10 @@ class DiskBackedRecordStore:
         total = len(self.offsets)
         if self.start >= total:
             return 0
-        return ((total - self.start - 1) // self.step) + 1
+        available = ((total - self.start - 1) // self.step) + 1
+        if self.count is None:
+            return available
+        return max(0, min(available, self.count))
 
     def __getitem__(self, index: int) -> AudioRecord:
         global_index = self._global_index(index)
@@ -143,12 +148,14 @@ class DiskBackedRecordStore:
             yield self[index]
 
     def shard(self, rank: int, world_size: int) -> "DiskBackedRecordStore":
+        local_length = len(self)
         return DiskBackedRecordStore(
             self.records_path,
             self.offsets,
             self.estimated_frames,
             start=self.start + rank,
             step=self.step * world_size,
+            count=local_length // world_size,
         )
 
     def populate_metadata(self, hop_length: int, num_workers: int = 4) -> None:
@@ -703,7 +710,8 @@ def _shard_records_for_rank(
         return records
     if hasattr(records, "shard"):
         return records.shard(rank, world_size)
-    return records[rank::world_size]
+    usable = (len(records) // world_size) * world_size
+    return records[:usable][rank:usable:world_size]
 
 
 def _record_store_duration_hours(
