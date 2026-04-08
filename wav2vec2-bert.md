@@ -7,7 +7,7 @@ Add a new `audio_teacher` training path that uses a frozen `wav2vec2-bert` style
 This is separate from the existing `liberta` path:
 
 - `liberta` is a text teacher over transcripts.
-- `audio_teacher` will be an acoustic teacher over raw waveform.
+- `audio_teacher` is an acoustic teacher over raw waveform.
 
 ## Scope
 
@@ -27,6 +27,26 @@ Out of scope for v1:
 - tokenizer-space CTC KL distillation unless vocab compatibility is proven
 - caching teacher outputs
 
+## Current Status
+
+Implemented:
+
+- CLI and checkpoint-arg plumbing for `audio_teacher`
+- `FrozenAudioTeacher` runtime with `AutoProcessor` and `AutoModel`
+- optional waveform return from `ASRDataset`
+- waveform-aware `collate_asr_batch`
+- train-loop teacher instantiation and device resolution
+- inference export stripping `audio_teacher_projection.*` and forcing `audio_teacher=False`
+- initial tests for CLI parsing and waveform batching
+
+Not implemented yet:
+
+- student projection head in `SqueezeformerCTC`
+- training loss integration
+- validation loss integration
+- inference/evaluation runtime metadata cleanup
+- full test coverage beyond the initial waveform and CLI checks
+
 ## Why This Design
 
 This repo currently supports:
@@ -44,57 +64,47 @@ The safest first step is to add a separate audio teacher abstraction and start w
 
 ### 1. CLI and config plumbing
 
+Status: done
+
 Files:
 
 - `squeezeformer_pytorch/training/cli.py`
 - `squeezeformer_pytorch/training/runtime.py`
 - `train.py`
 
-Add new CLI flags:
+Implemented:
 
-- `--audio-teacher`
-- `--audio-teacher-model-name`
-- `--audio-teacher-model-path`
-- `--audio-teacher-device`
-- `--audio-teacher-weight`
-- `--audio-teacher-objective`
-- `--audio-teacher-target`
-- `--audio-teacher-layer`
-- `--audio-teacher-sample-rate`
-- `--audio-teacher-max-seconds`
-
-Add validation rules:
-
-- teacher weight must be `> 0` when enabled
-- device must resolve cleanly
-- `ctc_kl` objective should be blocked unless tokenizer compatibility is explicitly supported
-
-Add training-args checkpoint persistence and resume resolution, mirroring the existing `liberta` pattern.
+- CLI flags for `audio_teacher`
+- startup validation for teacher device, sample rate, weight, and local model path
+- checkpoint resume resolution through `_resolve_audio_teacher_settings(...)`
+- training-arg persistence through `args.*` assignment in `train.py`
 
 ### 2. Add frozen acoustic teacher runtime
+
+Status: done
 
 Files:
 
 - `squeezeformer_pytorch/training/runtime.py`
 
-Add a new class:
+Added:
 
 - `FrozenAudioTeacher`
 
 Responsibilities:
 
 - load `AutoProcessor`
-- load `AutoModel` or `AutoModelForCTC`
+- load `AutoModel`
 - freeze parameters
 - run on requested device and dtype
 - expose one method for batched waveform encoding
 
-Expected outputs for v1:
+Current outputs:
 
 - pooled teacher hidden state per utterance
-- optional raw hidden states for future framewise KD
+- raw hidden states for future framewise KD
 
-Suggested API:
+API:
 
 ```python
 class FrozenAudioTeacher:
@@ -108,52 +118,55 @@ class FrozenAudioTeacher:
 
 ### 3. Thread raw waveform through data loading
 
+Status: done
+
 Files:
 
 - `squeezeformer_pytorch/data.py`
 
-Current dataset code loads waveform only to compute features, then drops it.
+Implemented:
 
-Change `ASRDataset` to optionally return waveform metadata when `audio_teacher` is enabled:
+- `return_waveforms: bool = False` in `ASRDataset`
+- optional return of:
+  - `waveform`
+  - `waveform_length`
+  - `sample_rate`
+- mono waveform conversion for simpler teacher batching
+- reuse of the same augmented waveform for student features and teacher audio when augmentation is enabled
 
-- `waveform`
-- `waveform_length`
-- `sample_rate`
-
-Implementation notes:
-
-- add `return_waveforms: bool = False` to `ASRDataset`
-- keep feature caching behavior unchanged
-- return mono waveform to simplify teacher batching
-- preserve waveform augment behavior so student features and teacher audio see the same augmented sample when augmentation is enabled
+Feature caching remains unchanged.
 
 ### 4. Extend batch collation
 
+Status: done
+
 Files:
 
 - `squeezeformer_pytorch/data.py`
 
-Update `collate_asr_batch` to conditionally include:
+Implemented conditional batch fields:
 
 - `waveforms`
 - `waveform_lengths`
 - `sample_rates`
 
-Waveforms should be padded only when present in batch items.
+Waveforms are padded only when present in all batch items.
 
 ### 5. Extend model with training-only audio teacher projection
+
+Status: next
 
 Files:
 
 - `squeezeformer_pytorch/asr.py`
 
-Add model flags:
+Planned model flags:
 
 - `audio_teacher_enabled`
 - `audio_teacher_hidden_size`
 - `audio_teacher_target`
 
-Add a training-only projection head for student representations:
+Planned training-only head:
 
 - `audio_teacher_projection`
 
@@ -163,19 +176,29 @@ Suggested output key from `forward(..., return_training_outputs=True)`:
 
 - `audio_teacher_student_states`
 
-Do not reuse the `liberta_projection` path. Keep the concerns separate.
+Do not reuse the `liberta_projection` path.
 
 ### 6. Instantiate teacher in train loop
+
+Status: mostly done
 
 Files:
 
 - `train.py`
 
-Instantiate `FrozenAudioTeacher` similarly to how `FrozenLibertaTeacher` is built today.
+Implemented:
 
-Enable waveform-returning dataset mode only when `audio_teacher` is active.
+- `FrozenAudioTeacher` instantiation in `train.py`
+- teacher device resolution similar to `liberta`
+- waveform-returning dataset mode only when `audio_teacher` is active
+
+Remaining:
+
+- actually use teacher outputs inside the loss path
 
 ### 7. Add training loss
+
+Status: next
 
 Files:
 
@@ -190,7 +213,7 @@ After student forward pass:
 Loss options for v1:
 
 - normalized `MSE`
-- cosine embedding style loss
+- cosine-style loss
 
 Recommended default:
 
@@ -202,11 +225,13 @@ Apply:
 loss = loss + args.audio_teacher_weight * audio_teacher_loss
 ```
 
-Track separately in logs:
+Track separately:
 
 - `train_audio_teacher_loss`
 
 ### 8. Mirror the loss in validation
+
+Status: pending
 
 Files:
 
@@ -222,25 +247,26 @@ Compute and report:
 - `audio_teacher_loss`
 - teacher timing
 
-Include in Trackio and validation report payloads.
-
 ### 9. Strip teacher-only weights from inference export
+
+Status: partially done
 
 Files:
 
 - `squeezeformer_pytorch/training/runtime.py`
 
-Update inference checkpoint export so it removes:
+Implemented:
 
-- `audio_teacher_projection.*`
+- inference export removes `audio_teacher_projection.*`
+- exported `training_args["audio_teacher"] = False`
 
-Also force training args for exported inference payload to disable:
+Remaining:
 
-- `audio_teacher`
-
-Inference artifacts must remain teacher-free.
+- verify end-to-end once `audio_teacher_projection` exists
 
 ### 10. Runtime metadata compatibility
+
+Status: pending
 
 Files:
 
@@ -251,6 +277,8 @@ Ensure new training args deserialize safely, but inference does not require teac
 
 ### 11. Tests
 
+Status: started
+
 Files:
 
 - `tests/test_training_data_loading.py`
@@ -258,10 +286,14 @@ Files:
 - `tests/test_training_evaluation.py`
 - `tests/test_inference.py`
 
-Add tests for:
+Implemented so far:
 
+- CLI flag parsing for `audio_teacher`
 - waveform-returning dataset mode
 - waveform-aware batch collation
+
+Still needed:
+
 - model forward returning `audio_teacher_student_states`
 - training/eval logging of teacher loss
 - inference export stripping teacher-only weights
@@ -269,15 +301,21 @@ Add tests for:
 
 ## Recommended Delivery Order
 
+Completed:
+
 1. CLI and training-arg plumbing
 2. dataset waveform threading
 3. collate waveform batching
 4. frozen teacher runtime
+
+Remaining:
+
 5. model projection head
 6. training loss integration
 7. validation integration
-8. checkpoint export cleanup
-9. tests
+8. checkpoint export cleanup verification
+9. inference/evaluation runtime metadata cleanup
+10. tests
 
 ## v1 Success Criteria
 
