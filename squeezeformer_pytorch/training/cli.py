@@ -71,6 +71,8 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
 
     requested_device = resolve_device(args.device)
     _validate_device_ready(requested_device)
+    liberta_device = resolve_device(args.liberta_device)
+    _validate_device_ready(liberta_device)
 
     positive_int_arguments = {
         "--batch-size": args.batch_size,
@@ -353,6 +355,12 @@ def parse_args() -> argparse.Namespace:
         type=_validate_device_argument,
         required=True,
         help="Execution device, for example 'cpu', 'cuda', or 'cuda:0'.",
+    )
+    parser.add_argument(
+        "--liberta-device",
+        type=_validate_device_argument,
+        default="cpu",
+        help="Execution device for the optional LiBERTa teacher, for example 'cpu' or 'cuda:1'.",
     )
     parser.add_argument(
         "--optimizer",

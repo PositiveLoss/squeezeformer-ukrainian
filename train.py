@@ -498,12 +498,13 @@ def main() -> None:
             )
         )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
+    liberta_device = resolve_device(args.liberta_device)
     liberta_teacher = (
         FrozenLibertaTeacher(
             str(Path(liberta_model_path).expanduser().resolve())
             if liberta_model_path is not None
             else liberta_model_name,
-            device=device,
+            device=liberta_device,
             dtype=_resolve_model_load_dtype(args.dtype),
             max_length=liberta_max_length,
         )
