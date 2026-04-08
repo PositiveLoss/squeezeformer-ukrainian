@@ -843,6 +843,35 @@ def test_parse_args_supports_max_batch_duration_sec(monkeypatch: pytest.MonkeyPa
     assert args.max_batch_duration_sec == 12.5
 
 
+def test_parse_args_supports_audio_teacher_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train.py",
+            "--device",
+            "cpu",
+            "--audio-teacher",
+            "--audio-teacher-model-name",
+            "facebook/wav2vec2-bert-2.0",
+            "--audio-teacher-device",
+            "cpu",
+            "--audio-teacher-weight",
+            "0.2",
+            "--audio-teacher-layer",
+            "5",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.audio_teacher is True
+    assert args.audio_teacher_model_name == "facebook/wav2vec2-bert-2.0"
+    assert args.audio_teacher_device == "cpu"
+    assert args.audio_teacher_weight == pytest.approx(0.2)
+    assert args.audio_teacher_layer == 5
+
+
 def test_parse_args_supports_alignment_filter_thresholds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1829,6 +1858,75 @@ def test_collate_asr_batch_filters_invalid_items() -> None:
     assert batch is not None
     assert batch["features"].shape == (1, 4, 80)
     assert batch["feature_lengths"].tolist() == [4]
+
+
+def test_collate_asr_batch_includes_waveforms_when_present() -> None:
+    batch = collate_asr_batch(
+        [
+            {
+                "features": torch.ones(4, 80),
+                "feature_length": 4,
+                "targets": torch.tensor([1, 2], dtype=torch.long),
+                "target_length": 2,
+                "transcript": "це тест",
+                "utterance_id": "utt0",
+                "speaker_id": None,
+                "has_speaker_id": False,
+                "waveform": torch.tensor([0.0, 1.0, 2.0], dtype=torch.float32),
+                "waveform_length": 3,
+                "sample_rate": 16_000,
+            },
+            {
+                "features": torch.ones(2, 80),
+                "feature_length": 2,
+                "targets": torch.tensor([3], dtype=torch.long),
+                "target_length": 1,
+                "transcript": "тест",
+                "utterance_id": "utt1",
+                "speaker_id": "spk1",
+                "has_speaker_id": True,
+                "waveform": torch.tensor([4.0, 5.0], dtype=torch.float32),
+                "waveform_length": 2,
+                "sample_rate": 16_000,
+            },
+        ]
+    )
+
+    assert batch is not None
+    assert batch["waveforms"].shape == (2, 3)
+    assert batch["waveform_lengths"].tolist() == [3, 2]
+    assert batch["sample_rates"].tolist() == [16_000, 16_000]
+    assert batch["waveforms"][1].tolist() == [4.0, 5.0, 0.0]
+
+
+def test_asr_dataset_returns_waveform_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyTokenizer:
+        def encode(self, text: str) -> list[int]:
+            return [len(text)]
+
+    def fake_load_audio(
+        audio_path: str | None, audio_bytes: bytes | None
+    ) -> tuple[torch.Tensor, int]:
+        del audio_path, audio_bytes
+        return torch.tensor([[1.0, 3.0, 5.0], [3.0, 5.0, 7.0]], dtype=torch.float32), 16_000
+
+    monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
+
+    dataset = ASRDataset(
+        records=[AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        tokenizer=DummyTokenizer(),
+        featurizer=AudioFeaturizer(),
+        return_waveforms=True,
+    )
+
+    item = dataset[0]
+
+    assert item is not None
+    assert torch.equal(item["waveform"], torch.tensor([2.0, 4.0, 6.0], dtype=torch.float32))
+    assert item["waveform_length"] == 3
+    assert item["sample_rate"] == 16_000
 
 
 def test_aed_cross_entropy_loss_matches_transposed_reference() -> None:

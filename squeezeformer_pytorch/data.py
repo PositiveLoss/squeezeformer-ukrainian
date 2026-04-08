@@ -1094,6 +1094,7 @@ class ASRDataset(Dataset[dict[str, Any]]):
         specaugment: SpecAugment | None = None,
         waveform_augment: WaveformAugment | None = None,
         feature_cache_dir: str | Path | None = None,
+        return_waveforms: bool = False,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
@@ -1101,21 +1102,25 @@ class ASRDataset(Dataset[dict[str, Any]]):
         self.specaugment = specaugment
         self.waveform_augment = waveform_augment
         self.feature_cache_dir = Path(feature_cache_dir) if feature_cache_dir is not None else None
+        self.return_waveforms = return_waveforms
         if self.feature_cache_dir is not None:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _feature_cache_path(self, record: AudioRecord) -> Path | None:
         return feature_cache_path(self.feature_cache_dir, record.utterance_id, self.featurizer)
 
-    def _compute_features(
+    def _load_waveform(
         self,
         record: AudioRecord,
         *,
         waveform_augment_enabled: bool,
-    ) -> Tensor:
+    ) -> tuple[Tensor, int]:
         waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
         if waveform_augment_enabled and self.waveform_augment is not None:
             waveform, sample_rate = self.waveform_augment(waveform, sample_rate)
+        return waveform, sample_rate
+
+    def _compute_features_from_waveform(self, waveform: Tensor, sample_rate: int) -> Tensor:
         return self.featurizer(waveform, sample_rate)
 
     def __len__(self) -> int:
@@ -1127,6 +1132,8 @@ class ASRDataset(Dataset[dict[str, Any]]):
         waveform_augment_enabled = (
             self.waveform_augment is not None and self.waveform_augment.is_enabled()
         )
+        waveform: Tensor | None = None
+        sample_rate: int | None = None
         use_cache = cache_path is not None and not waveform_augment_enabled
         if use_cache and cache_path.exists():
             features = torch.load(cache_path, map_location="cpu")
@@ -1143,17 +1150,19 @@ class ASRDataset(Dataset[dict[str, Any]]):
                     int(record.estimated_frames),
                 )
                 cache_path.unlink(missing_ok=True)
-                features = self._compute_features(
+                waveform, sample_rate = self._load_waveform(
                     record,
                     waveform_augment_enabled=waveform_augment_enabled,
                 )
+                features = self._compute_features_from_waveform(waveform, sample_rate)
                 if use_cache:
                     torch.save(features, cache_path)
         else:
-            features = self._compute_features(
+            waveform, sample_rate = self._load_waveform(
                 record,
                 waveform_augment_enabled=waveform_augment_enabled,
             )
+            features = self._compute_features_from_waveform(waveform, sample_rate)
             if use_cache:
                 torch.save(features, cache_path)
         features = normalize_feature_tensor(features, self.featurizer.n_mels)
@@ -1174,7 +1183,7 @@ class ASRDataset(Dataset[dict[str, Any]]):
         if self.specaugment is not None:
             features = self.specaugment(features)
         target_ids = torch.tensor(self.tokenizer.encode(record.transcript), dtype=torch.long)
-        return {
+        batch_item = {
             "features": features,
             "feature_length": features.size(0),
             "targets": target_ids,
@@ -1184,6 +1193,21 @@ class ASRDataset(Dataset[dict[str, Any]]):
             "speaker_id": record.speaker_id,
             "has_speaker_id": record.has_speaker_id,
         }
+        if self.return_waveforms:
+            if waveform is None or sample_rate is None:
+                waveform, sample_rate = self._load_waveform(
+                    record,
+                    waveform_augment_enabled=waveform_augment_enabled,
+                )
+            mono_waveform = waveform.mean(dim=0) if waveform.dim() > 1 else waveform.reshape(-1)
+            batch_item.update(
+                {
+                    "waveform": mono_waveform.contiguous(),
+                    "waveform_length": int(mono_waveform.numel()),
+                    "sample_rate": int(sample_rate),
+                }
+            )
+        return batch_item
 
 
 class LengthBucketBatchSampler(BatchSampler):
@@ -1481,6 +1505,13 @@ def collate_asr_batch(batch: list[dict[str, Any] | None]) -> dict[str, Any] | No
     utterance_ids = []
     speaker_ids = []
     has_speaker_ids = []
+    include_waveforms = all("waveform" in item for item in batch)
+    padded_waveforms = []
+    waveform_lengths = []
+    sample_rates = []
+    max_waveform_length = (
+        max(int(item["waveform_length"]) for item in batch) if include_waveforms else 0
+    )
     for item in batch:
         feature = item["features"]
         if feature.size(0) < max_feature_length:
@@ -1491,8 +1522,15 @@ def collate_asr_batch(batch: list[dict[str, Any] | None]) -> dict[str, Any] | No
         utterance_ids.append(item["utterance_id"])
         speaker_ids.append(item["speaker_id"])
         has_speaker_ids.append(item["has_speaker_id"])
+        if include_waveforms:
+            waveform = item["waveform"]
+            if waveform.numel() < max_waveform_length:
+                waveform = F.pad(waveform, (0, max_waveform_length - waveform.numel()))
+            padded_waveforms.append(waveform)
+            waveform_lengths.append(int(item["waveform_length"]))
+            sample_rates.append(int(item["sample_rate"]))
 
-    return {
+    collated = {
         "features": torch.stack(padded_features, dim=0),
         "feature_lengths": feature_lengths,
         "targets": torch.cat(targets, dim=0),
@@ -1502,6 +1540,11 @@ def collate_asr_batch(batch: list[dict[str, Any] | None]) -> dict[str, Any] | No
         "speaker_ids": speaker_ids,
         "has_speaker_ids": has_speaker_ids,
     }
+    if include_waveforms:
+        collated["waveforms"] = torch.stack(padded_waveforms, dim=0)
+        collated["waveform_lengths"] = torch.tensor(waveform_lengths, dtype=torch.long)
+        collated["sample_rates"] = torch.tensor(sample_rates, dtype=torch.long)
+    return collated
 
 
 def create_dataloader(

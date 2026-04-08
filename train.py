@@ -61,6 +61,7 @@ from squeezeformer_pytorch.training.evaluation import (
 )
 from squeezeformer_pytorch.training.runtime import (
     ExponentialMovingAverage,
+    FrozenAudioTeacher,
     FrozenLibertaTeacher,
     _autocast_context,
     _build_fp8_recipe,
@@ -73,6 +74,7 @@ from squeezeformer_pytorch.training.runtime import (
     _peak_process_memory_bytes,
     _read_proc_status_memory_bytes,
     _resolve_aed_settings,
+    _resolve_audio_teacher_settings,
     _resolve_blank_pruning_settings,
     _resolve_intermediate_ctc_settings,
     _resolve_liberta_settings,
@@ -325,6 +327,20 @@ def main() -> None:
         checkpoint,
         aed_enabled=aed_decoder_enabled,
     )
+    (
+        audio_teacher_enabled,
+        audio_teacher_model_name,
+        audio_teacher_model_path,
+        audio_teacher_weight,
+        audio_teacher_objective,
+        audio_teacher_target,
+        audio_teacher_layer,
+        audio_teacher_sample_rate,
+        audio_teacher_max_seconds,
+    ) = _resolve_audio_teacher_settings(
+        args,
+        checkpoint,
+    )
     stage_start_time = time.perf_counter()
     logger.info(
         "preparing tokenizer mode=%s resume=%s tokenizer_path=%s",
@@ -456,12 +472,14 @@ def main() -> None:
         specaugment=specaugment,
         waveform_augment=waveform_augment,
         feature_cache_dir=train_feature_cache_dir,
+        return_waveforms=audio_teacher_enabled,
     )
     val_dataset = ASRDataset(
         local_val_records,
         tokenizer=tokenizer,
         featurizer=featurizer,
         feature_cache_dir=val_feature_cache_dir,
+        return_waveforms=audio_teacher_enabled,
     )
     stage_start_time = time.perf_counter()
     logger.info(
@@ -561,6 +579,15 @@ def main() -> None:
     args.liberta_model_path = liberta_model_path
     args.liberta_distill_weight = liberta_distill_weight
     args.liberta_max_length = liberta_max_length
+    args.audio_teacher = audio_teacher_enabled
+    args.audio_teacher_model_name = audio_teacher_model_name
+    args.audio_teacher_model_path = audio_teacher_model_path
+    args.audio_teacher_weight = audio_teacher_weight
+    args.audio_teacher_objective = audio_teacher_objective
+    args.audio_teacher_target = audio_teacher_target
+    args.audio_teacher_layer = audio_teacher_layer
+    args.audio_teacher_sample_rate = audio_teacher_sample_rate
+    args.audio_teacher_max_seconds = audio_teacher_max_seconds
     args.blank_prune = blank_prune_layer is not None and blank_prune_threshold > 0.0
     args.blank_prune_layer = blank_prune_layer
     args.blank_prune_threshold = blank_prune_threshold
@@ -570,13 +597,14 @@ def main() -> None:
         _validate_fp8_runtime(device, encoder_config)
     stage_start_time = time.perf_counter()
     logger.info(
-        "building model variant=%s dtype=%s compile=%s intermediate_ctc_layers=%s aed=%s liberta=%s blank_prune_layer=%s",
+        "building model variant=%s dtype=%s compile=%s intermediate_ctc_layers=%s aed=%s liberta=%s audio_teacher=%s blank_prune_layer=%s",
         args.variant,
         args.dtype,
         args.compile,
         list(intermediate_ctc_layers),
         aed_decoder_enabled,
         liberta_distill_enabled,
+        audio_teacher_enabled,
         blank_prune_layer,
     )
     model = SqueezeformerCTC(
@@ -668,9 +696,37 @@ def main() -> None:
         if liberta_distill_enabled
         else None
     )
+    requested_audio_teacher_device = resolve_device(args.audio_teacher_device)
+    if distributed and requested_audio_teacher_device.type == "cuda":
+        if requested_audio_teacher_device.index not in {None, local_rank}:
+            logger.warning(
+                "--audio-teacher-device %s conflicts with LOCAL_RANK=%s; using cuda:%s for this rank.",
+                args.audio_teacher_device,
+                local_rank,
+                local_rank,
+            )
+        audio_teacher_device = torch.device(f"cuda:{local_rank}")
+    else:
+        audio_teacher_device = requested_audio_teacher_device
+    audio_teacher = (
+        FrozenAudioTeacher(
+            str(Path(audio_teacher_model_path).expanduser().resolve())
+            if audio_teacher_model_path is not None
+            else audio_teacher_model_name,
+            device=audio_teacher_device,
+            dtype=_resolve_model_load_dtype(args.dtype),
+            sample_rate=audio_teacher_sample_rate,
+            layer=audio_teacher_layer,
+            max_seconds=audio_teacher_max_seconds,
+        )
+        if audio_teacher_enabled
+        else None
+    )
     logger.info(
-        "model and auxiliaries ready params=%s elapsed=%s",
+        "model and auxiliaries ready params=%s liberta=%s audio_teacher=%s elapsed=%s",
         sum(parameter.numel() for parameter in model.parameters()),
+        liberta_teacher is not None,
+        audio_teacher is not None,
         _format_elapsed_seconds(time.perf_counter() - stage_start_time),
     )
     ema = (

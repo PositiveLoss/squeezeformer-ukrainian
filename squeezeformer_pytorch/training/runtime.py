@@ -34,9 +34,10 @@ except (ImportError, OSError):
     Format = None
 
 try:
-    from transformers import AutoModel, AutoTokenizer
+    from transformers import AutoModel, AutoProcessor, AutoTokenizer
 except ImportError:
     AutoModel = None
+    AutoProcessor = None
     AutoTokenizer = None
 
 try:
@@ -57,11 +58,14 @@ def _inference_checkpoint_payload(checkpoint: dict[str, object]) -> dict[str, ob
     state_dict = {
         key: value
         for key, value in checkpoint["model_state_dict"].items()
-        if not key.startswith("aed_decoder.") and not key.startswith("liberta_projection.")
+        if not key.startswith("aed_decoder.")
+        and not key.startswith("liberta_projection.")
+        and not key.startswith("audio_teacher_projection.")
     }
     training_args = dict(checkpoint.get("training_args", {}))
     training_args["aed_decoder"] = False
     training_args["liberta_distill"] = False
+    training_args["audio_teacher"] = False
     return {
         "model_state_dict": state_dict,
         "encoder_config": checkpoint["encoder_config"],
@@ -151,6 +155,83 @@ class FrozenLibertaTeacher:
         denom = mask.sum(dim=1).clamp_min(1.0)
         pooled = (hidden * mask).sum(dim=1) / denom
         return pooled
+
+
+class FrozenAudioTeacher:
+    def __init__(
+        self,
+        model_source: str,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        sample_rate: int = 16_000,
+        layer: int = -1,
+        max_seconds: float = 30.0,
+    ) -> None:
+        if AutoModel is None or AutoProcessor is None:
+            raise RuntimeError(
+                "Audio teacher distillation requires transformers. Install the package and rerun."
+            )
+        self.device = device
+        self.sample_rate = int(sample_rate)
+        self.layer = int(layer)
+        self.max_seconds = float(max_seconds)
+        self.processor = AutoProcessor.from_pretrained(model_source, trust_remote_code=True)
+        self.model = AutoModel.from_pretrained(
+            model_source,
+            trust_remote_code=True,
+            dtype=dtype,
+        )
+        self.model.to(device=device, dtype=dtype)
+        self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+        self.hidden_size = int(self.model.config.hidden_size)
+
+    def encode_waveforms(
+        self,
+        waveforms: Tensor,
+        waveform_lengths: Tensor,
+    ) -> dict[str, Tensor]:
+        if waveforms.dim() != 2:
+            raise ValueError(
+                f"Expected padded mono waveforms with shape [batch, time], got {tuple(waveforms.shape)}."
+            )
+        if waveform_lengths.dim() != 1 or waveform_lengths.size(0) != waveforms.size(0):
+            raise ValueError(
+                "waveform_lengths must have shape [batch] matching the waveform batch size."
+            )
+        max_samples = max(1, int(round(self.max_seconds * self.sample_rate)))
+        samples: list[Tensor] = []
+        for waveform, length in zip(waveforms, waveform_lengths, strict=True):
+            trimmed = waveform[: int(length.item())].detach().cpu()
+            if trimmed.numel() > max_samples:
+                trimmed = trimmed[:max_samples]
+            samples.append(trimmed)
+        processed = self.processor(
+            [sample.numpy() for sample in samples],
+            sampling_rate=self.sample_rate,
+            return_tensors="pt",
+            padding=True,
+        )
+        processed = {key: value.to(self.device) for key, value in processed.items()}
+        with torch.inference_mode():
+            outputs = self.model(**processed, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        if hidden_states is None:
+            raise RuntimeError("Audio teacher model did not return hidden states.")
+        teacher_hidden = hidden_states[self.layer]
+        attention_mask = processed.get("attention_mask")
+        if attention_mask is None:
+            pooled = teacher_hidden.mean(dim=1)
+        else:
+            mask = attention_mask.unsqueeze(-1).to(dtype=teacher_hidden.dtype)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            pooled = (teacher_hidden * mask).sum(dim=1) / denom
+        return {
+            "hidden_states": teacher_hidden,
+            "pooled_hidden": pooled,
+        }
 
 
 def _configure_console_logger(
@@ -599,6 +680,66 @@ def _resolve_liberta_settings(
             "--liberta-distill-weight must be > 0 when LiBERTa distillation is enabled."
         )
     return True, model_name, model_path, weight, max_length
+
+
+def _resolve_audio_teacher_settings(
+    args: argparse.Namespace,
+    checkpoint: dict[str, object] | None,
+) -> tuple[bool, str, str | None, float, str, str, int, int, float]:
+    checkpoint_args = checkpoint.get("training_args", {}) if checkpoint is not None else {}
+    checkpoint_enabled = checkpoint_args.get("audio_teacher")
+
+    if args.audio_teacher is False:
+        return (
+            False,
+            args.audio_teacher_model_name,
+            args.audio_teacher_model_path,
+            float(args.audio_teacher_weight),
+            str(args.audio_teacher_objective),
+            str(args.audio_teacher_target),
+            int(args.audio_teacher_layer),
+            int(args.audio_teacher_sample_rate),
+            float(args.audio_teacher_max_seconds),
+        )
+    if args.audio_teacher is None and checkpoint is not None and checkpoint_enabled is not None:
+        enabled = bool(checkpoint_enabled)
+        model_name = str(
+            checkpoint_args.get("audio_teacher_model_name", args.audio_teacher_model_name)
+        )
+        checkpoint_model_path = checkpoint_args.get(
+            "audio_teacher_model_path", args.audio_teacher_model_path
+        )
+        model_path = str(checkpoint_model_path) if checkpoint_model_path is not None else None
+        weight = float(checkpoint_args.get("audio_teacher_weight", args.audio_teacher_weight))
+        objective = str(
+            checkpoint_args.get("audio_teacher_objective", args.audio_teacher_objective)
+        )
+        target = str(checkpoint_args.get("audio_teacher_target", args.audio_teacher_target))
+        layer = int(checkpoint_args.get("audio_teacher_layer", args.audio_teacher_layer))
+        sample_rate = int(
+            checkpoint_args.get("audio_teacher_sample_rate", args.audio_teacher_sample_rate)
+        )
+        max_seconds = float(
+            checkpoint_args.get("audio_teacher_max_seconds", args.audio_teacher_max_seconds)
+        )
+    else:
+        enabled = bool(args.audio_teacher) if args.audio_teacher is not None else False
+        model_name = str(args.audio_teacher_model_name)
+        model_path = args.audio_teacher_model_path
+        weight = float(args.audio_teacher_weight)
+        objective = str(args.audio_teacher_objective)
+        target = str(args.audio_teacher_target)
+        layer = int(args.audio_teacher_layer)
+        sample_rate = int(args.audio_teacher_sample_rate)
+        max_seconds = float(args.audio_teacher_max_seconds)
+
+    if not enabled:
+        return False, model_name, model_path, weight, objective, target, layer, sample_rate, max_seconds
+    if weight <= 0.0:
+        raise ValueError("--audio-teacher-weight must be > 0 when --audio-teacher is enabled.")
+    if objective == "ctc_kl":
+        raise ValueError("Audio teacher objective 'ctc_kl' is not implemented yet.")
+    return True, model_name, model_path, weight, objective, target, layer, sample_rate, max_seconds
 
 
 def _build_aed_targets(

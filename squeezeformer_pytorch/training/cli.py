@@ -73,6 +73,8 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
     _validate_device_ready(requested_device)
     liberta_device = resolve_device(args.liberta_device)
     _validate_device_ready(liberta_device)
+    audio_teacher_device = resolve_device(args.audio_teacher_device)
+    _validate_device_ready(audio_teacher_device)
 
     positive_int_arguments = {
         "--batch-size": args.batch_size,
@@ -90,6 +92,7 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
         "--aed-decoder-layers": args.aed_decoder_layers,
         "--aed-decoder-heads": args.aed_decoder_heads,
         "--liberta-max-length": args.liberta_max_length,
+        "--audio-teacher-sample-rate": args.audio_teacher_sample_rate,
         "--fp8-amax-history-len": args.fp8_amax_history_len,
         "--example-limit": args.example_limit,
         "--n-fft": args.n_fft,
@@ -160,6 +163,7 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
         "--liberta-distill-weight": args.liberta_distill_weight,
         "--blank-prune-threshold": args.blank_prune_threshold,
         "--ema-decay": args.ema_decay,
+        "--audio-teacher-weight": args.audio_teacher_weight,
     }
     for name, value in probability_arguments.items():
         if not 0.0 <= value <= 1.0:
@@ -242,6 +246,16 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
             "--liberta-model-path",
             args.liberta_model_path,
             expected="dir",
+        )
+    if args.audio_teacher_model_path is not None:
+        _validate_existing_local_path_argument(
+            "--audio-teacher-model-path",
+            args.audio_teacher_model_path,
+            expected="dir",
+        )
+    if args.audio_teacher_max_seconds <= 0:
+        raise ValueError(
+            f"--audio-teacher-max-seconds must be > 0, got {args.audio_teacher_max_seconds}."
         )
 
     for source in args.dataset_source or []:
@@ -512,6 +526,39 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--liberta-distill-weight", type=float, default=0.05)
     parser.add_argument("--liberta-max-length", type=int, default=256)
+    parser.add_argument(
+        "--audio-teacher",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--audio-teacher-model-name", default="facebook/wav2vec2-bert-2.0")
+    parser.add_argument(
+        "--audio-teacher-model-path",
+        default=None,
+        help=(
+            "Local directory containing a wav2vec2-bert teacher to load with "
+            "transformers.from_pretrained(). Overrides --audio-teacher-model-name when set."
+        ),
+    )
+    parser.add_argument(
+        "--audio-teacher-device",
+        default="cpu",
+        help="Execution device for the optional audio teacher, for example 'cpu' or 'cuda:1'.",
+    )
+    parser.add_argument("--audio-teacher-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--audio-teacher-objective",
+        default="hidden_mse",
+        choices=["hidden_mse", "hidden_cosine", "ctc_kl"],
+    )
+    parser.add_argument(
+        "--audio-teacher-target",
+        default="encoder",
+        choices=["encoder", "intermediate", "ctc_logits"],
+    )
+    parser.add_argument("--audio-teacher-layer", type=int, default=-1)
+    parser.add_argument("--audio-teacher-sample-rate", type=int, default=16_000)
+    parser.add_argument("--audio-teacher-max-seconds", type=float, default=30.0)
     parser.add_argument("--blank-prune-layer", type=int, default=None)
     parser.add_argument("--blank-prune-threshold", type=float, default=0.0)
     parser.add_argument("--blank-prune-min-keep-frames", type=int, default=1)
