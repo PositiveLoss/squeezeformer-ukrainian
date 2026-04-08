@@ -522,11 +522,16 @@ def main() -> None:
     model.to(device)
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state_dict"])
+    ddp_find_unused_parameters = (
+        blank_prune_layer is not None
+        and blank_prune_threshold > 0.0
+        and blank_prune_layer not in intermediate_ctc_layers
+    )
     if distributed:
         forward_model: nn.Module = DDP(
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
-            find_unused_parameters=blank_prune_layer is not None and blank_prune_threshold > 0.0,
+            find_unused_parameters=ddp_find_unused_parameters,
         )
     else:
         forward_model = torch.compile(model) if args.compile else model
