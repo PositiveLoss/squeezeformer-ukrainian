@@ -196,6 +196,10 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
     assert merged["metrics"]["liberta_distill_loss"] == 7.0
     assert merged["metrics"]["cer"] == 2.0
     assert merged["metrics"]["wer"] == 0.2
+    assert merged["metrics"]["avg_blank_probability"] == 0.0
+    assert merged["metrics"]["decoded_empty_fraction"] == 0.0
+    assert merged["metrics"]["decoded_avg_char_length"] == 1.0
+    assert merged["metrics"]["decoded_avg_word_length"] == 1.0
     assert merged["metrics"]["samples_total"] == 2.0
     assert merged["metrics"]["speaker_count"] == 1.0
     assert merged["metrics"]["speaker_macro_wer"] == 0.25

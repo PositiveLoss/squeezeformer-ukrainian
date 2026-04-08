@@ -138,6 +138,23 @@ def collect_examples(
     return hardest_examples, random_examples
 
 
+def decoding_debug_metrics(hypotheses: list[str]) -> dict[str, float]:
+    if not hypotheses:
+        return {
+            "decoded_empty_fraction": 0.0,
+            "decoded_avg_char_length": 0.0,
+            "decoded_avg_word_length": 0.0,
+        }
+    empty_count = sum(1 for hypothesis in hypotheses if not hypothesis.strip())
+    return {
+        "decoded_empty_fraction": empty_count / len(hypotheses),
+        "decoded_avg_char_length": sum(len(hypothesis) for hypothesis in hypotheses) / len(hypotheses),
+        "decoded_avg_word_length": (
+            sum(len(hypothesis.split()) for hypothesis in hypotheses) / len(hypotheses)
+        ),
+    }
+
+
 def speaker_level_metrics(
     speaker_ids: list[str | None],
     has_speaker_ids: list[bool],
@@ -190,6 +207,8 @@ def _merge_evaluation_shards(
     total_forward_seconds = 0.0
     total_teacher_seconds = 0.0
     total_decode_seconds = 0.0
+    total_blank_probability = 0.0
+    total_decoded_frames = 0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -206,6 +225,8 @@ def _merge_evaluation_shards(
         total_forward_seconds += float(shard.get("total_forward_seconds", 0.0))
         total_teacher_seconds += float(shard.get("total_teacher_seconds", 0.0))
         total_decode_seconds += float(shard.get("total_decode_seconds", 0.0))
+        total_blank_probability += float(shard.get("total_blank_probability", 0.0))
+        total_decoded_frames += int(shard.get("total_decoded_frames", 0))
         references.extend(shard["references"])
         hypotheses.extend(shard["hypotheses"])
         utterance_ids.extend(shard["utterance_ids"])
@@ -221,8 +242,10 @@ def _merge_evaluation_shards(
         "liberta_distill_loss": total_liberta_distill_loss / max(1, total_batches),
         "cer": char_error_rate(references, hypotheses),
         "wer": word_error_rate(references, hypotheses),
+        "avg_blank_probability": total_blank_probability / max(1, total_decoded_frames),
     }
     metrics.update(length_bucket_metrics(references, hypotheses))
+    metrics.update(decoding_debug_metrics(hypotheses))
     speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
     metrics["speaker_count"] = float(speaker_metrics["speaker_count"])
     metrics["speaker_macro_wer"] = float(speaker_metrics["speaker_macro_wer"])
@@ -280,6 +303,8 @@ def evaluate(
     total_forward_seconds = 0.0
     total_teacher_seconds = 0.0
     total_decode_seconds = 0.0
+    total_blank_probability = 0.0
+    total_decoded_frames = 0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -387,6 +412,15 @@ def evaluate(
                 utterance_ids.extend(batch["utterance_ids"])
                 speaker_ids.extend(batch["speaker_ids"])
                 has_speaker_ids.extend(batch["has_speaker_ids"])
+                valid_mask = (
+                    torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(0)
+                    < output_lengths.unsqueeze(1)
+                )
+                blank_probabilities = log_probs[..., tokenizer.blank_id].exp()
+                total_blank_probability += float(
+                    blank_probabilities.masked_select(valid_mask).sum().item()
+                )
+                total_decoded_frames += int(output_lengths.sum().item())
                 decode_start_time = time.perf_counter()
                 decoded_hypotheses = decode_batch(
                     log_probs,
@@ -413,6 +447,8 @@ def evaluate(
         "total_forward_seconds": total_forward_seconds,
         "total_teacher_seconds": total_teacher_seconds,
         "total_decode_seconds": total_decode_seconds,
+        "total_blank_probability": total_blank_probability,
+        "total_decoded_frames": total_decoded_frames,
         "references": references,
         "hypotheses": hypotheses,
         "utterance_ids": utterance_ids,
@@ -716,6 +752,8 @@ def _evaluate_and_checkpoint(
             "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
             "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
             "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
+            "val_avg_blank_prob=%.4f val_empty_hyp_frac=%.4f "
+            "val_avg_hyp_chars=%.2f val_avg_hyp_words=%.2f "
             "best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
             "timing_decode=%.2fs timing_gather=%.2fs timing_checkpoint_export=%.2fs "
             "report=%s latest=%s best=%s averaged=%s"
@@ -730,6 +768,10 @@ def _evaluate_and_checkpoint(
         float(val_metrics["liberta_distill_loss"]),
         float(val_metrics["cer"]),
         float(val_metrics["wer"]),
+        float(val_metrics["avg_blank_probability"]),
+        float(val_metrics["decoded_empty_fraction"]),
+        float(val_metrics["decoded_avg_char_length"]),
+        float(val_metrics["decoded_avg_word_length"]),
         updated_best_val_wer,
         float(validation_timings.get("forward_seconds", 0.0)),
         float(validation_timings.get("teacher_seconds", 0.0)),
