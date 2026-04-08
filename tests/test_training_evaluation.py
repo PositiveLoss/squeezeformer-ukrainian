@@ -163,6 +163,7 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
                 "total_combined_ctc_loss": 8.0,
                 "total_aed_loss": 10.0,
                 "total_liberta_distill_loss": 12.0,
+                "total_audio_teacher_loss": 14.0,
                 "total_batches": 2,
                 "references": ["a"],
                 "hypotheses": ["b"],
@@ -177,6 +178,7 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
                 "total_combined_ctc_loss": 12.0,
                 "total_aed_loss": 14.0,
                 "total_liberta_distill_loss": 16.0,
+                "total_audio_teacher_loss": 18.0,
                 "total_batches": 2,
                 "references": ["c"],
                 "hypotheses": ["d"],
@@ -194,6 +196,7 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
     assert merged["metrics"]["combined_ctc_loss"] == 5.0
     assert merged["metrics"]["aed_loss"] == 6.0
     assert merged["metrics"]["liberta_distill_loss"] == 7.0
+    assert merged["metrics"]["audio_teacher_loss"] == 8.0
     assert merged["metrics"]["cer"] == 2.0
     assert merged["metrics"]["wer"] == 0.2
     assert merged["metrics"]["avg_blank_probability"] == 0.0

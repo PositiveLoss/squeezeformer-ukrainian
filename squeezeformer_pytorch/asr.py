@@ -415,6 +415,9 @@ class SqueezeformerCTC(nn.Module):
         aed_decoder_dropout: float = 0.1,
         liberta_distill_enabled: bool = False,
         liberta_hidden_size: int = 1024,
+        audio_teacher_enabled: bool = False,
+        audio_teacher_hidden_size: int = 1024,
+        audio_teacher_target: str = "encoder",
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
@@ -425,6 +428,8 @@ class SqueezeformerCTC(nn.Module):
         self.blank_prune_min_keep_frames = blank_prune_min_keep_frames
         self.aed_decoder_enabled = aed_decoder_enabled
         self.liberta_distill_enabled = liberta_distill_enabled
+        self.audio_teacher_enabled = audio_teacher_enabled
+        self.audio_teacher_target = audio_teacher_target
         self.use_transformer_engine = use_transformer_engine
         self.encoder = SqueezeformerEncoder(
             encoder_config,
@@ -463,6 +468,11 @@ class SqueezeformerCTC(nn.Module):
         self.liberta_projection = (
             nn.Linear(encoder_config.d_model, liberta_hidden_size)
             if liberta_distill_enabled
+            else None
+        )
+        self.audio_teacher_projection = (
+            nn.Linear(encoder_config.d_model, audio_teacher_hidden_size)
+            if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
 
@@ -766,6 +776,11 @@ class SqueezeformerCTC(nn.Module):
                     self.classifier,
                     encoded,
                 )
+            if self.audio_teacher_projection is not None:
+                output["audio_teacher_student_states"] = self.project_encoder_for_audio_teacher(
+                    encoded,
+                    output_lengths,
+                )
             if decoder_inputs is not None:
                 if self.aed_decoder is None:
                     raise RuntimeError("AED decoder is disabled for this model.")
@@ -845,6 +860,12 @@ class SqueezeformerCTC(nn.Module):
         pooled = mean_pool_sequence(hidden, lengths)
         return self.liberta_projection(pooled)
 
+    def project_encoder_for_audio_teacher(self, hidden: Tensor, lengths: Tensor) -> Tensor:
+        if self.audio_teacher_projection is None:
+            raise RuntimeError("Audio teacher projection head is disabled for this model.")
+        pooled = mean_pool_sequence(hidden, lengths)
+        return self.audio_teacher_projection(pooled)
+
     def load_state_dict(self, state_dict: dict[str, object], strict: bool = True):
         # Backward-compatibility for checkpoints created with a single
         # `intermediate_classifier.*` head before multi-head support landed.
@@ -873,6 +894,12 @@ class SqueezeformerCTC(nn.Module):
                 key: value
                 for key, value in remapped_state_dict.items()
                 if not key.startswith("liberta_projection.")
+            }
+        if self.audio_teacher_projection is None:
+            remapped_state_dict = {
+                key: value
+                for key, value in remapped_state_dict.items()
+                if not key.startswith("audio_teacher_projection.")
             }
         return super().load_state_dict(remapped_state_dict, strict=strict)
 

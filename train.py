@@ -595,6 +595,32 @@ def main() -> None:
     fp8_recipe = _build_fp8_recipe(args)
     if args.dtype == DTypeChoice.FP8:
         _validate_fp8_runtime(device, encoder_config)
+    requested_audio_teacher_device = resolve_device(args.audio_teacher_device)
+    if distributed and requested_audio_teacher_device.type == "cuda":
+        if requested_audio_teacher_device.index not in {None, local_rank}:
+            logger.warning(
+                "--audio-teacher-device %s conflicts with LOCAL_RANK=%s; using cuda:%s for this rank.",
+                args.audio_teacher_device,
+                local_rank,
+                local_rank,
+            )
+        audio_teacher_device = torch.device(f"cuda:{local_rank}")
+    else:
+        audio_teacher_device = requested_audio_teacher_device
+    audio_teacher = (
+        FrozenAudioTeacher(
+            str(Path(audio_teacher_model_path).expanduser().resolve())
+            if audio_teacher_model_path is not None
+            else audio_teacher_model_name,
+            device=audio_teacher_device,
+            dtype=_resolve_model_load_dtype(args.dtype),
+            sample_rate=audio_teacher_sample_rate,
+            layer=audio_teacher_layer,
+            max_seconds=audio_teacher_max_seconds,
+        )
+        if audio_teacher_enabled
+        else None
+    )
     stage_start_time = time.perf_counter()
     logger.info(
         "building model variant=%s dtype=%s compile=%s intermediate_ctc_layers=%s aed=%s liberta=%s audio_teacher=%s blank_prune_layer=%s",
@@ -619,6 +645,11 @@ def main() -> None:
         aed_decoder_heads=aed_decoder_heads,
         aed_decoder_dropout=aed_decoder_dropout,
         liberta_distill_enabled=liberta_distill_enabled,
+        audio_teacher_enabled=audio_teacher is not None,
+        audio_teacher_hidden_size=(
+            audio_teacher.hidden_size if audio_teacher is not None else encoder_config.d_model
+        ),
+        audio_teacher_target=audio_teacher_target,
         use_transformer_engine=args.dtype == DTypeChoice.FP8,
     )
     model.to(device)
@@ -694,32 +725,6 @@ def main() -> None:
             max_length=liberta_max_length,
         )
         if liberta_distill_enabled
-        else None
-    )
-    requested_audio_teacher_device = resolve_device(args.audio_teacher_device)
-    if distributed and requested_audio_teacher_device.type == "cuda":
-        if requested_audio_teacher_device.index not in {None, local_rank}:
-            logger.warning(
-                "--audio-teacher-device %s conflicts with LOCAL_RANK=%s; using cuda:%s for this rank.",
-                args.audio_teacher_device,
-                local_rank,
-                local_rank,
-            )
-        audio_teacher_device = torch.device(f"cuda:{local_rank}")
-    else:
-        audio_teacher_device = requested_audio_teacher_device
-    audio_teacher = (
-        FrozenAudioTeacher(
-            str(Path(audio_teacher_model_path).expanduser().resolve())
-            if audio_teacher_model_path is not None
-            else audio_teacher_model_name,
-            device=audio_teacher_device,
-            dtype=_resolve_model_load_dtype(args.dtype),
-            sample_rate=audio_teacher_sample_rate,
-            layer=audio_teacher_layer,
-            max_seconds=audio_teacher_max_seconds,
-        )
-        if audio_teacher_enabled
         else None
     )
     logger.info(
@@ -820,6 +825,7 @@ def main() -> None:
         running_intermediate_ctc_loss = 0.0
         running_aed_loss = 0.0
         running_liberta_distill_loss = 0.0
+        running_audio_teacher_loss = 0.0
         tune_effective_frames = 0
         tune_padded_frames = 0
         tune_target_tokens = 0
@@ -905,6 +911,7 @@ def main() -> None:
                     aed_logits = forward_outputs.get("aed_logits")
                     aed_hidden = forward_outputs.get("aed_hidden")
                     liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
+                    audio_teacher_student_states = forward_outputs.get("audio_teacher_student_states")
                     if intermediate_ctc_losses_map:
                         intermediate_ctc_loss = torch.stack(
                             [intermediate_ctc_losses_map[layer_index] for layer_index in intermediate_ctc_layers]
@@ -940,6 +947,33 @@ def main() -> None:
                     loss = loss + (args.liberta_distill_weight * liberta_distill_loss)
                 else:
                     liberta_distill_loss = None
+                if audio_teacher is not None and audio_teacher_student_states is not None:
+                    teacher_outputs = audio_teacher.encode_waveforms(
+                        batch["waveforms"],
+                        batch["waveform_lengths"],
+                        sample_rates=batch.get("sample_rates"),
+                    )
+                    teacher_embeddings = teacher_outputs["pooled_hidden"].to(
+                        device=audio_teacher_student_states.device,
+                        dtype=audio_teacher_student_states.dtype,
+                    )
+                    if args.audio_teacher_objective == "hidden_cosine":
+                        audio_teacher_loss = (
+                            1.0
+                            - F.cosine_similarity(
+                                audio_teacher_student_states.float(),
+                                teacher_embeddings.float(),
+                                dim=-1,
+                            )
+                        ).mean()
+                    else:
+                        audio_teacher_loss = F.mse_loss(
+                            F.normalize(audio_teacher_student_states.float(), dim=-1),
+                            F.normalize(teacher_embeddings.float(), dim=-1),
+                        )
+                    loss = loss + (args.audio_teacher_weight * audio_teacher_loss)
+                else:
+                    audio_teacher_loss = None
                 running_loss += float(loss.item())
                 running_main_ctc_loss += float(main_ctc_loss.item())
                 running_intermediate_ctc_loss += float(
@@ -948,6 +982,9 @@ def main() -> None:
                 running_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
                 running_liberta_distill_loss += float(
                     liberta_distill_loss.item() if liberta_distill_loss is not None else 0.0
+                )
+                running_audio_teacher_loss += float(
+                    audio_teacher_loss.item() if audio_teacher_loss is not None else 0.0
                 )
                 scaler.scale(loss / args.gradient_accumulation_steps).backward()
             if should_step:
@@ -1014,6 +1051,11 @@ def main() -> None:
                         device=device,
                         distributed=distributed,
                     )
+                    train_audio_teacher_loss_step = _distributed_mean(
+                        float(audio_teacher_loss.item() if audio_teacher_loss is not None else 0.0),
+                        device=device,
+                        distributed=distributed,
+                    )
                     grad_norm = _distributed_mean(
                         grad_norm,
                         device=device,
@@ -1043,6 +1085,7 @@ def main() -> None:
                             "epoch=%s step=%s/%s global_step=%s train_loss=%.4f "
                             "train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f "
                             "train_aed_loss=%.4f train_liberta_distill_loss=%.4f "
+                            "train_audio_teacher_loss=%.4f "
                             "batch_audio_minutes=%.2f grad_norm=%.4f max_feature_frames=%s %s %s"
                         ),
                         epoch,
@@ -1054,6 +1097,7 @@ def main() -> None:
                         train_intermediate_ctc_loss_step,
                         train_aed_loss_step,
                         train_liberta_distill_loss_step,
+                        train_audio_teacher_loss_step,
                         batch_audio_minutes,
                         grad_norm,
                         max_feature_frames,
@@ -1069,6 +1113,7 @@ def main() -> None:
                             "train_intermediate_ctc_loss_step": train_intermediate_ctc_loss_step,
                             "train_aed_loss_step": train_aed_loss_step,
                             "train_liberta_distill_loss_step": train_liberta_distill_loss_step,
+                            "train_audio_teacher_loss_step": train_audio_teacher_loss_step,
                             "grad_norm": grad_norm,
                             "train_max_feature_frames_step": max_feature_frames,
                             "ema_decay": ema.current_decay() if ema is not None else 0.0,
@@ -1132,6 +1177,11 @@ def main() -> None:
                             device=device,
                             distributed=distributed,
                         ),
+                        "train_audio_teacher_loss": _distributed_mean(
+                            running_audio_teacher_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
+                        ),
                     }
                     if distributed:
                         _distributed_barrier()
@@ -1163,6 +1213,9 @@ def main() -> None:
                         aed_loss_weight=args.aed_loss_weight,
                         liberta_teacher=liberta_teacher,
                         liberta_distill_weight=args.liberta_distill_weight,
+                        audio_teacher=audio_teacher,
+                        audio_teacher_weight=args.audio_teacher_weight,
+                        audio_teacher_objective=args.audio_teacher_objective,
                         ema=ema,
                         train_metrics=train_metrics,
                         epoch=epoch,
@@ -1216,17 +1269,23 @@ def main() -> None:
             device=device,
             distributed=distributed,
         )
+        train_audio_teacher_loss = _distributed_mean(
+            running_audio_teacher_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
         if distributed:
             _distributed_barrier()
         if is_main_process:
             logger.info(
-                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f elapsed=%s, starting validation",
+                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f train_audio_teacher_loss=%.4f elapsed=%s, starting validation",
                 epoch,
                 train_loss,
                 train_main_ctc_loss,
                 train_intermediate_ctc_loss,
                 train_aed_loss,
                 train_liberta_distill_loss,
+                train_audio_teacher_loss,
                 _format_elapsed_seconds(time.perf_counter() - epoch_start_time),
             )
         best_val_wer = _evaluate_and_checkpoint(
@@ -1246,6 +1305,9 @@ def main() -> None:
             aed_loss_weight=args.aed_loss_weight,
             liberta_teacher=liberta_teacher,
             liberta_distill_weight=args.liberta_distill_weight,
+            audio_teacher=audio_teacher,
+            audio_teacher_weight=args.audio_teacher_weight,
+            audio_teacher_objective=args.audio_teacher_objective,
             ema=ema,
             train_metrics={
                 "train_loss": train_loss,
@@ -1253,6 +1315,7 @@ def main() -> None:
                 "train_intermediate_ctc_loss": train_intermediate_ctc_loss,
                 "train_aed_loss": train_aed_loss,
                 "train_liberta_distill_loss": train_liberta_distill_loss,
+                "train_audio_teacher_loss": train_audio_teacher_loss,
             },
             epoch=epoch,
             global_step=global_step,

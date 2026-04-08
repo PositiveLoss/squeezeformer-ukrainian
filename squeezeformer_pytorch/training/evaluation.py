@@ -23,6 +23,7 @@ from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
 from squeezeformer_pytorch.training.runtime import (
     ExponentialMovingAverage,
+    FrozenAudioTeacher,
     FrozenLibertaTeacher,
     _aed_cross_entropy_loss,
     _autocast_context,
@@ -203,6 +204,7 @@ def _merge_evaluation_shards(
     total_combined_ctc_loss = 0.0
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
+    total_audio_teacher_loss = 0.0
     total_batches = 0
     total_forward_seconds = 0.0
     total_teacher_seconds = 0.0
@@ -221,6 +223,7 @@ def _merge_evaluation_shards(
         total_combined_ctc_loss += float(shard["total_combined_ctc_loss"])
         total_aed_loss += float(shard["total_aed_loss"])
         total_liberta_distill_loss += float(shard["total_liberta_distill_loss"])
+        total_audio_teacher_loss += float(shard.get("total_audio_teacher_loss", 0.0))
         total_batches += int(shard["total_batches"])
         total_forward_seconds += float(shard.get("total_forward_seconds", 0.0))
         total_teacher_seconds += float(shard.get("total_teacher_seconds", 0.0))
@@ -240,6 +243,7 @@ def _merge_evaluation_shards(
         "combined_ctc_loss": total_combined_ctc_loss / max(1, total_batches),
         "aed_loss": total_aed_loss / max(1, total_batches),
         "liberta_distill_loss": total_liberta_distill_loss / max(1, total_batches),
+        "audio_teacher_loss": total_audio_teacher_loss / max(1, total_batches),
         "cer": char_error_rate(references, hypotheses),
         "wer": word_error_rate(references, hypotheses),
         "avg_blank_probability": total_blank_probability / max(1, total_decoded_frames),
@@ -288,6 +292,9 @@ def evaluate(
     aed_loss_weight: float = 0.0,
     liberta_teacher: FrozenLibertaTeacher | None = None,
     liberta_distill_weight: float = 0.0,
+    audio_teacher: FrozenAudioTeacher | None = None,
+    audio_teacher_weight: float = 0.0,
+    audio_teacher_objective: str = "hidden_mse",
     distributed: bool = False,
     is_main_process: bool = True,
 ) -> dict[str, object] | None:
@@ -299,6 +306,7 @@ def evaluate(
     total_combined_ctc_loss = 0.0
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
+    total_audio_teacher_loss = 0.0
     total_batches = 0
     total_forward_seconds = 0.0
     total_teacher_seconds = 0.0
@@ -368,6 +376,7 @@ def evaluate(
                     aed_logits = forward_outputs.get("aed_logits")
                     aed_hidden = forward_outputs.get("aed_hidden")
                     liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
+                    audio_teacher_student_states = forward_outputs.get("audio_teacher_student_states")
                     if aed_logits is not None and decoder_targets is not None:
                         aed_loss = _aed_cross_entropy_loss(
                             aed_logits,
@@ -397,6 +406,35 @@ def evaluate(
                     total_teacher_seconds += time.perf_counter() - teacher_start_time
                 else:
                     liberta_distill_loss = None
+                if audio_teacher is not None and audio_teacher_student_states is not None:
+                    teacher_start_time = time.perf_counter()
+                    teacher_outputs = audio_teacher.encode_waveforms(
+                        batch["waveforms"],
+                        batch["waveform_lengths"],
+                        sample_rates=batch.get("sample_rates"),
+                    )
+                    teacher_embeddings = teacher_outputs["pooled_hidden"].to(
+                        device=audio_teacher_student_states.device,
+                        dtype=audio_teacher_student_states.dtype,
+                    )
+                    if audio_teacher_objective == "hidden_cosine":
+                        audio_teacher_loss = (
+                            1.0
+                            - F.cosine_similarity(
+                                audio_teacher_student_states.float(),
+                                teacher_embeddings.float(),
+                                dim=-1,
+                            )
+                        ).mean()
+                    else:
+                        audio_teacher_loss = F.mse_loss(
+                            F.normalize(audio_teacher_student_states.float(), dim=-1),
+                            F.normalize(teacher_embeddings.float(), dim=-1),
+                        )
+                    loss = loss + (audio_teacher_weight * audio_teacher_loss)
+                    total_teacher_seconds += time.perf_counter() - teacher_start_time
+                else:
+                    audio_teacher_loss = None
                 total_loss += float(loss.item())
                 total_main_ctc_loss += float(main_ctc_loss.item())
                 total_intermediate_ctc_loss += float(
@@ -406,6 +444,9 @@ def evaluate(
                 total_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
                 total_liberta_distill_loss += float(
                     liberta_distill_loss.item() if liberta_distill_loss is not None else 0.0
+                )
+                total_audio_teacher_loss += float(
+                    audio_teacher_loss.item() if audio_teacher_loss is not None else 0.0
                 )
                 total_batches += 1
                 references.extend(batch["transcripts"])
@@ -443,6 +484,7 @@ def evaluate(
         "total_combined_ctc_loss": total_combined_ctc_loss,
         "total_aed_loss": total_aed_loss,
         "total_liberta_distill_loss": total_liberta_distill_loss,
+        "total_audio_teacher_loss": total_audio_teacher_loss,
         "total_batches": total_batches,
         "total_forward_seconds": total_forward_seconds,
         "total_teacher_seconds": total_teacher_seconds,
@@ -581,6 +623,9 @@ def _evaluate_and_checkpoint(
     aed_loss_weight: float,
     liberta_teacher: FrozenLibertaTeacher | None,
     liberta_distill_weight: float,
+    audio_teacher: FrozenAudioTeacher | None,
+    audio_teacher_weight: float,
+    audio_teacher_objective: str,
     ema: ExponentialMovingAverage | None,
     train_metrics: dict[str, float],
     epoch: int,
@@ -619,6 +664,9 @@ def _evaluate_and_checkpoint(
         aed_loss_weight=aed_loss_weight,
         liberta_teacher=liberta_teacher,
         liberta_distill_weight=liberta_distill_weight,
+        audio_teacher=audio_teacher,
+        audio_teacher_weight=audio_teacher_weight,
+        audio_teacher_objective=audio_teacher_objective,
         distributed=distributed,
         is_main_process=is_main_process,
     )
@@ -751,7 +799,7 @@ def _evaluate_and_checkpoint(
             "%s complete train_loss=%.4f val_loss=%.4f "
             "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
             "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
-            "val_liberta_distill_loss=%.4f val_cer=%.4f val_wer=%.4f "
+            "val_liberta_distill_loss=%.4f val_audio_teacher_loss=%.4f val_cer=%.4f val_wer=%.4f "
             "val_avg_blank_prob=%.4f val_empty_hyp_frac=%.4f "
             "val_avg_hyp_chars=%.2f val_avg_hyp_words=%.2f "
             "best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
@@ -766,6 +814,7 @@ def _evaluate_and_checkpoint(
         float(val_metrics["combined_ctc_loss"]),
         float(val_metrics["aed_loss"]),
         float(val_metrics["liberta_distill_loss"]),
+        float(val_metrics["audio_teacher_loss"]),
         float(val_metrics["cer"]),
         float(val_metrics["wer"]),
         float(val_metrics["avg_blank_probability"]),

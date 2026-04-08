@@ -119,6 +119,32 @@ def test_flash_attention_backend_forward_shapes() -> None:
         output_lengths,
         torch.tensor([expected_subsampled_length(160), expected_subsampled_length(123)]),
     )
+
+
+def test_squeezeformer_training_outputs_include_audio_teacher_states() -> None:
+    config = squeezeformer_variant("xs")
+    model = SqueezeformerCTC(
+        encoder_config=config,
+        vocab_size=8,
+        audio_teacher_enabled=True,
+        audio_teacher_hidden_size=24,
+    )
+    features = torch.randn(2, 48, 80)
+    feature_lengths = torch.tensor([48, 40], dtype=torch.long)
+    targets = torch.tensor([1, 2, 3, 1, 2], dtype=torch.long)
+    target_lengths = torch.tensor([3, 2], dtype=torch.long)
+
+    outputs = model(
+        features,
+        feature_lengths,
+        return_training_outputs=True,
+        targets=targets,
+        target_lengths=target_lengths,
+        blank_id=0,
+    )
+
+    assert "audio_teacher_student_states" in outputs
+    assert outputs["audio_teacher_student_states"].shape == (2, 24)
     assert torch.isfinite(outputs).all()
 
 

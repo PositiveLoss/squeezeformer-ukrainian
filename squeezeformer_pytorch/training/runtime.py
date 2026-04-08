@@ -13,6 +13,7 @@ from typing import NamedTuple
 
 import torch
 import trackio
+import torchaudio
 from torch import Tensor, nn
 from torch.nn import functional as F
 
@@ -192,6 +193,8 @@ class FrozenAudioTeacher:
         self,
         waveforms: Tensor,
         waveform_lengths: Tensor,
+        *,
+        sample_rates: Tensor | None = None,
     ) -> dict[str, Tensor]:
         if waveforms.dim() != 2:
             raise ValueError(
@@ -203,8 +206,17 @@ class FrozenAudioTeacher:
             )
         max_samples = max(1, int(round(self.max_seconds * self.sample_rate)))
         samples: list[Tensor] = []
-        for waveform, length in zip(waveforms, waveform_lengths, strict=True):
+        for batch_index, (waveform, length) in enumerate(zip(waveforms, waveform_lengths, strict=True)):
             trimmed = waveform[: int(length.item())].detach().cpu()
+            source_sample_rate = self.sample_rate
+            if sample_rates is not None:
+                source_sample_rate = int(sample_rates[batch_index].item())
+            if source_sample_rate != self.sample_rate:
+                trimmed = torchaudio.functional.resample(
+                    trimmed.unsqueeze(0),
+                    source_sample_rate,
+                    self.sample_rate,
+                ).squeeze(0)
             if trimmed.numel() > max_samples:
                 trimmed = trimmed[:max_samples]
             samples.append(trimmed)

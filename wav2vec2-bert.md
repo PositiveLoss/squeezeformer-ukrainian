@@ -36,14 +36,14 @@ Implemented:
 - optional waveform return from `ASRDataset`
 - waveform-aware `collate_asr_batch`
 - train-loop teacher instantiation and device resolution
+- student projection head in `SqueezeformerCTC`
+- training loss integration
+- validation loss integration
 - inference export stripping `audio_teacher_projection.*` and forcing `audio_teacher=False`
 - initial tests for CLI parsing and waveform batching
 
 Not implemented yet:
 
-- student projection head in `SqueezeformerCTC`
-- training loss integration
-- validation loss integration
 - inference/evaluation runtime metadata cleanup
 - full test coverage beyond the initial waveform and CLI checks
 
@@ -154,7 +154,7 @@ Waveforms are padded only when present in all batch items.
 
 ### 5. Extend model with training-only audio teacher projection
 
-Status: next
+Status: done
 
 Files:
 
@@ -180,7 +180,7 @@ Do not reuse the `liberta_projection` path.
 
 ### 6. Instantiate teacher in train loop
 
-Status: mostly done
+Status: done
 
 Files:
 
@@ -192,13 +192,9 @@ Implemented:
 - teacher device resolution similar to `liberta`
 - waveform-returning dataset mode only when `audio_teacher` is active
 
-Remaining:
-
-- actually use teacher outputs inside the loss path
-
 ### 7. Add training loss
 
-Status: next
+Status: done
 
 Files:
 
@@ -231,7 +227,7 @@ Track separately:
 
 ### 8. Mirror the loss in validation
 
-Status: pending
+Status: done
 
 Files:
 
@@ -291,6 +287,8 @@ Implemented so far:
 - CLI flag parsing for `audio_teacher`
 - waveform-returning dataset mode
 - waveform-aware batch collation
+- model forward returning `audio_teacher_student_states`
+- evaluation shard merge covering `audio_teacher_loss`
 
 Still needed:
 
@@ -310,12 +308,9 @@ Completed:
 
 Remaining:
 
-5. model projection head
-6. training loss integration
-7. validation integration
-8. checkpoint export cleanup verification
-9. inference/evaluation runtime metadata cleanup
-10. tests
+5. checkpoint export cleanup verification
+6. inference/evaluation runtime metadata cleanup
+7. tests
 
 ## v1 Success Criteria
 
