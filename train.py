@@ -746,6 +746,7 @@ def main() -> None:
                         target_lengths=target_lengths,
                         blank_id=tokenizer.blank_id,
                         decoder_inputs=decoder_inputs,
+                        liberta_lengths=decoder_target_lengths,
                     )
                     encoded = forward_outputs["encoded"]
                     output_lengths = forward_outputs["output_lengths"]
@@ -753,6 +754,7 @@ def main() -> None:
                     intermediate_ctc_losses_map = forward_outputs["intermediate_ctc_losses"]
                     aed_logits = forward_outputs.get("aed_logits")
                     aed_hidden = forward_outputs.get("aed_hidden")
+                    liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
                     if intermediate_ctc_losses_map:
                         intermediate_ctc_loss = torch.stack(
                             [intermediate_ctc_losses_map[layer_index] for layer_index in intermediate_ctc_layers]
@@ -775,16 +777,14 @@ def main() -> None:
                         aed_hidden = None
                 if (
                     liberta_teacher is not None
-                    and aed_hidden is not None
-                    and decoder_target_lengths is not None
+                    and liberta_student_embeddings is not None
                 ):
-                    teacher_embeddings = liberta_teacher.encode(batch["transcripts"])
-                    student_embeddings = model.project_aed_hidden_for_liberta(
-                        aed_hidden,
-                        decoder_target_lengths,
+                    teacher_embeddings = liberta_teacher.encode(batch["transcripts"]).to(
+                        device=liberta_student_embeddings.device,
+                        dtype=liberta_student_embeddings.dtype,
                     )
                     liberta_distill_loss = F.mse_loss(
-                        F.normalize(student_embeddings.float(), dim=-1),
+                        F.normalize(liberta_student_embeddings.float(), dim=-1),
                         F.normalize(teacher_embeddings.float(), dim=-1),
                     )
                     loss = loss + (args.liberta_distill_weight * liberta_distill_loss)

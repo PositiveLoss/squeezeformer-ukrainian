@@ -231,6 +231,7 @@ def evaluate(
                     blank_id=tokenizer.blank_id,
                     return_main_log_probs=True,
                     decoder_inputs=decoder_inputs,
+                    liberta_lengths=decoder_target_lengths,
                 )
                 encoded = forward_outputs["encoded"]
                 output_lengths = forward_outputs["output_lengths"]
@@ -249,6 +250,7 @@ def evaluate(
                     combined_ctc_loss = main_ctc_loss
                 aed_logits = forward_outputs.get("aed_logits")
                 aed_hidden = forward_outputs.get("aed_hidden")
+                liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
                 if aed_logits is not None and decoder_targets is not None:
                     aed_loss = _aed_cross_entropy_loss(
                         aed_logits,
@@ -262,16 +264,14 @@ def evaluate(
                     loss = combined_ctc_loss
             if (
                 liberta_teacher is not None
-                and aed_hidden is not None
-                and decoder_target_lengths is not None
+                and liberta_student_embeddings is not None
             ):
-                teacher_embeddings = liberta_teacher.encode(batch["transcripts"])
-                student_embeddings = model.project_aed_hidden_for_liberta(
-                    aed_hidden,
-                    decoder_target_lengths,
+                teacher_embeddings = liberta_teacher.encode(batch["transcripts"]).to(
+                    device=liberta_student_embeddings.device,
+                    dtype=liberta_student_embeddings.dtype,
                 )
                 liberta_distill_loss = F.mse_loss(
-                    F.normalize(student_embeddings.float(), dim=-1),
+                    F.normalize(liberta_student_embeddings.float(), dim=-1),
                     F.normalize(teacher_embeddings.float(), dim=-1),
                 )
                 loss = loss + (liberta_distill_weight * liberta_distill_loss)

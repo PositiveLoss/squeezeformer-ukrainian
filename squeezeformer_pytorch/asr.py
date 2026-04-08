@@ -702,6 +702,7 @@ class SqueezeformerCTC(nn.Module):
         blank_id: int | None = None,
         return_main_log_probs: bool = False,
         decoder_inputs: Tensor | None = None,
+        liberta_lengths: Tensor | None = None,
     ) -> tuple[Tensor, Tensor] | dict[str, Any]:
         if return_training_outputs or decoder_inputs is not None:
             if targets is not None and target_lengths is not None and blank_id is not None:
@@ -745,6 +746,11 @@ class SqueezeformerCTC(nn.Module):
                 aed_logits, aed_hidden = self.aed_decoder(encoded, output_lengths, decoder_inputs)
                 output["aed_logits"] = aed_logits
                 output["aed_hidden"] = aed_hidden
+                if liberta_lengths is not None and self.liberta_projection is not None:
+                    output["liberta_student_embeddings"] = self.project_aed_hidden_for_liberta(
+                        aed_hidden,
+                        liberta_lengths,
+                    )
             return output
         if self.blank_prune_layer is not None and self.blank_prune_threshold > 0.0:
             encoded, output_lengths, _, _ = self.encoder.forward_with_intermediates(
