@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -462,7 +463,6 @@ def main() -> None:
         )
     else:
         forward_model = torch.compile(model) if args.compile else model
-    aux_model = model
     use_grad_scaler = device.type == "cuda" and args.dtype == DTypeChoice.FLOAT16
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
@@ -615,6 +615,9 @@ def main() -> None:
             if batch is None:
                 logger.warning("skipping empty training batch after dataset filtering")
                 continue
+            should_step = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(
+                train_loader
+            )
             if (batch_index - 1) % args.gradient_accumulation_steps == 0:
                 tune_effective_frames = 0
                 tune_padded_frames = 0
@@ -662,91 +665,93 @@ def main() -> None:
                 decoder_targets = None
                 decoder_target_lengths = None
 
-            with _autocast_context(device, args.dtype, fp8_recipe=fp8_recipe):
-                encoded, output_lengths, intermediate_encoded, intermediate_output_lengths = (
-                    aux_model.encode_with_intermediates(features, feature_lengths)
-                )
-                main_log_probs, intermediate_log_probs_map = aux_model.ctc_log_probs_from_encoded(
-                    encoded,
-                    intermediate_encoded,
-                )
-                main_ctc_loss = criterion(
-                    main_log_probs.float().transpose(0, 1),
-                    targets,
-                    output_lengths,
-                    target_lengths,
-                )
-                del main_log_probs
-                if intermediate_encoded and intermediate_output_lengths:
-                    intermediate_ctc_losses = []
-                    for layer_index in intermediate_ctc_layers:
-                        intermediate_log_probs = intermediate_log_probs_map[layer_index]
-                        intermediate_ctc_losses.append(
-                            criterion(
-                                intermediate_log_probs.float().transpose(0, 1),
-                                targets,
-                                intermediate_output_lengths[layer_index],
-                                target_lengths,
-                            )
-                        )
-                        del intermediate_log_probs
-                    intermediate_ctc_loss = torch.stack(intermediate_ctc_losses).mean()
-                    loss = (
-                        1.0 - intermediate_ctc_weight
-                    ) * main_ctc_loss + intermediate_ctc_weight * intermediate_ctc_loss
-                else:
-                    intermediate_ctc_loss = None
-                    loss = main_ctc_loss
-                if (
-                    aed_decoder_enabled
-                    and decoder_inputs is not None
-                    and decoder_targets is not None
-                ):
-                    aed_logits, aed_hidden = aux_model.aed_from_encoded(
+            sync_context = (
+                forward_model.no_sync()
+                if distributed and not should_step and isinstance(forward_model, DDP)
+                else nullcontext()
+            )
+            with sync_context:
+                with _autocast_context(device, args.dtype, fp8_recipe=fp8_recipe):
+                    forward_outputs = forward_model(
+                        features,
+                        feature_lengths,
+                        return_training_outputs=True,
+                        decoder_inputs=decoder_inputs,
+                    )
+                    encoded = forward_outputs["encoded"]
+                    output_lengths = forward_outputs["output_lengths"]
+                    intermediate_encoded = forward_outputs["intermediate_encoded"]
+                    intermediate_output_lengths = forward_outputs["intermediate_output_lengths"]
+                    aed_logits = forward_outputs.get("aed_logits")
+                    aed_hidden = forward_outputs.get("aed_hidden")
+                    main_log_probs, intermediate_log_probs_map = model.ctc_log_probs_from_encoded(
                         encoded,
+                        intermediate_encoded,
+                    )
+                    main_ctc_loss = criterion(
+                        main_log_probs.float().transpose(0, 1),
+                        targets,
                         output_lengths,
-                        decoder_inputs,
+                        target_lengths,
                     )
-                    aed_loss = _aed_cross_entropy_loss(
-                        aed_logits,
-                        decoder_targets,
-                        pad_id=model.aed_decoder.pad_id,
+                    del main_log_probs
+                    if intermediate_encoded and intermediate_output_lengths:
+                        intermediate_ctc_losses = []
+                        for layer_index in intermediate_ctc_layers:
+                            intermediate_log_probs = intermediate_log_probs_map[layer_index]
+                            intermediate_ctc_losses.append(
+                                criterion(
+                                    intermediate_log_probs.float().transpose(0, 1),
+                                    targets,
+                                    intermediate_output_lengths[layer_index],
+                                    target_lengths,
+                                )
+                            )
+                            del intermediate_log_probs
+                        intermediate_ctc_loss = torch.stack(intermediate_ctc_losses).mean()
+                        loss = (
+                            1.0 - intermediate_ctc_weight
+                        ) * main_ctc_loss + intermediate_ctc_weight * intermediate_ctc_loss
+                    else:
+                        intermediate_ctc_loss = None
+                        loss = main_ctc_loss
+                    if aed_logits is not None and decoder_targets is not None:
+                        aed_loss = _aed_cross_entropy_loss(
+                            aed_logits,
+                            decoder_targets,
+                            pad_id=model.aed_decoder.pad_id,
+                        )
+                        loss = (1.0 - args.aed_loss_weight) * loss + args.aed_loss_weight * aed_loss
+                    else:
+                        aed_loss = None
+                        aed_hidden = None
+                if (
+                    liberta_teacher is not None
+                    and aed_hidden is not None
+                    and decoder_target_lengths is not None
+                ):
+                    teacher_embeddings = liberta_teacher.encode(batch["transcripts"])
+                    student_embeddings = model.project_aed_hidden_for_liberta(
+                        aed_hidden,
+                        decoder_target_lengths,
                     )
-                    loss = (1.0 - args.aed_loss_weight) * loss + args.aed_loss_weight * aed_loss
+                    liberta_distill_loss = F.mse_loss(
+                        F.normalize(student_embeddings.float(), dim=-1),
+                        F.normalize(teacher_embeddings.float(), dim=-1),
+                    )
+                    loss = loss + (args.liberta_distill_weight * liberta_distill_loss)
                 else:
-                    aed_loss = None
-                    aed_hidden = None
-            if (
-                liberta_teacher is not None
-                and aed_hidden is not None
-                and decoder_target_lengths is not None
-            ):
-                teacher_embeddings = liberta_teacher.encode(batch["transcripts"])
-                student_embeddings = aux_model.project_aed_hidden_for_liberta(
-                    aed_hidden,
-                    decoder_target_lengths,
+                    liberta_distill_loss = None
+                running_loss += float(loss.item())
+                running_main_ctc_loss += float(main_ctc_loss.item())
+                running_intermediate_ctc_loss += float(
+                    intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
                 )
-                liberta_distill_loss = F.mse_loss(
-                    F.normalize(student_embeddings.float(), dim=-1),
-                    F.normalize(teacher_embeddings.float(), dim=-1),
+                running_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
+                running_liberta_distill_loss += float(
+                    liberta_distill_loss.item() if liberta_distill_loss is not None else 0.0
                 )
-                loss = loss + (args.liberta_distill_weight * liberta_distill_loss)
-            else:
-                liberta_distill_loss = None
-            running_loss += float(loss.item())
-            running_main_ctc_loss += float(main_ctc_loss.item())
-            running_intermediate_ctc_loss += float(
-                intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
-            )
-            running_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
-            running_liberta_distill_loss += float(
-                liberta_distill_loss.item() if liberta_distill_loss is not None else 0.0
-            )
-            scaler.scale(loss / args.gradient_accumulation_steps).backward()
-
-            should_step = batch_index % args.gradient_accumulation_steps == 0 or batch_index == len(
-                train_loader
-            )
+                scaler.scale(loss / args.gradient_accumulation_steps).backward()
             if should_step:
                 for optimizer in optimizers:
                     scaler.unscale_(optimizer)

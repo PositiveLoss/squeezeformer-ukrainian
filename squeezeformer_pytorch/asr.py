@@ -6,7 +6,7 @@ import json
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import sentencepiece as spm
 import torch
@@ -548,7 +548,31 @@ class SqueezeformerCTC(nn.Module):
             )
         return torch.cat(blank_probability_chunks, dim=0)
 
-    def forward(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        features: Tensor,
+        feature_lengths: Tensor,
+        *,
+        return_training_outputs: bool = False,
+        decoder_inputs: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | dict[str, Any]:
+        if return_training_outputs or decoder_inputs is not None:
+            encoded, output_lengths, intermediate_encoded, intermediate_output_lengths = (
+                self.encode_with_intermediates(features, feature_lengths)
+            )
+            output: dict[str, Any] = {
+                "encoded": encoded,
+                "output_lengths": output_lengths,
+                "intermediate_encoded": intermediate_encoded,
+                "intermediate_output_lengths": intermediate_output_lengths,
+            }
+            if decoder_inputs is not None:
+                if self.aed_decoder is None:
+                    raise RuntimeError("AED decoder is disabled for this model.")
+                aed_logits, aed_hidden = self.aed_decoder(encoded, output_lengths, decoder_inputs)
+                output["aed_logits"] = aed_logits
+                output["aed_hidden"] = aed_hidden
+            return output
         if self.blank_prune_layer is not None and self.blank_prune_threshold > 0.0:
             encoded, output_lengths, _, _ = self.encoder.forward_with_intermediates(
                 features,
