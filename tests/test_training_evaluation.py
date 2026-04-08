@@ -73,3 +73,82 @@ def test_evaluate_restores_model_mode(monkeypatch) -> None:
     )
 
     assert model.training is True
+
+
+def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
+    monkeypatch.setattr(training_evaluation, "char_error_rate", lambda refs, hyps: float(len(refs)))
+    monkeypatch.setattr(training_evaluation, "word_error_rate", lambda refs, hyps: float(len(hyps)) / 10.0)
+    monkeypatch.setattr(
+        training_evaluation,
+        "length_bucket_metrics",
+        lambda refs, hyps: {"samples_total": float(len(refs))},
+    )
+    monkeypatch.setattr(
+        training_evaluation,
+        "speaker_level_metrics",
+        lambda speaker_ids, has_speaker_ids, refs, hyps: {
+            "speaker_count": len([speaker_id for speaker_id in speaker_ids if speaker_id]),
+            "speaker_macro_wer": 0.25,
+            "speaker_id_available": False,
+            "missing_speaker_id_samples": len([flag for flag in has_speaker_ids if not flag]),
+            "per_speaker": {},
+        },
+    )
+    monkeypatch.setattr(
+        training_evaluation,
+        "collect_examples",
+        lambda utterance_ids, speaker_ids, refs, hyps, limit: (
+            [{"utterance_id": utterance_ids[0], "speaker_id": "", "reference": refs[0], "hypothesis": hyps[0]}],
+            [{"utterance_id": utterance_ids[-1], "speaker_id": "", "reference": refs[-1], "hypothesis": hyps[-1]}],
+        ),
+    )
+
+    merged = training_evaluation._merge_evaluation_shards(
+        [
+            {
+                "total_loss": 2.0,
+                "total_main_ctc_loss": 4.0,
+                "total_intermediate_ctc_loss": 6.0,
+                "total_combined_ctc_loss": 8.0,
+                "total_aed_loss": 10.0,
+                "total_liberta_distill_loss": 12.0,
+                "total_batches": 2,
+                "references": ["a"],
+                "hypotheses": ["b"],
+                "utterance_ids": ["utt-1"],
+                "speaker_ids": ["spk-1"],
+                "has_speaker_ids": [True],
+            },
+            {
+                "total_loss": 6.0,
+                "total_main_ctc_loss": 8.0,
+                "total_intermediate_ctc_loss": 10.0,
+                "total_combined_ctc_loss": 12.0,
+                "total_aed_loss": 14.0,
+                "total_liberta_distill_loss": 16.0,
+                "total_batches": 2,
+                "references": ["c"],
+                "hypotheses": ["d"],
+                "utterance_ids": ["utt-2"],
+                "speaker_ids": [None],
+                "has_speaker_ids": [False],
+            },
+        ],
+        example_limit=1,
+    )
+
+    assert merged["metrics"]["loss"] == 2.0
+    assert merged["metrics"]["main_ctc_loss"] == 3.0
+    assert merged["metrics"]["intermediate_ctc_loss"] == 4.0
+    assert merged["metrics"]["combined_ctc_loss"] == 5.0
+    assert merged["metrics"]["aed_loss"] == 6.0
+    assert merged["metrics"]["liberta_distill_loss"] == 7.0
+    assert merged["metrics"]["cer"] == 2.0
+    assert merged["metrics"]["wer"] == 0.2
+    assert merged["metrics"]["samples_total"] == 2.0
+    assert merged["metrics"]["speaker_count"] == 1.0
+    assert merged["metrics"]["speaker_macro_wer"] == 0.25
+    assert merged["metrics"]["speaker_id_available"] == 0.0
+    assert merged["metrics"]["missing_speaker_id_samples"] == 1.0
+    assert merged["hardest_examples"][0]["utterance_id"] == "utt-1"
+    assert merged["random_examples"][0]["utterance_id"] == "utt-2"

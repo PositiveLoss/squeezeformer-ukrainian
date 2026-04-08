@@ -159,15 +159,19 @@ class DiskBackedRecordStore:
         for index in range(len(self)):
             yield self[index]
 
-    def shard(self, rank: int, world_size: int) -> "DiskBackedRecordStore":
+    def shard(self, rank: int, world_size: int, *, allow_uneven: bool = False) -> "DiskBackedRecordStore":
         local_length = len(self)
+        if allow_uneven:
+            local_count = max(0, (local_length - rank + world_size - 1) // world_size)
+        else:
+            local_count = local_length // world_size
         return DiskBackedRecordStore(
             self.records_path,
             self.offsets,
             self.estimated_frames,
             start=self.start + rank,
             step=self.step * world_size,
-            count=local_length // world_size,
+            count=local_count,
         )
 
     def populate_metadata(self, hop_length: int, num_workers: int = 4) -> None:
@@ -744,11 +748,14 @@ def _shard_records_for_rank(
     *,
     rank: int,
     world_size: int,
+    allow_uneven: bool = False,
 ) -> list[AudioRecord] | DiskBackedRecordStore:
     if world_size <= 1:
         return records
     if hasattr(records, "shard"):
-        return records.shard(rank, world_size)
+        return records.shard(rank, world_size, allow_uneven=allow_uneven)
+    if allow_uneven:
+        return records[rank::world_size]
     usable = (len(records) // world_size) * world_size
     return records[:usable][rank:usable:world_size]
 

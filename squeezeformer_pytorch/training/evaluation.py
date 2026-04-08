@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import trackio
 from torch import nn
 from torch.nn import functional as F
@@ -164,6 +165,68 @@ def speaker_level_metrics(
     }
 
 
+def _merge_evaluation_shards(
+    shards: list[dict[str, object]],
+    *,
+    example_limit: int,
+) -> dict[str, object]:
+    total_loss = 0.0
+    total_main_ctc_loss = 0.0
+    total_intermediate_ctc_loss = 0.0
+    total_combined_ctc_loss = 0.0
+    total_aed_loss = 0.0
+    total_liberta_distill_loss = 0.0
+    total_batches = 0
+    references: list[str] = []
+    hypotheses: list[str] = []
+    utterance_ids: list[str] = []
+    speaker_ids: list[str | None] = []
+    has_speaker_ids: list[bool] = []
+    for shard in shards:
+        total_loss += float(shard["total_loss"])
+        total_main_ctc_loss += float(shard["total_main_ctc_loss"])
+        total_intermediate_ctc_loss += float(shard["total_intermediate_ctc_loss"])
+        total_combined_ctc_loss += float(shard["total_combined_ctc_loss"])
+        total_aed_loss += float(shard["total_aed_loss"])
+        total_liberta_distill_loss += float(shard["total_liberta_distill_loss"])
+        total_batches += int(shard["total_batches"])
+        references.extend(shard["references"])
+        hypotheses.extend(shard["hypotheses"])
+        utterance_ids.extend(shard["utterance_ids"])
+        speaker_ids.extend(shard["speaker_ids"])
+        has_speaker_ids.extend(shard["has_speaker_ids"])
+
+    metrics = {
+        "loss": total_loss / max(1, total_batches),
+        "main_ctc_loss": total_main_ctc_loss / max(1, total_batches),
+        "intermediate_ctc_loss": total_intermediate_ctc_loss / max(1, total_batches),
+        "combined_ctc_loss": total_combined_ctc_loss / max(1, total_batches),
+        "aed_loss": total_aed_loss / max(1, total_batches),
+        "liberta_distill_loss": total_liberta_distill_loss / max(1, total_batches),
+        "cer": char_error_rate(references, hypotheses),
+        "wer": word_error_rate(references, hypotheses),
+    }
+    metrics.update(length_bucket_metrics(references, hypotheses))
+    speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
+    metrics["speaker_count"] = float(speaker_metrics["speaker_count"])
+    metrics["speaker_macro_wer"] = float(speaker_metrics["speaker_macro_wer"])
+    metrics["speaker_id_available"] = float(speaker_metrics["speaker_id_available"])
+    metrics["missing_speaker_id_samples"] = float(speaker_metrics["missing_speaker_id_samples"])
+    hardest_examples, random_examples = collect_examples(
+        utterance_ids,
+        speaker_ids,
+        references,
+        hypotheses,
+        limit=example_limit,
+    )
+    return {
+        "metrics": metrics,
+        "hardest_examples": hardest_examples,
+        "random_examples": random_examples,
+        "speaker_metrics": speaker_metrics,
+    }
+
+
 def evaluate(
     model: SqueezeformerCTC,
     dataloader,
@@ -181,7 +244,9 @@ def evaluate(
     aed_loss_weight: float = 0.0,
     liberta_teacher: FrozenLibertaTeacher | None = None,
     liberta_distill_weight: float = 0.0,
-) -> dict[str, object]:
+    distributed: bool = False,
+    is_main_process: bool = True,
+) -> dict[str, object] | None:
     was_training = model.training
     model.eval()
     total_loss = 0.0
@@ -307,35 +372,31 @@ def evaluate(
     finally:
         if was_training:
             model.train()
-    metrics = {
-        "loss": total_loss / max(1, total_batches),
-        "main_ctc_loss": total_main_ctc_loss / max(1, total_batches),
-        "intermediate_ctc_loss": total_intermediate_ctc_loss / max(1, total_batches),
-        "combined_ctc_loss": total_combined_ctc_loss / max(1, total_batches),
-        "aed_loss": total_aed_loss / max(1, total_batches),
-        "liberta_distill_loss": total_liberta_distill_loss / max(1, total_batches),
-        "cer": char_error_rate(references, hypotheses),
-        "wer": word_error_rate(references, hypotheses),
+    local_results = {
+        "total_loss": total_loss,
+        "total_main_ctc_loss": total_main_ctc_loss,
+        "total_intermediate_ctc_loss": total_intermediate_ctc_loss,
+        "total_combined_ctc_loss": total_combined_ctc_loss,
+        "total_aed_loss": total_aed_loss,
+        "total_liberta_distill_loss": total_liberta_distill_loss,
+        "total_batches": total_batches,
+        "references": references,
+        "hypotheses": hypotheses,
+        "utterance_ids": utterance_ids,
+        "speaker_ids": speaker_ids,
+        "has_speaker_ids": has_speaker_ids,
     }
-    metrics.update(length_bucket_metrics(references, hypotheses))
-    speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
-    metrics["speaker_count"] = float(speaker_metrics["speaker_count"])
-    metrics["speaker_macro_wer"] = float(speaker_metrics["speaker_macro_wer"])
-    metrics["speaker_id_available"] = float(speaker_metrics["speaker_id_available"])
-    metrics["missing_speaker_id_samples"] = float(speaker_metrics["missing_speaker_id_samples"])
-    hardest_examples, random_examples = collect_examples(
-        utterance_ids,
-        speaker_ids,
-        references,
-        hypotheses,
-        limit=example_limit,
-    )
-    return {
-        "metrics": metrics,
-        "hardest_examples": hardest_examples,
-        "random_examples": random_examples,
-        "speaker_metrics": speaker_metrics,
-    }
+    if distributed and dist.is_initialized():
+        gathered_results = [None] * dist.get_world_size() if is_main_process else None
+        dist.gather_object(
+            local_results,
+            object_gather_list=gathered_results,
+            dst=0,
+        )
+        if not is_main_process:
+            return None
+        return _merge_evaluation_shards(gathered_results, example_limit=example_limit)
+    return _merge_evaluation_shards([local_results], example_limit=example_limit)
 
 
 def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
@@ -429,6 +490,8 @@ def _evaluate_and_checkpoint(
     logger: logging.Logger,
     save_last_checkpoint: bool,
     report_stem: str,
+    distributed: bool,
+    is_main_process: bool,
 ) -> float:
     ema_backup = ema.apply_to(model) if ema is not None else None
     validation = evaluate(
@@ -448,9 +511,13 @@ def _evaluate_and_checkpoint(
         aed_loss_weight=aed_loss_weight,
         liberta_teacher=liberta_teacher,
         liberta_distill_weight=liberta_distill_weight,
+        distributed=distributed,
+        is_main_process=is_main_process,
     )
     if ema_backup is not None:
         ExponentialMovingAverage.restore(model, ema_backup)
+    if not is_main_process:
+        return best_val_wer
 
     val_metrics = validation["metrics"]
     log_payload = {
