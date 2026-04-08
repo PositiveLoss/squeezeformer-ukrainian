@@ -26,7 +26,7 @@ from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
     ASRDataset,
     AudioFeaturizer,
-    CVRecord,
+    AudioRecord,
     MaxFramesBatchSampler,
     SpecAugment,
     WaveformAugment,
@@ -885,7 +885,7 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     train_rows = [
-        CVRecord(
+        AudioRecord(
             audio_path="a.wav",
             audio_bytes=None,
             transcript="перший запис",
@@ -894,7 +894,7 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
         )
     ]
     val_rows = [
-        CVRecord(
+        AudioRecord(
             audio_path="b.wav",
             audio_bytes=None,
             transcript="другий запис",
@@ -917,7 +917,7 @@ def test_load_train_val_records_without_record_cache_uses_in_memory_loader(
         max_symbol_ratio: float,
         lowercase_transcripts: bool,
         hf_token: str | None = None,
-    ) -> list[CVRecord]:
+    ) -> list[AudioRecord]:
         del (
             dataset_sources,
             seed,
@@ -979,7 +979,7 @@ def test_ensure_opus_decode_support_fails_fast_for_in_memory_opus_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     records = [
-        CVRecord(
+        AudioRecord(
             audio_path="sample.opus",
             audio_bytes=None,
             transcript="приклад",
@@ -1028,10 +1028,10 @@ def test_ensure_opus_decode_support_checks_disk_backed_record_store(
 
 def test_shard_records_for_rank_slices_in_memory_records() -> None:
     records = [
-        CVRecord("a.wav", None, "a", "utt0", 1),
-        CVRecord("b.wav", None, "b", "utt1", 1),
-        CVRecord("c.wav", None, "c", "utt2", 1),
-        CVRecord("d.wav", None, "d", "utt3", 1),
+        AudioRecord("a.wav", None, "a", "utt0", 1),
+        AudioRecord("b.wav", None, "b", "utt1", 1),
+        AudioRecord("c.wav", None, "c", "utt2", 1),
+        AudioRecord("d.wav", None, "d", "utt3", 1),
     ]
 
     shard = _shard_records_for_rank(records, rank=1, world_size=2)
@@ -1277,10 +1277,10 @@ def test_transcript_filter_rejects_pathological_rows() -> None:
 
 def test_max_frames_batch_sampler_respects_frame_budget() -> None:
     records = [
-        CVRecord(None, None, "a", "0", estimated_frames=20, speaker_id="s0", has_speaker_id=True),
-        CVRecord(None, None, "b", "1", estimated_frames=25, speaker_id="s1", has_speaker_id=True),
-        CVRecord(None, None, "c", "2", estimated_frames=40, speaker_id="s2", has_speaker_id=True),
-        CVRecord(None, None, "d", "3", estimated_frames=45, speaker_id="s3", has_speaker_id=True),
+        AudioRecord(None, None, "a", "0", estimated_frames=20, speaker_id="s0", has_speaker_id=True),
+        AudioRecord(None, None, "b", "1", estimated_frames=25, speaker_id="s1", has_speaker_id=True),
+        AudioRecord(None, None, "c", "2", estimated_frames=40, speaker_id="s2", has_speaker_id=True),
+        AudioRecord(None, None, "d", "3", estimated_frames=45, speaker_id="s3", has_speaker_id=True),
     ]
     sampler = MaxFramesBatchSampler(records, max_batch_frames=90, shuffle=False)
     batches = list(iter(sampler))
@@ -1292,7 +1292,7 @@ def test_max_frames_batch_sampler_respects_frame_budget() -> None:
 
 def test_adaptive_batch_sampler_respects_token_budget() -> None:
     records = [
-        CVRecord(
+        AudioRecord(
             None,
             None,
             "aaa",
@@ -1301,7 +1301,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s0",
             has_speaker_id=True,
         ),
-        CVRecord(
+        AudioRecord(
             None,
             None,
             "bbbb",
@@ -1310,7 +1310,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s1",
             has_speaker_id=True,
         ),
-        CVRecord(
+        AudioRecord(
             None,
             None,
             "cc",
@@ -1319,7 +1319,7 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
             speaker_id="s2",
             has_speaker_id=True,
         ),
-        CVRecord(
+        AudioRecord(
             None,
             None,
             "dddd",
@@ -1461,7 +1461,7 @@ def test_feature_cache_is_used_when_waveform_augment_is_effectively_disabled(
     monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
 
     dataset = ASRDataset(
-        records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        records=[AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         tokenizer=DummyTokenizer(),
         featurizer=AudioFeaturizer(),
         waveform_augment=WaveformAugment(
@@ -1498,7 +1498,7 @@ def test_invalid_cached_features_are_recomputed(
     monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
 
     dataset = ASRDataset(
-        records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        records=[AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         tokenizer=DummyTokenizer(),
         featurizer=AudioFeaturizer(),
         feature_cache_dir=tmp_path,
@@ -1570,7 +1570,7 @@ def test_create_dataloader_uses_fork_context_on_linux(monkeypatch: pytest.Monkey
     monkeypatch.setattr("squeezeformer_pytorch.data.DataLoader", FakeDataLoader)
 
     dataset = ASRDataset(
-        records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        records=[AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         tokenizer=DummyTokenizer(),
         featurizer=AudioFeaturizer(),
     )

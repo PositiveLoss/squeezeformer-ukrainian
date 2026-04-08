@@ -124,7 +124,7 @@ def _increment_summary_field(
 
 
 @dataclass(frozen=True)
-class CVRecord:
+class AudioRecord:
     audio_path: str | None
     audio_bytes: bytes | None
     transcript: str
@@ -479,7 +479,7 @@ def resolve_audio_from_source(
 
 
 def _record_split_matches(
-    record: CVRecord,
+    record: AudioRecord,
     *,
     split: str,
     seed: int,
@@ -510,7 +510,7 @@ def _build_cv_record(
     min_audio_duration_sec: float,
     max_audio_duration_sec: float,
     lowercase_transcripts: bool,
-) -> CVRecord | None:
+) -> AudioRecord | None:
     try:
         transcript = _extract_transcript(row, lowercase=lowercase_transcripts)
     except KeyError:
@@ -553,7 +553,7 @@ def _build_cv_record(
     raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
     speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
     estimated_frames = max(1, int((duration_seconds * 16000) / 160))
-    return CVRecord(
+    return AudioRecord(
         audio_path=audio_path,
         audio_bytes=audio_bytes,
         transcript=transcript,
@@ -654,7 +654,7 @@ def load_records(
     max_transcript_chars: int = 400,
     max_symbol_ratio: float = 0.5,
     lowercase_transcripts: bool = True,
-) -> list[CVRecord]:
+) -> list[AudioRecord]:
     records = list(
         iter_records(
             dataset_root=dataset_root,
@@ -687,7 +687,7 @@ def iter_records(
     min_audio_duration_sec: float = 0.01,
     max_audio_duration_sec: float = 30.0,
     lowercase_transcripts: bool = True,
-) -> Iterable[CVRecord]:
+) -> Iterable[AudioRecord]:
     summary = LoaderSummary()
     found_usable_record = False
 
@@ -753,7 +753,7 @@ def iter_records_from_source(
     lowercase_transcripts: bool = True,
     hf_token: str | None = None,
     cache_dir: str | Path | None = None,
-) -> Iterable[CVRecord]:
+) -> Iterable[AudioRecord]:
     summary = LoaderSummary()
     found_usable_record = False
 
@@ -898,7 +898,7 @@ def feature_cache_path(
     return feature_cache_path / f"{safe_utterance_id}_{frontend_hash}.pt"
 
 
-def max_reasonable_feature_frames(record: CVRecord) -> int:
+def max_reasonable_feature_frames(record: AudioRecord) -> int:
     estimated_frames = max(1, int(record.estimated_frames))
     return max(20_000, estimated_frames * 4, estimated_frames + 1_024)
 
@@ -914,7 +914,7 @@ def normalize_feature_tensor(features: Tensor, expected_feature_bins: int) -> Te
 
 
 def feature_tensor_is_plausible(
-    record: CVRecord,
+    record: AudioRecord,
     features: Tensor,
     *,
     expected_feature_bins: int,
@@ -928,7 +928,7 @@ def feature_tensor_is_plausible(
 class ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
-        records: list[CVRecord],
+        records: list[AudioRecord],
         tokenizer: Tokenizer,
         featurizer: AudioFeaturizer,
         specaugment: SpecAugment | None = None,
@@ -944,12 +944,12 @@ class ASRDataset(Dataset[dict[str, Any]]):
         if self.feature_cache_dir is not None:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _feature_cache_path(self, record: CVRecord) -> Path | None:
+    def _feature_cache_path(self, record: AudioRecord) -> Path | None:
         return feature_cache_path(self.feature_cache_dir, record.utterance_id, self.featurizer)
 
     def _compute_features(
         self,
-        record: CVRecord,
+        record: AudioRecord,
         *,
         waveform_augment_enabled: bool,
     ) -> Tensor:
@@ -1029,7 +1029,7 @@ class ASRDataset(Dataset[dict[str, Any]]):
 class LengthBucketBatchSampler(BatchSampler):
     def __init__(
         self,
-        records: list[CVRecord],
+        records: list[AudioRecord],
         batch_size: int,
         shuffle: bool,
         longest_first: bool = False,
@@ -1065,7 +1065,7 @@ class LengthBucketBatchSampler(BatchSampler):
 class MaxFramesBatchSampler(BatchSampler):
     def __init__(
         self,
-        records: list[CVRecord],
+        records: list[AudioRecord],
         max_batch_frames: int,
         shuffle: bool,
         longest_first: bool = False,
@@ -1118,7 +1118,7 @@ class MaxFramesBatchSampler(BatchSampler):
 class AdaptiveBatchSampler(BatchSampler):
     def __init__(
         self,
-        records: list[CVRecord],
+        records: list[AudioRecord],
         target_batch_units: int,
         unit: str,
         shuffle: bool,
@@ -1140,7 +1140,7 @@ class AdaptiveBatchSampler(BatchSampler):
         )
         self._num_batches = self._count_batches()
 
-    def _record_units(self, record: CVRecord) -> int:
+    def _record_units(self, record: AudioRecord) -> int:
         if self.unit == "frames":
             return max(1, record.estimated_frames)
         return max(1, len(record.transcript))
@@ -1180,7 +1180,7 @@ class AdaptiveBatchSampler(BatchSampler):
         return self._num_batches
 
 
-def _record_is_valid(record: CVRecord) -> bool:
+def _record_is_valid(record: AudioRecord) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
             try:
@@ -1202,13 +1202,13 @@ def _record_is_valid(record: CVRecord) -> bool:
 
 
 def prevalidate_records(
-    records: list[CVRecord],
+    records: list[AudioRecord],
     num_workers: int = 4,
-) -> list[CVRecord]:
+) -> list[AudioRecord]:
     if num_workers <= 1:
         return [record for record in records if _record_is_valid(record)]
 
-    validated_records: list[CVRecord] = []
+    validated_records: list[AudioRecord] = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         for record, is_valid in zip(records, executor.map(_record_is_valid, records), strict=True):
             if is_valid:
@@ -1216,7 +1216,7 @@ def prevalidate_records(
     return validated_records
 
 
-def estimate_record_frames(record: CVRecord, hop_length: int) -> int:
+def estimate_record_frames(record: AudioRecord, hop_length: int) -> int:
     if record.estimated_frames > 0 and record.num_samples > 0 and record.sample_rate > 0:
         return record.estimated_frames
     num_samples, sample_rate = probe_audio_metadata(record.audio_path, record.audio_bytes)
@@ -1230,11 +1230,11 @@ def estimate_record_frames(record: CVRecord, hop_length: int) -> int:
 
 
 def materialize_record_metadata(
-    records: list[CVRecord],
+    records: list[AudioRecord],
     hop_length: int,
     num_workers: int = 4,
-) -> list[CVRecord]:
-    def populate(record: CVRecord) -> CVRecord:
+) -> list[AudioRecord]:
+    def populate(record: AudioRecord) -> AudioRecord:
         estimate_record_frames(record, hop_length=hop_length)
         return record
 

@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import torch.distributed as dist
 
 from squeezeformer_pytorch.data import (
-    CVRecord,
+    AudioRecord,
     download_dataset,
     iter_records,
     iter_records_from_source,
@@ -123,12 +123,12 @@ class DiskBackedRecordStore:
             return 0
         return ((total - self.start - 1) // self.step) + 1
 
-    def __getitem__(self, index: int) -> CVRecord:
+    def __getitem__(self, index: int) -> AudioRecord:
         global_index = self._global_index(index)
         handle = self._open_handle()
         handle.seek(self.offsets[global_index])
         payload = json.loads(handle.readline().decode("utf-8"))
-        return CVRecord(
+        return AudioRecord(
             audio_path=payload["audio_path"],
             audio_bytes=_load_cached_audio_bytes(payload, records_path=self.records_path),
             transcript=payload["transcript"],
@@ -433,7 +433,7 @@ def _path_declares_opus(audio_path: str | None) -> bool:
     return Path(urlparse(audio_path).path).suffix.lower() == ".opus"
 
 
-def _record_looks_like_opus(record: CVRecord) -> bool:
+def _record_looks_like_opus(record: AudioRecord) -> bool:
     if _path_declares_opus(record.audio_path):
         return True
     if record.audio_bytes is not None and _audio_header_looks_like_opus(record.audio_bytes):
@@ -442,7 +442,7 @@ def _record_looks_like_opus(record: CVRecord) -> bool:
 
 
 def _find_opus_probe_record(
-    records: list[CVRecord] | DiskBackedRecordStore,
+    records: list[AudioRecord] | DiskBackedRecordStore,
 ) -> tuple[str | None, bytes | None, str] | None:
     if isinstance(records, DiskBackedRecordStore):
         with records.records_path.open("rb") as handle:
@@ -476,7 +476,7 @@ def _find_opus_probe_record(
 
 
 def _ensure_opus_decode_support(
-    records: list[CVRecord] | DiskBackedRecordStore,
+    records: list[AudioRecord] | DiskBackedRecordStore,
     *,
     split: str,
 ) -> None:
@@ -563,11 +563,11 @@ def _load_records_from_dataset_roots(
 
 
 def _prevalidate_loaded_records(
-    records: list[CVRecord],
+    records: list[AudioRecord],
     *,
     split: str,
     num_workers: int,
-) -> list[CVRecord]:
+) -> list[AudioRecord]:
     validated_records = prevalidate_records(records, num_workers=num_workers)
     if not validated_records:
         raise RuntimeError(f"Split '{split}' is empty after audio prevalidation.")
@@ -583,7 +583,7 @@ def _load_train_val_records(
     output_dir: Path,
     distributed: bool = False,
     is_main_process: bool = True,
-) -> tuple[list[CVRecord] | DiskBackedRecordStore, list[CVRecord] | DiskBackedRecordStore]:
+) -> tuple[list[AudioRecord] | DiskBackedRecordStore, list[AudioRecord] | DiskBackedRecordStore]:
     validation_dataset_sources = validation_dataset_sources or []
     use_external_validation = bool(validation_dataset_sources)
     train_val_fraction = 0.0 if use_external_validation else args.val_fraction
@@ -694,11 +694,11 @@ def _load_train_val_records(
 
 
 def _shard_records_for_rank(
-    records: list[CVRecord] | DiskBackedRecordStore,
+    records: list[AudioRecord] | DiskBackedRecordStore,
     *,
     rank: int,
     world_size: int,
-) -> list[CVRecord] | DiskBackedRecordStore:
+) -> list[AudioRecord] | DiskBackedRecordStore:
     if world_size <= 1:
         return records
     if hasattr(records, "shard"):
@@ -707,7 +707,7 @@ def _shard_records_for_rank(
 
 
 def _record_store_duration_hours(
-    records: list[CVRecord] | DiskBackedRecordStore,
+    records: list[AudioRecord] | DiskBackedRecordStore,
     *,
     hop_length: int,
     sample_rate: int = 16000,
@@ -736,7 +736,7 @@ def _frames_to_minutes(
 
 
 def _build_split_audit(
-    split_records: dict[str, list[CVRecord] | DiskBackedRecordStore],
+    split_records: dict[str, list[AudioRecord] | DiskBackedRecordStore],
     *,
     hop_length: int,
 ) -> dict[str, object]:
