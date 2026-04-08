@@ -364,17 +364,13 @@ def _iter_remote_rows(
     suffix = Path(urlparse(source_url).path).suffix.lower()
     payload = io.BytesIO(_read_remote_bytes(source_url, token=token, cache_dir=cache_dir))
     if suffix == ".tsv":
-        reader = pl.read_csv_batched(
+        reader = pl.scan_csv(
             payload,
             separator="\t",
             infer_schema_length=1000,
-            batch_size=batch_size,
         )
-        while True:
-            batches = reader.next_batches(1)
-            if not batches:
-                break
-            yield from batches[0].iter_rows(named=True)
+        for batch in reader.collect_batches(chunk_size=batch_size):
+            yield from batch.iter_rows(named=True)
         return
     if suffix == ".parquet":
         logger.info("loading remote parquet manifest %s", source_url)
@@ -385,17 +381,13 @@ def _iter_remote_rows(
 
 def _iter_manifest_file_rows(path: Path, *, batch_size: int) -> Iterable[dict[str, Any]]:
     if path.suffix == ".tsv":
-        reader = pl.read_csv_batched(
+        reader = pl.scan_csv(
             path,
             separator="\t",
             infer_schema_length=1000,
-            batch_size=batch_size,
         )
-        while True:
-            batches = reader.next_batches(1)
-            if not batches:
-                break
-            yield from batches[0].iter_rows(named=True)
+        for batch in reader.collect_batches(chunk_size=batch_size):
+            yield from batch.iter_rows(named=True)
         return
     if path.suffix == ".parquet":
         logger.info("loading parquet manifest %s", path)
