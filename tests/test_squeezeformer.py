@@ -24,19 +24,19 @@ from squeezeformer_pytorch.asr import load_lm_scorer, prune_encoder_frames_by_bl
 from squeezeformer_pytorch.checkpoints import load_checkpoint, save_checkpoint
 from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
+    ASRDataset,
     AudioFeaturizer,
-    CV22ASRDataset,
     CVRecord,
     MaxFramesBatchSampler,
     SpecAugment,
     WaveformAugment,
     create_dataloader,
-    iter_cv22_corpus_texts,
-    iter_cv22_records,
-    iter_cv22_records_from_source,
+    iter_corpus_texts,
+    iter_records,
+    iter_records_from_source,
     iter_manifest_rows_from_source,
-    load_cv22_corpus_texts,
-    load_cv22_records,
+    load_corpus_texts,
+    load_records,
     normalize_transcript,
     transcript_is_usable,
 )
@@ -638,15 +638,15 @@ def test_lm_scorer_factory_spec_loads_saved_model(tmp_path: Path) -> None:
     assert scorer("це") > scorer("цz")
 
 
-def test_load_cv22_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> None:
+def test_load_corpus_texts_normalizes_and_deduplicates(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\na.wav\t Це   Тест \nb.wav\tце тест\nc.wav\tМовна   Модель\n",
         encoding="utf-8",
     )
-    texts = load_cv22_corpus_texts(tmp_path, deduplicate=False)
+    texts = load_corpus_texts(tmp_path, deduplicate=False)
     assert texts == ["це тест", "це тест", "мовна модель"]
-    deduped = load_cv22_corpus_texts(tmp_path, deduplicate=True)
+    deduped = load_corpus_texts(tmp_path, deduplicate=True)
     assert deduped == ["це тест", "мовна модель"]
 
 
@@ -654,34 +654,34 @@ def test_normalize_transcript_preserves_case_when_lowercase_disabled() -> None:
     assert normalize_transcript(" Це   Тест ", lowercase=False) == "Це Тест"
 
 
-def test_load_cv22_corpus_texts_preserves_case_when_lowercase_disabled(tmp_path: Path) -> None:
+def test_load_corpus_texts_preserves_case_when_lowercase_disabled(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\na.wav\t Це   Тест \nb.wav\tце тест\nc.wav\tМовна   Модель\n",
         encoding="utf-8",
     )
-    texts = load_cv22_corpus_texts(tmp_path, deduplicate=False, lowercase_transcripts=False)
+    texts = load_corpus_texts(tmp_path, deduplicate=False, lowercase_transcripts=False)
     assert texts == ["Це Тест", "це тест", "Мовна Модель"]
 
 
-def test_iter_cv22_corpus_texts_reads_root_level_parquet(tmp_path: Path) -> None:
+def test_iter_corpus_texts_reads_root_level_parquet(tmp_path: Path) -> None:
     pl.DataFrame(
         {
             "path": ["a.wav", "b.wav"],
             "sentence": [" Це   Тест ", "Мовна   Модель"],
         }
     ).write_parquet(tmp_path / "train.parquet")
-    texts = list(iter_cv22_corpus_texts(tmp_path))
+    texts = list(iter_corpus_texts(tmp_path))
     assert texts == ["це тест", "мовна модель"]
 
 
-def test_load_cv22_records_works_without_speaker_id_field(tmp_path: Path) -> None:
+def test_load_records_works_without_speaker_id_field(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\tid\tduration\na.wav\tце тест\tutt0\t0.3\nb.wav\tмовна модель\tutt1\t0.3\n",
         encoding="utf-8",
     )
-    records = load_cv22_records(
+    records = load_records(
         dataset_root=tmp_path,
         split="train",
         seed=13,
@@ -693,13 +693,13 @@ def test_load_cv22_records_works_without_speaker_id_field(tmp_path: Path) -> Non
     assert all(not record.has_speaker_id for record in records)
 
 
-def test_load_cv22_records_preserves_case_when_lowercase_disabled(tmp_path: Path) -> None:
+def test_load_records_preserves_case_when_lowercase_disabled(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\tid\tduration\na.wav\tЦе Тест\tutt0\t0.3\n",
         encoding="utf-8",
     )
-    records = load_cv22_records(
+    records = load_records(
         dataset_root=tmp_path,
         split="train",
         seed=13,
@@ -719,7 +719,7 @@ def test_resolve_dataset_roots_uses_dataset_source_list(
     first.mkdir()
     second.mkdir()
 
-    def fake_download_cv22_dataset(
+    def fake_download_dataset(
         repo_id: str,
         token: str | None,
         cache_dir: str | None = None,
@@ -729,7 +729,7 @@ def test_resolve_dataset_roots_uses_dataset_source_list(
         del token, cache_dir, force_download, allow_patterns
         return {"source-a": first, "source-b": second}[repo_id]
 
-    monkeypatch.setattr("train.download_cv22_dataset", fake_download_cv22_dataset)
+    monkeypatch.setattr("train.download_dataset", fake_download_dataset)
 
     args = type(
         "Args",
@@ -1148,7 +1148,7 @@ def test_update_top_checkpoints_removes_incompatible_existing_entries(tmp_path: 
     assert not (topk_dir / "old.pt").exists()
 
 
-def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
+def test_iter_records_streams_split_selection(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\tid\tspeaker_id\tduration\n"
@@ -1158,7 +1158,7 @@ def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     streamed = list(
-        iter_cv22_records(
+        iter_records(
             dataset_root=tmp_path,
             split="train",
             seed=13,
@@ -1167,7 +1167,7 @@ def test_iter_cv22_records_streams_split_selection(tmp_path: Path) -> None:
             max_samples=2,
         )
     )
-    loaded = load_cv22_records(
+    loaded = load_records(
         dataset_root=tmp_path,
         split="train",
         seed=13,
@@ -1224,7 +1224,7 @@ def test_iter_manifest_rows_from_source_caches_remote_manifest(
     assert calls == [source_url]
 
 
-def test_iter_cv22_records_from_source_matches_local_loader(tmp_path: Path) -> None:
+def test_iter_records_from_source_matches_local_loader(tmp_path: Path) -> None:
     manifest = tmp_path / "train.tsv"
     manifest.write_text(
         "path\tsentence\tid\tspeaker_id\tduration\n"
@@ -1235,7 +1235,7 @@ def test_iter_cv22_records_from_source_matches_local_loader(tmp_path: Path) -> N
     )
 
     from_source = list(
-        iter_cv22_records_from_source(
+        iter_records_from_source(
             manifest,
             split="train",
             seed=13,
@@ -1245,7 +1245,7 @@ def test_iter_cv22_records_from_source_matches_local_loader(tmp_path: Path) -> N
         )
     )
     from_root = list(
-        iter_cv22_records(
+        iter_records(
             dataset_root=tmp_path,
             split="train",
             seed=13,
@@ -1458,7 +1458,7 @@ def test_feature_cache_is_used_when_waveform_augment_is_effectively_disabled(
 
     monkeypatch.setattr("squeezeformer_pytorch.data.load_audio", fake_load_audio)
 
-    dataset = CV22ASRDataset(
+    dataset = ASRDataset(
         records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         tokenizer=DummyTokenizer(),
         featurizer=AudioFeaturizer(),
@@ -1494,7 +1494,7 @@ def test_create_dataloader_uses_fork_context_on_linux(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr("squeezeformer_pytorch.data.DataLoader", FakeDataLoader)
 
-    dataset = CV22ASRDataset(
+    dataset = ASRDataset(
         records=[CVRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         tokenizer=DummyTokenizer(),
         featurizer=AudioFeaturizer(),

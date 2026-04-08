@@ -41,15 +41,15 @@ from squeezeformer_pytorch.asr import (
 )
 from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import (
+    ASRDataset,
     AudioFeaturizer,
-    CV22ASRDataset,
     CVRecord,
     SpecAugment,
     WaveformAugment,
     create_dataloader,
-    download_cv22_dataset,
-    iter_cv22_records,
-    iter_cv22_records_from_source,
+    download_dataset,
+    iter_records,
+    iter_records_from_source,
     load_audio,
     prevalidate_records,
     probe_audio_metadata,
@@ -648,7 +648,7 @@ def _resolve_dataset_roots(args: argparse.Namespace) -> list[Path]:
     dataset_roots: list[Path] = []
     seen: set[Path] = set()
     for source in sources:
-        dataset_root = download_cv22_dataset(
+        dataset_root = download_dataset(
             repo_id=source,
             token=args.hf_token,
             cache_dir=args.cache_dir,
@@ -899,7 +899,7 @@ def _build_disk_backed_record_store(
                 if remaining_samples <= 0:
                     break
             record_iterator = (
-                iter_cv22_records(
+                iter_records(
                     dataset_root=dataset_source,
                     split=split,
                     seed=seed,
@@ -916,7 +916,7 @@ def _build_disk_backed_record_store(
                 if isinstance(dataset_source, Path)
                 and dataset_source.exists()
                 and dataset_source.is_dir()
-                else iter_cv22_records_from_source(
+                else iter_records_from_source(
                     dataset_source,
                     split=split,
                     seed=seed,
@@ -1133,7 +1133,7 @@ def _load_records_from_dataset_roots(
             if remaining_samples <= 0:
                 break
         iterator = (
-            iter_cv22_records(
+            iter_records(
                 dataset_root=dataset_source,
                 split=split,
                 seed=seed,
@@ -1150,7 +1150,7 @@ def _load_records_from_dataset_roots(
             if isinstance(dataset_source, Path)
             and dataset_source.exists()
             and dataset_source.is_dir()
-            else iter_cv22_records_from_source(
+            else iter_records_from_source(
                 dataset_source,
                 split=split,
                 seed=seed,
@@ -3171,7 +3171,7 @@ def main() -> None:
         rank=rank,
         world_size=world_size,
     )
-    train_dataset = CV22ASRDataset(
+    train_dataset = ASRDataset(
         local_train_records,
         tokenizer=tokenizer,
         featurizer=featurizer,
@@ -3179,7 +3179,7 @@ def main() -> None:
         waveform_augment=waveform_augment,
         feature_cache_dir=train_feature_cache_dir,
     )
-    val_dataset = CV22ASRDataset(
+    val_dataset = ASRDataset(
         val_records,
         tokenizer=tokenizer,
         featurizer=featurizer,

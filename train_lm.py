@@ -9,8 +9,8 @@ from typing import Iterable
 from tqdm.auto import tqdm
 
 from squeezeformer_pytorch.data import (
-    iter_cv22_corpus_texts,
-    iter_cv22_corpus_texts_from_repo,
+    iter_corpus_texts,
+    iter_corpus_texts_from_repo,
 )
 from squeezeformer_pytorch.lm import NGramLanguageModel
 
@@ -97,7 +97,7 @@ def main() -> None:
         dataset_path = Path(args.dataset_repo)
         if dataset_path.exists():
             texts, counter = count_texts(
-                iter_cv22_corpus_texts(
+                iter_corpus_texts(
                     dataset_root=dataset_path,
                     deduplicate=args.deduplicate,
                     max_samples=args.max_samples,
@@ -109,7 +109,7 @@ def main() -> None:
             input_type = "dataset"
         else:
             texts, counter = count_texts(
-                iter_cv22_corpus_texts_from_repo(
+                iter_corpus_texts_from_repo(
                     repo_id=args.dataset_repo,
                     token=args.hf_token,
                     deduplicate=args.deduplicate,

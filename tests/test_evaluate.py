@@ -45,7 +45,7 @@ def test_evaluate_defaults_to_checkpoint_tokenizer_casing(monkeypatch) -> None:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-    def fake_load_cv22_records(**kwargs):
+    def fake_load_records(**kwargs):
         captured["lowercase_transcripts"] = kwargs["lowercase_transcripts"]
         return []
 
@@ -97,10 +97,10 @@ def test_evaluate_defaults_to_checkpoint_tokenizer_casing(monkeypatch) -> None:
     monkeypatch.setattr(evaluate, "SqueezeformerCTC", DummyModel)
     monkeypatch.setattr(evaluate, "resolve_device", lambda *_args, **_kwargs: "cpu")
     monkeypatch.setattr(evaluate, "_validate_device_ready", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(evaluate, "download_cv22_dataset", lambda **_kwargs: "root")
-    monkeypatch.setattr(evaluate, "load_cv22_records", fake_load_cv22_records)
+    monkeypatch.setattr(evaluate, "download_dataset", lambda **_kwargs: "root")
+    monkeypatch.setattr(evaluate, "load_records", fake_load_records)
     monkeypatch.setattr(evaluate, "AudioFeaturizer", DummyFeaturizer)
-    monkeypatch.setattr(evaluate, "CV22ASRDataset", DummyDataset)
+    monkeypatch.setattr(evaluate, "ASRDataset", DummyDataset)
     monkeypatch.setattr(evaluate, "create_dataloader", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(evaluate, "load_lm_scorer", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -150,7 +150,7 @@ def test_evaluate_respects_lowercase_transcripts_override(monkeypatch) -> None:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-    def fake_load_cv22_records(**kwargs):
+    def fake_load_records(**kwargs):
         captured["lowercase_transcripts"] = kwargs["lowercase_transcripts"]
         return []
 
@@ -202,10 +202,10 @@ def test_evaluate_respects_lowercase_transcripts_override(monkeypatch) -> None:
     monkeypatch.setattr(evaluate, "SqueezeformerCTC", DummyModel)
     monkeypatch.setattr(evaluate, "resolve_device", lambda *_args, **_kwargs: "cpu")
     monkeypatch.setattr(evaluate, "_validate_device_ready", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(evaluate, "download_cv22_dataset", lambda **_kwargs: "root")
-    monkeypatch.setattr(evaluate, "load_cv22_records", fake_load_cv22_records)
+    monkeypatch.setattr(evaluate, "download_dataset", lambda **_kwargs: "root")
+    monkeypatch.setattr(evaluate, "load_records", fake_load_records)
     monkeypatch.setattr(evaluate, "AudioFeaturizer", DummyFeaturizer)
-    monkeypatch.setattr(evaluate, "CV22ASRDataset", DummyDataset)
+    monkeypatch.setattr(evaluate, "ASRDataset", DummyDataset)
     monkeypatch.setattr(evaluate, "create_dataloader", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(evaluate, "load_lm_scorer", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(

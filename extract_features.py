@@ -15,7 +15,7 @@ from squeezeformer_pytorch.data import (
     SpecAugment,
     WaveformAugment,
     feature_cache_path,
-    iter_cv22_records_from_source,
+    iter_records_from_source,
     load_audio,
     prevalidate_records,
 )
@@ -183,7 +183,7 @@ def _selected_records(
             remaining_samples = args.max_samples - selected
             if remaining_samples <= 0:
                 break
-        for record in iter_cv22_records_from_source(
+        for record in iter_records_from_source(
             dataset_source,
             split=split,
             seed=args.seed,

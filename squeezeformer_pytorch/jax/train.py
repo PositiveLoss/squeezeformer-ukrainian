@@ -30,13 +30,13 @@ from squeezeformer_pytorch.asr import (
     tokenizer_from_dict,
 )
 from squeezeformer_pytorch.data import (
+    ASRDataset,
     AudioFeaturizer,
-    CV22ASRDataset,
     SpecAugment,
     WaveformAugment,
     create_dataloader,
-    download_cv22_dataset,
-    load_cv22_records,
+    download_dataset,
+    load_records,
     prevalidate_records,
 )
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
@@ -565,13 +565,13 @@ def main() -> None:
         logger=logger,
     )
 
-    dataset_root = download_cv22_dataset(
+    dataset_root = download_dataset(
         repo_id=args.dataset_repo,
         token=args.hf_token,
         cache_dir=args.cache_dir,
     )
     lowercase_transcripts = args.tokenizer != "sentencepiece"
-    train_records = load_cv22_records(
+    train_records = load_records(
         dataset_root=dataset_root,
         split="train",
         seed=args.seed,
@@ -583,7 +583,7 @@ def main() -> None:
         max_symbol_ratio=args.max_symbol_ratio,
         lowercase_transcripts=lowercase_transcripts,
     )
-    val_records = load_cv22_records(
+    val_records = load_records(
         dataset_root=dataset_root,
         split="validation",
         seed=args.seed,
@@ -647,7 +647,7 @@ def main() -> None:
     val_feature_cache_dir = (
         Path(args.feature_cache_dir) / "validation" if args.feature_cache_dir is not None else None
     )
-    train_dataset = CV22ASRDataset(
+    train_dataset = ASRDataset(
         train_records,
         tokenizer=tokenizer,
         featurizer=featurizer,
@@ -655,7 +655,7 @@ def main() -> None:
         waveform_augment=waveform_augment,
         feature_cache_dir=train_feature_cache_dir,
     )
-    val_dataset = CV22ASRDataset(
+    val_dataset = ASRDataset(
         val_records,
         tokenizer=tokenizer,
         featurizer=featurizer,

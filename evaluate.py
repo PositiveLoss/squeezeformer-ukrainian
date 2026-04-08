@@ -18,11 +18,11 @@ from squeezeformer_pytorch.checkpoints import (
     should_use_transformer_engine_for_checkpoint,
 )
 from squeezeformer_pytorch.data import (
+    ASRDataset,
     AudioFeaturizer,
-    CV22ASRDataset,
     create_dataloader,
-    download_cv22_dataset,
-    load_cv22_records,
+    download_dataset,
+    load_records,
     prevalidate_records,
 )
 from squeezeformer_pytorch.model import SqueezeformerConfig
@@ -174,12 +174,12 @@ def main() -> None:
         else checkpoint_tokenizer_type != "sentencepiece"
     )
 
-    dataset_root = download_cv22_dataset(
+    dataset_root = download_dataset(
         repo_id=args.dataset_repo,
         token=args.hf_token,
         cache_dir=args.cache_dir,
     )
-    records = load_cv22_records(
+    records = load_records(
         dataset_root=dataset_root,
         split=args.split,
         seed=args.seed,
@@ -198,7 +198,7 @@ def main() -> None:
     feature_cache_dir = (
         Path(args.feature_cache_dir) / args.split if args.feature_cache_dir else None
     )
-    dataset = CV22ASRDataset(
+    dataset = ASRDataset(
         records,
         tokenizer=tokenizer,
         featurizer=featurizer,

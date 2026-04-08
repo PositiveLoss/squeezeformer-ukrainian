@@ -627,7 +627,7 @@ def load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[Tenso
     raise FileNotFoundError("Audio source is not available.")
 
 
-def download_cv22_dataset(
+def download_dataset(
     repo_id: str,
     token: str | None,
     cache_dir: str | None = None,
@@ -647,7 +647,7 @@ def download_cv22_dataset(
     return Path(local_path)
 
 
-def load_cv22_records(
+def load_records(
     dataset_root: Path,
     split: str,
     seed: int,
@@ -660,7 +660,7 @@ def load_cv22_records(
     lowercase_transcripts: bool = True,
 ) -> list[CVRecord]:
     records = list(
-        iter_cv22_records(
+        iter_records(
             dataset_root=dataset_root,
             split=split,
             seed=seed,
@@ -678,7 +678,7 @@ def load_cv22_records(
     return records
 
 
-def iter_cv22_records(
+def iter_records(
     dataset_root: Path,
     split: str,
     seed: int,
@@ -741,7 +741,7 @@ def iter_cv22_records(
         raise RuntimeError("No usable records were found in the dataset manifests.")
 
 
-def iter_cv22_records_from_source(
+def iter_records_from_source(
     source: str | Path,
     *,
     split: str,
@@ -811,14 +811,14 @@ def iter_cv22_records_from_source(
         raise RuntimeError("No usable records were found in the dataset manifests.")
 
 
-def load_cv22_corpus_texts(
+def load_corpus_texts(
     dataset_root: Path,
     deduplicate: bool = False,
     max_samples: int | None = None,
     lowercase_transcripts: bool = True,
 ) -> list[str]:
     texts = list(
-        iter_cv22_corpus_texts(
+        iter_corpus_texts(
             dataset_root=dataset_root,
             deduplicate=deduplicate,
             max_samples=max_samples,
@@ -830,7 +830,7 @@ def load_cv22_corpus_texts(
     return texts
 
 
-def iter_cv22_corpus_texts_from_repo(
+def iter_corpus_texts_from_repo(
     repo_id: str,
     token: str | None,
     deduplicate: bool = False,
@@ -855,7 +855,7 @@ def iter_cv22_corpus_texts_from_repo(
                 return
 
 
-def iter_cv22_corpus_texts(
+def iter_corpus_texts(
     dataset_root: Path,
     deduplicate: bool = False,
     max_samples: int | None = None,
@@ -905,7 +905,7 @@ def feature_cache_path(
     return feature_cache_path / f"{safe_utterance_id}_{frontend_hash}.pt"
 
 
-class CV22ASRDataset(Dataset[dict[str, Any]]):
+class ASRDataset(Dataset[dict[str, Any]]):
     def __init__(
         self,
         records: list[CVRecord],
@@ -1216,7 +1216,7 @@ def collate_asr_batch(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def create_dataloader(
-    dataset: CV22ASRDataset,
+    dataset: ASRDataset,
     batch_size: int,
     shuffle: bool,
     num_workers: int,
