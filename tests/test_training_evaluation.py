@@ -187,6 +187,34 @@ def test_encoder_output_diagnostics_capture_mean_std_and_norm() -> None:
     assert diagnostics["avg_token_l2_norm"] > 2.2
 
 
+def test_top_emitted_token_histogram_reports_dominant_tokens() -> None:
+    tokenizer = CharacterTokenizer(symbols=["a", "b"])
+    log_probs = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.05, 0.90, 0.05],
+                    [0.05, 0.90, 0.05],
+                    [0.05, 0.05, 0.90],
+                    [0.90, 0.05, 0.05],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    histogram = training_evaluation.top_emitted_token_histogram(
+        log_probs,
+        output_lengths=torch.tensor([3]),
+        tokenizer=tokenizer,
+        top_k=3,
+    )
+
+    assert histogram[0][2] == "a"
+    assert abs(histogram[0][1] - (2.0 / 3.0)) < 1e-6
+    assert histogram[1][2] == "b"
+
+
 def test_evaluate_restores_model_mode(monkeypatch) -> None:
     class DummyTokenizer:
         blank_id = 0

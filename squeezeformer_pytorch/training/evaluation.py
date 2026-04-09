@@ -223,6 +223,40 @@ def summarize_encoder_output_diagnostics(diagnostics: dict[str, float]) -> dict[
     }
 
 
+def top_emitted_token_histogram(
+    log_probs: torch.Tensor,
+    output_lengths: torch.Tensor,
+    tokenizer: Tokenizer,
+    *,
+    top_k: int = 5,
+) -> list[tuple[int, float, str]]:
+    valid_mask = (
+        torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(0)
+        < output_lengths.unsqueeze(1)
+    )
+    valid_frames = int(valid_mask.sum().item())
+    if valid_frames <= 0:
+        return []
+
+    top_token_ids = log_probs.argmax(dim=-1).masked_select(valid_mask)
+    counts = torch.bincount(top_token_ids, minlength=log_probs.size(-1)).float()
+    if counts.numel() == 0:
+        return []
+    top_count = min(max(1, top_k), int((counts > 0).sum().item()))
+    top_values, top_indices = torch.topk(counts, k=top_count)
+
+    histogram: list[tuple[int, float, str]] = []
+    for token_id, count in zip(top_indices.tolist(), top_values.tolist(), strict=True):
+        if token_id == tokenizer.blank_id:
+            token_text = "<blank>"
+        else:
+            token_text = tokenizer.decode([token_id]).replace("\n", "\\n")
+            if not token_text:
+                token_text = f"<id:{token_id}>"
+        histogram.append((int(token_id), float(count) / float(valid_frames), token_text))
+    return histogram
+
+
 def summarize_ctc_batch_diagnostics(diagnostics: dict[str, float]) -> dict[str, float]:
     decoded_frames = max(1.0, float(diagnostics.get("decoded_frames", 0.0)))
     sample_count = max(1.0, float(diagnostics.get("sample_count", 0.0)))

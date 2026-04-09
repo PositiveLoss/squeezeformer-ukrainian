@@ -82,6 +82,7 @@ from squeezeformer_pytorch.training.evaluation import (
     summarize_ctc_batch_diagnostics,
     summarize_encoder_output_diagnostics,
     summarize_ctc_logit_diagnostics,
+    top_emitted_token_histogram,
 )
 from squeezeformer_pytorch.training.evaluation import (
     decode_batch as _evaluation_decode_batch,
@@ -1598,6 +1599,12 @@ def main() -> None:
                                 output_lengths,
                             )
                         )
+                        top_token_histogram = top_emitted_token_histogram(
+                            log_probs,
+                            output_lengths,
+                            tokenizer,
+                            top_k=5,
+                        )
                     else:
                         ctc_diagnostics = {
                             "avg_blank_probability": 0.0,
@@ -1621,6 +1628,7 @@ def main() -> None:
                             "avg_std": 0.0,
                             "avg_token_l2_norm": 0.0,
                         }
+                        top_token_histogram = []
                 if is_main_process and should_log_step:
                     learning_rates = {
                         f"learning_rate_{name}": optimizer.param_groups[0]["lr"]
@@ -1712,17 +1720,22 @@ def main() -> None:
                         " ".join(f"{name}={value:.6g}" for name, value in learning_rates.items()),
                     )
                     if log_probs is not None:
+                        top_token_histogram_text = ", ".join(
+                            f"{token_text}:{fraction:.3f}"
+                            for _token_id, fraction, token_text in top_token_histogram
+                        )
                         preview_hypothesis = greedy_decode(
                             log_probs[:1],
                             output_lengths[:1],
                             tokenizer,
                         )[0]
                         logger.info(
-                            "train preview ref=%r hyp=%r avg_output_frames=%.1f avg_target_tokens=%.1f",
+                            "train preview ref=%r hyp=%r avg_output_frames=%.1f avg_target_tokens=%.1f top_tokens=%s",
                             _truncate_for_log(batch["transcripts"][0]),
                             _truncate_for_log(preview_hypothesis),
                             ctc_diagnostics["avg_output_frames"],
                             ctc_diagnostics["avg_target_tokens"],
+                            top_token_histogram_text,
                         )
                     trackio.log(
                         {
