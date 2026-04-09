@@ -74,6 +74,9 @@ from squeezeformer_pytorch.training.evaluation import (
     _aed_cross_entropy_loss,
     _build_aed_targets,
     _evaluate_and_checkpoint,
+    ctc_batch_diagnostics,
+    greedy_decode,
+    summarize_ctc_batch_diagnostics,
 )
 from squeezeformer_pytorch.training.evaluation import (
     decode_batch as _evaluation_decode_batch,
@@ -128,6 +131,12 @@ Format = _training_runtime.Format
 DelayedScaling = _training_runtime.DelayedScaling
 ExternalMuon = _training_runtime.ExternalMuon
 _export_inference_checkpoint = _training_runtime._export_inference_checkpoint
+
+
+def _truncate_for_log(value: str, *, limit: int = 120) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[: max(0, limit - 3)]}..."
 
 
 def _build_trackio_run_name(
@@ -1188,6 +1197,9 @@ def main() -> None:
                 decoder_inputs = None
                 decoder_targets = None
                 decoder_target_lengths = None
+            next_global_step = global_step + 1 if should_step else global_step
+            should_log_step = should_step and next_global_step % args.log_every == 0
+            should_collect_log_probs = should_log_step and is_main_process
 
             sync_context = (
                 forward_model.no_sync()
@@ -1203,11 +1215,14 @@ def main() -> None:
                         targets=targets,
                         target_lengths=target_lengths,
                         blank_id=tokenizer.blank_id,
+                        return_main_log_probs=should_collect_log_probs,
                         decoder_inputs=decoder_inputs,
                         liberta_lengths=decoder_target_lengths,
                     )
                     main_ctc_loss = forward_outputs["main_ctc_loss"]
                     intermediate_ctc_losses_map = forward_outputs["intermediate_ctc_losses"]
+                    output_lengths = forward_outputs["output_lengths"]
+                    log_probs = forward_outputs.get("main_log_probs")
                     aed_logits = forward_outputs.get("aed_logits")
                     liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
                     audio_teacher_student_states = forward_outputs.get(
@@ -1322,7 +1337,6 @@ def main() -> None:
                         device=device,
                     )
 
-                should_log_step = global_step % args.log_every == 0
                 if should_log_step:
                     train_loss_step = _distributed_mean(
                         float(loss.item()),
@@ -1378,19 +1392,48 @@ def main() -> None:
                         device=device,
                         distributed=distributed,
                     )
+                    if log_probs is not None:
+                        ctc_diagnostics = summarize_ctc_batch_diagnostics(
+                            ctc_batch_diagnostics(
+                                log_probs,
+                                output_lengths,
+                                tokenizer,
+                                target_lengths=target_lengths,
+                            )
+                        )
+                    else:
+                        ctc_diagnostics = {
+                            "avg_blank_probability": 0.0,
+                            "argmax_blank_fraction": 0.0,
+                            "avg_top_nonblank_probability": 0.0,
+                            "avg_output_frames": 0.0,
+                            "avg_target_tokens": 0.0,
+                            "target_tokens_per_frame": 0.0,
+                        }
                 if is_main_process and should_log_step:
                     learning_rates = {
                         f"learning_rate_{name}": optimizer.param_groups[0]["lr"]
                         for name, optimizer in zip(optimizer_names, optimizers, strict=True)
                     }
                     memory_snapshot = _format_memory_snapshot(device)
+                    intermediate_loss_detail = (
+                        " ".join(
+                            f"layer{layer_index}_ctc={float(intermediate_ctc_losses_map[layer_index].item()):.4f}"
+                            for layer_index in sorted(intermediate_ctc_losses_map)
+                        )
+                        if intermediate_ctc_losses_map
+                        else ""
+                    )
                     logger.info(
                         (
                             "epoch=%s step=%s/%s global_step=%s train_loss=%.4f "
                             "train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f "
                             "train_aed_loss=%.4f train_liberta_distill_loss=%.4f "
                             "train_audio_teacher_loss=%.4f "
-                            "batch_audio_minutes=%.2f grad_norm=%.4f max_feature_frames=%s %s %s"
+                            "batch_audio_minutes=%.2f grad_norm=%.4f max_feature_frames=%s "
+                            "train_avg_blank_prob=%.4f train_argmax_blank_frac=%.4f "
+                            "train_avg_top_nonblank_prob=%.4f train_target_tokens_per_frame=%.4f "
+                            "%s %s %s"
                         ),
                         epoch,
                         batch_index,
@@ -1405,9 +1448,27 @@ def main() -> None:
                         batch_audio_minutes,
                         grad_norm,
                         max_feature_frames,
+                        ctc_diagnostics["avg_blank_probability"],
+                        ctc_diagnostics["argmax_blank_fraction"],
+                        ctc_diagnostics["avg_top_nonblank_probability"],
+                        ctc_diagnostics["target_tokens_per_frame"],
+                        intermediate_loss_detail,
                         memory_snapshot,
                         " ".join(f"{name}={value:.6g}" for name, value in learning_rates.items()),
                     )
+                    if log_probs is not None:
+                        preview_hypothesis = greedy_decode(
+                            log_probs[:1],
+                            output_lengths[:1],
+                            tokenizer,
+                        )[0]
+                        logger.info(
+                            "train preview ref=%r hyp=%r avg_output_frames=%.1f avg_target_tokens=%.1f",
+                            _truncate_for_log(batch["transcripts"][0]),
+                            _truncate_for_log(preview_hypothesis),
+                            ctc_diagnostics["avg_output_frames"],
+                            ctc_diagnostics["avg_target_tokens"],
+                        )
                     trackio.log(
                         {
                             "epoch": epoch,
@@ -1420,6 +1481,18 @@ def main() -> None:
                             "train_audio_teacher_loss_step": train_audio_teacher_loss_step,
                             "grad_norm": grad_norm,
                             "train_max_feature_frames_step": max_feature_frames,
+                            "train_avg_blank_probability_step": ctc_diagnostics[
+                                "avg_blank_probability"
+                            ],
+                            "train_argmax_blank_fraction_step": ctc_diagnostics[
+                                "argmax_blank_fraction"
+                            ],
+                            "train_avg_top_nonblank_probability_step": ctc_diagnostics[
+                                "avg_top_nonblank_probability"
+                            ],
+                            "train_target_tokens_per_frame_step": ctc_diagnostics[
+                                "target_tokens_per_frame"
+                            ],
                             "ema_decay": ema.current_decay() if ema is not None else 0.0,
                             "cpu_rss_bytes": _read_proc_status_memory_bytes("VmRSS:") or 0,
                             "cpu_peak_rss_bytes": (

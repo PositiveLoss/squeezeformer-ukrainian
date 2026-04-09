@@ -77,6 +77,37 @@ def test_beam_decode_ignores_padded_frames() -> None:
     assert decoded == ["a"]
 
 
+def test_ctc_batch_diagnostics_capture_blank_and_nonblank_signal() -> None:
+    tokenizer = CharacterTokenizer(symbols=["a", "b"])
+    log_probs = torch.log(
+        torch.tensor(
+            [
+                [
+                    [0.80, 0.15, 0.05],
+                    [0.10, 0.70, 0.20],
+                    [0.85, 0.10, 0.05],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+    )
+
+    diagnostics = training_evaluation.summarize_ctc_batch_diagnostics(
+        training_evaluation.ctc_batch_diagnostics(
+            log_probs,
+            output_lengths=torch.tensor([2]),
+            tokenizer=tokenizer,
+            target_lengths=torch.tensor([1]),
+        )
+    )
+
+    assert diagnostics["argmax_blank_fraction"] == 0.5
+    assert diagnostics["avg_output_frames"] == 2.0
+    assert diagnostics["avg_target_tokens"] == 1.0
+    assert diagnostics["target_tokens_per_frame"] == 0.5
+    assert diagnostics["avg_blank_probability"] > diagnostics["avg_top_nonblank_probability"]
+
+
 def test_evaluate_restores_model_mode(monkeypatch) -> None:
     class DummyTokenizer:
         blank_id = 0

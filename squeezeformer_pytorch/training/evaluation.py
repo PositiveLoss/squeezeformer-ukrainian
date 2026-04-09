@@ -88,6 +88,63 @@ def decode_batch(
     ]
 
 
+def ctc_batch_diagnostics(
+    log_probs: torch.Tensor,
+    output_lengths: torch.Tensor,
+    tokenizer: Tokenizer,
+    *,
+    target_lengths: torch.Tensor | None = None,
+) -> dict[str, float]:
+    valid_mask = (
+        torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(0)
+        < output_lengths.unsqueeze(1)
+    )
+    valid_frames = int(valid_mask.sum().item())
+    blank_probabilities = log_probs[..., tokenizer.blank_id].exp()
+    argmax_tokens = log_probs.argmax(dim=-1)
+    argmax_blank_frames = int(
+        ((argmax_tokens == tokenizer.blank_id) & valid_mask).sum().item()
+    )
+
+    nonblank_log_probs = log_probs.clone()
+    nonblank_log_probs[..., tokenizer.blank_id] = float("-inf")
+    top_nonblank_probabilities = nonblank_log_probs.max(dim=-1).values.exp()
+
+    diagnostics = {
+        "blank_probability_sum": float(blank_probabilities.masked_select(valid_mask).sum().item()),
+        "decoded_frames": float(valid_frames),
+        "argmax_blank_frames": float(argmax_blank_frames),
+        "top_nonblank_probability_sum": float(
+            top_nonblank_probabilities.masked_select(valid_mask).sum().item()
+        ),
+        "sample_count": float(output_lengths.numel()),
+        "output_frames_sum": float(output_lengths.sum().item()),
+    }
+    if target_lengths is not None:
+        diagnostics["target_tokens_sum"] = float(target_lengths.sum().item())
+    return diagnostics
+
+
+def summarize_ctc_batch_diagnostics(diagnostics: dict[str, float]) -> dict[str, float]:
+    decoded_frames = max(1.0, float(diagnostics.get("decoded_frames", 0.0)))
+    sample_count = max(1.0, float(diagnostics.get("sample_count", 0.0)))
+    target_tokens_sum = float(diagnostics.get("target_tokens_sum", 0.0))
+    output_frames_sum = float(diagnostics.get("output_frames_sum", 0.0))
+    return {
+        "avg_blank_probability": float(diagnostics.get("blank_probability_sum", 0.0))
+        / decoded_frames,
+        "argmax_blank_fraction": float(diagnostics.get("argmax_blank_frames", 0.0))
+        / decoded_frames,
+        "avg_top_nonblank_probability": float(
+            diagnostics.get("top_nonblank_probability_sum", 0.0)
+        )
+        / decoded_frames,
+        "avg_output_frames": output_frames_sum / sample_count,
+        "avg_target_tokens": target_tokens_sum / sample_count,
+        "target_tokens_per_frame": target_tokens_sum / decoded_frames,
+    }
+
+
 def _bucket_name(reference: str) -> str:
     word_count = len(reference.split())
     if word_count <= 5:
@@ -227,6 +284,10 @@ def _merge_evaluation_shards(
     total_decode_seconds = 0.0
     total_blank_probability = 0.0
     total_decoded_frames = 0
+    total_argmax_blank_frames = 0.0
+    total_top_nonblank_probability = 0.0
+    total_target_tokens = 0.0
+    total_samples = 0.0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -246,6 +307,12 @@ def _merge_evaluation_shards(
         total_decode_seconds += float(shard.get("total_decode_seconds", 0.0))
         total_blank_probability += float(shard.get("total_blank_probability", 0.0))
         total_decoded_frames += int(shard.get("total_decoded_frames", 0))
+        total_argmax_blank_frames += float(shard.get("total_argmax_blank_frames", 0.0))
+        total_top_nonblank_probability += float(
+            shard.get("total_top_nonblank_probability", 0.0)
+        )
+        total_target_tokens += float(shard.get("total_target_tokens", 0.0))
+        total_samples += float(shard.get("total_samples", 0.0))
         references.extend(shard["references"])
         hypotheses.extend(shard["hypotheses"])
         utterance_ids.extend(shard["utterance_ids"])
@@ -262,8 +329,20 @@ def _merge_evaluation_shards(
         "audio_teacher_loss": total_audio_teacher_loss / max(1, total_batches),
         "cer": char_error_rate(references, hypotheses),
         "wer": word_error_rate(references, hypotheses),
-        "avg_blank_probability": total_blank_probability / max(1, total_decoded_frames),
     }
+    metrics.update(
+        summarize_ctc_batch_diagnostics(
+            {
+                "blank_probability_sum": total_blank_probability,
+                "decoded_frames": float(total_decoded_frames),
+                "argmax_blank_frames": total_argmax_blank_frames,
+                "top_nonblank_probability_sum": total_top_nonblank_probability,
+                "sample_count": total_samples,
+                "output_frames_sum": float(total_decoded_frames),
+                "target_tokens_sum": total_target_tokens,
+            }
+        )
+    )
     metrics.update(length_bucket_metrics(references, hypotheses))
     metrics.update(decoding_debug_metrics(hypotheses))
     speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
@@ -329,6 +408,10 @@ def evaluate(
     total_decode_seconds = 0.0
     total_blank_probability = 0.0
     total_decoded_frames = 0
+    total_argmax_blank_frames = 0.0
+    total_top_nonblank_probability = 0.0
+    total_target_tokens = 0.0
+    total_samples = 0.0
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -470,14 +553,18 @@ def evaluate(
                 utterance_ids.extend(batch["utterance_ids"])
                 speaker_ids.extend(batch["speaker_ids"])
                 has_speaker_ids.extend(batch["has_speaker_ids"])
-                valid_mask = torch.arange(
-                    log_probs.size(1), device=output_lengths.device
-                ).unsqueeze(0) < output_lengths.unsqueeze(1)
-                blank_probabilities = log_probs[..., tokenizer.blank_id].exp()
-                total_blank_probability += float(
-                    blank_probabilities.masked_select(valid_mask).sum().item()
+                diagnostics = ctc_batch_diagnostics(
+                    log_probs,
+                    output_lengths,
+                    tokenizer,
+                    target_lengths=target_lengths,
                 )
-                total_decoded_frames += int(output_lengths.sum().item())
+                total_blank_probability += diagnostics["blank_probability_sum"]
+                total_decoded_frames += int(diagnostics["decoded_frames"])
+                total_argmax_blank_frames += diagnostics["argmax_blank_frames"]
+                total_top_nonblank_probability += diagnostics["top_nonblank_probability_sum"]
+                total_target_tokens += diagnostics.get("target_tokens_sum", 0.0)
+                total_samples += diagnostics["sample_count"]
                 decode_start_time = time.perf_counter()
                 decoded_hypotheses = decode_batch(
                     log_probs,
@@ -507,6 +594,10 @@ def evaluate(
         "total_decode_seconds": total_decode_seconds,
         "total_blank_probability": total_blank_probability,
         "total_decoded_frames": total_decoded_frames,
+        "total_argmax_blank_frames": total_argmax_blank_frames,
+        "total_top_nonblank_probability": total_top_nonblank_probability,
+        "total_target_tokens": total_target_tokens,
+        "total_samples": total_samples,
         "references": references,
         "hypotheses": hypotheses,
         "utterance_ids": utterance_ids,
@@ -826,7 +917,9 @@ def _evaluate_and_checkpoint(
                 "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
                 "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
                 "val_liberta_distill_loss=%.4f val_audio_teacher_loss=%.4f val_cer=%.4f val_wer=%.4f "
-                "val_avg_blank_prob=%.4f val_empty_hyp_frac=%.4f "
+                "val_avg_blank_prob=%.4f val_argmax_blank_frac=%.4f "
+                "val_avg_top_nonblank_prob=%.4f val_target_tokens_per_frame=%.4f "
+                "val_empty_hyp_frac=%.4f "
                 "val_avg_hyp_chars=%.2f val_avg_hyp_words=%.2f "
                 "val_model_source=%s best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
                 "timing_decode=%.2fs timing_gather=%.2fs timing_checkpoint_export=%.2fs "
@@ -844,6 +937,9 @@ def _evaluate_and_checkpoint(
             float(val_metrics["cer"]),
             float(val_metrics["wer"]),
             float(val_metrics["avg_blank_probability"]),
+            float(val_metrics["argmax_blank_fraction"]),
+            float(val_metrics["avg_top_nonblank_probability"]),
+            float(val_metrics["target_tokens_per_frame"]),
             float(val_metrics["decoded_empty_fraction"]),
             float(val_metrics["decoded_avg_char_length"]),
             float(val_metrics["decoded_avg_word_length"]),
@@ -878,6 +974,13 @@ def _evaluate_and_checkpoint(
             best_safetensors_path if best_safetensors_path.exists() else "n/a",
             _safetensors_path(averaged_path).as_posix() if averaged_path is not None else "n/a",
         )
+        if validation["hardest_examples"]:
+            hardest = validation["hardest_examples"][0]
+            logger.info(
+                "validation preview hardest_ref=%r hardest_hyp=%r",
+                hardest["reference"][:120],
+                hardest["hypothesis"][:120],
+            )
         return updated_best_val_wer
     finally:
         _load_cloned_state_dict(model, raw_state_dict)
