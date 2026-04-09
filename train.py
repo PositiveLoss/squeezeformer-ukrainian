@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from contextlib import nullcontext
 from copy import deepcopy
@@ -127,6 +128,27 @@ Format = _training_runtime.Format
 DelayedScaling = _training_runtime.DelayedScaling
 ExternalMuon = _training_runtime.ExternalMuon
 _export_inference_checkpoint = _training_runtime._export_inference_checkpoint
+
+
+def _build_trackio_run_name(
+    *,
+    trackio_project: str,
+    output_dir: Path,
+    start_epoch: int,
+    global_step: int,
+    process_start_time: float,
+) -> str:
+    base_name = trackio_project.strip() or output_dir.name or "training"
+    normalized_base_name = re.sub(r"[^A-Za-z0-9._-]+", "-", base_name).strip("-")
+    if not normalized_base_name:
+        normalized_base_name = "training"
+    timestamp = datetime.fromtimestamp(process_start_time, tz=timezone.utc).strftime(
+        "%Y%m%d_%H%M%S"
+    )
+    run_name = f"{normalized_base_name}_{timestamp}"
+    if global_step > 0 or start_epoch > 1:
+        run_name = f"{run_name}_resume-e{start_epoch:04d}-s{global_step:08d}"
+    return run_name
 
 
 def _distributed_mean(value: float, *, device: torch.device, distributed: bool) -> float:
@@ -1005,8 +1027,16 @@ def main() -> None:
         )
 
     if is_main_process:
+        trackio_run_name = _build_trackio_run_name(
+            trackio_project=args.trackio_project,
+            output_dir=output_dir,
+            start_epoch=start_epoch,
+            global_step=global_step,
+            process_start_time=process_start_time,
+        )
         trackio.init(
             project=args.trackio_project,
+            name=trackio_run_name,
             space_id=args.trackio_space_id,
             config={
                 **vars(args),
@@ -1030,8 +1060,9 @@ def main() -> None:
             },
         )
         logger.info(
-            "trackio initialized project=%s trackio_dir=%s elapsed_since_start=%s",
+            "trackio initialized project=%s run_name=%s trackio_dir=%s elapsed_since_start=%s",
             args.trackio_project,
+            trackio_run_name,
             trackio_dir,
             _format_elapsed_seconds(time.perf_counter() - process_start_time),
         )

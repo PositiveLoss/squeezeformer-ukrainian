@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 
 import trackio
@@ -44,6 +45,7 @@ from squeezeformer_pytorch.training.runtime import (
     _validate_device_ready,
     resolve_device,
 )
+from train import _build_trackio_run_name
 
 
 def parse_args() -> argparse.Namespace:
@@ -338,6 +340,13 @@ def main() -> None:
         report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     if args.trackio:
+        trackio_run_name = _build_trackio_run_name(
+            trackio_project=args.trackio_project,
+            output_dir=Path(args.checkpoint).expanduser().resolve().parent,
+            start_epoch=1,
+            global_step=0,
+            process_start_time=time.time(),
+        )
         trackio_config = {
             "evaluation_split": args.split,
             "checkpoint": str(args.checkpoint),
@@ -345,6 +354,7 @@ def main() -> None:
         }
         trackio.init(
             project=args.trackio_project,
+            name=trackio_run_name,
             space_id=args.trackio_space_id,
             config=trackio_config,
         )

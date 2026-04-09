@@ -468,6 +468,117 @@ def test_evaluate_can_select_raw_resume_weights(monkeypatch) -> None:
     assert captured["state_dict"] == {"weight": "raw"}
 
 
+def test_evaluate_trackio_uses_meaningful_run_name(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyTokenizer:
+        vocab_size = 32
+        blank_id = 0
+
+    class DummyModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def load_state_dict(self, _state_dict):
+            return None
+
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    class DummyFeaturizer:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    class DummyDataset:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+    monkeypatch.setattr(
+        evaluate,
+        "parse_args",
+        lambda: type(
+            "Args",
+            (),
+            {
+                "checkpoint": "artifacts/demo/checkpoint_last.safetensors",
+                "dataset_repo": "repo",
+                "dataset_source": None,
+                "validation_dataset_source": None,
+                "hf_token": None,
+                "cache_dir": None,
+                "split": "validation",
+                "batch_size": 1,
+                "num_workers": 0,
+                "seed": 13,
+                "val_fraction": 0.1,
+                "test_fraction": 0.1,
+                "max_samples": None,
+                "feature_cache_dir": None,
+                "lowercase_transcripts": None,
+                "bucket_by_length": True,
+                "pin_memory": False,
+                "persistent_workers": False,
+                "prefetch_factor": 2,
+                "prevalidate_audio": False,
+                "prevalidate_workers": 1,
+                "device": "cpu",
+                "dtype": DTypeChoice.FLOAT32,
+                "decode_strategy": "greedy",
+                "beam_size": 8,
+                "lm_scorer": None,
+                "lm_weight": 0.0,
+                "example_limit": 1,
+                "validation_model_source": None,
+                "report_path": None,
+                "trackio": True,
+                "trackio_project": "demo-project",
+                "trackio_space_id": None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        evaluate,
+        "load_checkpoint",
+        lambda *_args, **_kwargs: _build_checkpoint(tokenizer_type="character"),
+    )
+    monkeypatch.setattr(evaluate, "tokenizer_from_dict", lambda *_args, **_kwargs: DummyTokenizer())
+    monkeypatch.setattr(evaluate, "SqueezeformerCTC", DummyModel)
+    monkeypatch.setattr(evaluate, "resolve_device", lambda *_args, **_kwargs: "cpu")
+    monkeypatch.setattr(evaluate, "_validate_device_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evaluate, "_load_records_from_dataset_roots", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(evaluate, "AudioFeaturizer", DummyFeaturizer)
+    monkeypatch.setattr(evaluate, "ASRDataset", DummyDataset)
+    monkeypatch.setattr(evaluate, "create_dataloader", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(evaluate, "load_lm_scorer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        evaluate,
+        "evaluate",
+        lambda **_kwargs: {
+            "metrics": {},
+            "hardest_examples": [],
+            "random_examples": [],
+            "speaker_metrics": {},
+        },
+    )
+    monkeypatch.setattr(evaluate.time, "time", lambda: 0.0)
+    monkeypatch.setattr(
+        evaluate.trackio,
+        "init",
+        lambda **kwargs: captured.setdefault("trackio_init_kwargs", kwargs),
+    )
+    monkeypatch.setattr(evaluate.trackio, "log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evaluate.trackio, "finish", lambda: None)
+
+    evaluate.main()
+
+    assert (
+        captured["trackio_init_kwargs"]["name"] == "demo-project_19700101_000000"
+    )
+
+
 def test_evaluation_runtime_resolves_audio_teacher_metadata() -> None:
     settings = resolve_evaluation_checkpoint_settings(
         {
