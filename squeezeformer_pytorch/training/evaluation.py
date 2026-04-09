@@ -181,6 +181,48 @@ def summarize_ctc_logit_diagnostics(diagnostics: dict[str, float]) -> dict[str, 
     }
 
 
+def encoder_output_diagnostics(
+    encoded: torch.Tensor,
+    output_lengths: torch.Tensor,
+) -> dict[str, float]:
+    valid_mask = (
+        torch.arange(encoded.size(1), device=output_lengths.device).unsqueeze(0)
+        < output_lengths.unsqueeze(1)
+    )
+    valid_frames = int(valid_mask.sum().item())
+    if valid_frames <= 0:
+        return {
+            "decoded_frames": 0.0,
+            "value_sum": 0.0,
+            "value_sq_sum": 0.0,
+            "token_norm_sum": 0.0,
+            "feature_count": 0.0,
+        }
+
+    valid_values = encoded.masked_select(valid_mask.unsqueeze(-1))
+    token_norms = encoded.float().norm(dim=-1).masked_select(valid_mask)
+    return {
+        "decoded_frames": float(valid_frames),
+        "value_sum": float(valid_values.float().sum().item()),
+        "value_sq_sum": float(valid_values.float().square().sum().item()),
+        "token_norm_sum": float(token_norms.sum().item()),
+        "feature_count": float(valid_values.numel()),
+    }
+
+
+def summarize_encoder_output_diagnostics(diagnostics: dict[str, float]) -> dict[str, float]:
+    decoded_frames = max(1.0, float(diagnostics.get("decoded_frames", 0.0)))
+    feature_count = max(1.0, float(diagnostics.get("feature_count", 0.0)))
+    mean_value = float(diagnostics.get("value_sum", 0.0)) / feature_count
+    mean_square = float(diagnostics.get("value_sq_sum", 0.0)) / feature_count
+    variance = max(0.0, mean_square - (mean_value * mean_value))
+    return {
+        "avg_mean": mean_value,
+        "avg_std": variance ** 0.5,
+        "avg_token_l2_norm": float(diagnostics.get("token_norm_sum", 0.0)) / decoded_frames,
+    }
+
+
 def summarize_ctc_batch_diagnostics(diagnostics: dict[str, float]) -> dict[str, float]:
     decoded_frames = max(1.0, float(diagnostics.get("decoded_frames", 0.0)))
     sample_count = max(1.0, float(diagnostics.get("sample_count", 0.0)))

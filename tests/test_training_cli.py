@@ -101,6 +101,22 @@ def test_parse_args_accepts_disable_flash_attention_flag() -> None:
     assert args.disable_flash_attention is True
 
 
+def test_parse_args_accepts_blank_logit_training_controls() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+            "--blank-logit-offset",
+            "0.25",
+            "--blank-logit-regularization-weight",
+            "0.01",
+        ]
+    )
+
+    assert args.blank_logit_offset == 0.25
+    assert args.blank_logit_regularization_weight == 0.01
+
+
 def test_parse_args_accepts_run_trackio_ui_flag() -> None:
     args = parse_args(
         [

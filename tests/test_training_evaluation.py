@@ -163,6 +163,30 @@ def test_ctc_logit_diagnostics_capture_margin_and_entropy_signal() -> None:
     assert diagnostics["avg_entropy"] > 0.0
 
 
+def test_encoder_output_diagnostics_capture_mean_std_and_norm() -> None:
+    encoded = torch.tensor(
+        [
+            [
+                [1.0, -1.0],
+                [3.0, 1.0],
+                [100.0, 100.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    diagnostics = training_evaluation.summarize_encoder_output_diagnostics(
+        training_evaluation.encoder_output_diagnostics(
+            encoded,
+            output_lengths=torch.tensor([2]),
+        )
+    )
+
+    assert diagnostics["avg_mean"] == 1.0
+    assert abs(diagnostics["avg_std"] - torch.tensor(2.0**0.5).item()) < 1e-6
+    assert diagnostics["avg_token_l2_norm"] > 2.2
+
+
 def test_evaluate_restores_model_mode(monkeypatch) -> None:
     class DummyTokenizer:
         blank_id = 0

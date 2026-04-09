@@ -77,8 +77,10 @@ from squeezeformer_pytorch.training.evaluation import (
     _evaluate_and_checkpoint,
     ctc_batch_diagnostics,
     ctc_logit_diagnostics,
+    encoder_output_diagnostics,
     greedy_decode,
     summarize_ctc_batch_diagnostics,
+    summarize_encoder_output_diagnostics,
     summarize_ctc_logit_diagnostics,
 )
 from squeezeformer_pytorch.training.evaluation import (
@@ -1085,6 +1087,8 @@ def main() -> None:
             audio_teacher.hidden_size if audio_teacher is not None else encoder_config.d_model
         ),
         audio_teacher_target=audio_teacher_target,
+        blank_logit_offset=args.blank_logit_offset,
+        blank_logit_regularization_weight=args.blank_logit_regularization_weight,
         use_transformer_engine=args.dtype == DTypeChoice.FP8,
     )
     model.to(device)
@@ -1276,6 +1280,7 @@ def main() -> None:
         running_loss = 0.0
         running_main_ctc_loss = 0.0
         running_intermediate_ctc_loss = 0.0
+        running_blank_logit_regularization_loss = 0.0
         running_aed_loss = 0.0
         running_liberta_distill_loss = 0.0
         running_audio_teacher_loss = 0.0
@@ -1368,8 +1373,12 @@ def main() -> None:
                         {},
                     )
                     output_lengths = forward_outputs["output_lengths"]
+                    encoded = forward_outputs["encoded"]
                     log_probs = forward_outputs.get("main_log_probs")
                     logits = forward_outputs.get("main_logits")
+                    blank_logit_regularization_loss = forward_outputs.get(
+                        "blank_logit_regularization_loss"
+                    )
                     aed_logits = forward_outputs.get("aed_logits")
                     liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
                     audio_teacher_student_states = forward_outputs.get(
@@ -1388,6 +1397,11 @@ def main() -> None:
                     else:
                         intermediate_ctc_loss = None
                         loss = main_ctc_loss
+                    if blank_logit_regularization_loss is not None:
+                        loss = loss + (
+                            args.blank_logit_regularization_weight
+                            * blank_logit_regularization_loss
+                        )
                     if aed_logits is not None and decoder_targets is not None:
                         aed_loss = _aed_cross_entropy_loss(
                             aed_logits,
@@ -1440,6 +1454,11 @@ def main() -> None:
                 running_main_ctc_loss += float(main_ctc_loss.item())
                 running_intermediate_ctc_loss += float(
                     intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
+                )
+                running_blank_logit_regularization_loss += float(
+                    blank_logit_regularization_loss.item()
+                    if blank_logit_regularization_loss is not None
+                    else 0.0
                 )
                 running_aed_loss += float(aed_loss.item() if aed_loss is not None else 0.0)
                 running_liberta_distill_loss += float(
@@ -1505,6 +1524,15 @@ def main() -> None:
                         device=device,
                         distributed=distributed,
                     )
+                    train_blank_logit_regularization_loss_step = _distributed_mean(
+                        float(
+                            blank_logit_regularization_loss.item()
+                            if blank_logit_regularization_loss is not None
+                            else 0.0
+                        ),
+                        device=device,
+                        distributed=distributed,
+                    )
                     train_aed_loss_step = _distributed_mean(
                         float(aed_loss.item() if aed_loss is not None else 0.0),
                         device=device,
@@ -1564,6 +1592,12 @@ def main() -> None:
                                 tokenizer,
                             )
                         )
+                        encoder_stats = summarize_encoder_output_diagnostics(
+                            encoder_output_diagnostics(
+                                encoded,
+                                output_lengths,
+                            )
+                        )
                     else:
                         ctc_diagnostics = {
                             "avg_blank_probability": 0.0,
@@ -1581,6 +1615,11 @@ def main() -> None:
                             "avg_top2_margin": 0.0,
                             "avg_blank_nonblank_margin": 0.0,
                             "avg_entropy": 0.0,
+                        }
+                        encoder_stats = {
+                            "avg_mean": 0.0,
+                            "avg_std": 0.0,
+                            "avg_token_l2_norm": 0.0,
                         }
                 if is_main_process and should_log_step:
                     learning_rates = {
@@ -1613,6 +1652,7 @@ def main() -> None:
                         (
                             "epoch=%s step=%s/%s global_step=%s train_loss=%.4f "
                             "train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f "
+                            "train_blank_logit_regularization_loss=%.4f "
                             "train_aed_loss=%.4f train_liberta_distill_loss=%.4f "
                             "train_audio_teacher_loss=%.4f "
                             "batch_audio_minutes=%.2f grad_norm=%.4f max_feature_frames=%s "
@@ -1627,6 +1667,8 @@ def main() -> None:
                             "train_blank_weight_grad_norm=%.4f "
                             "train_nonblank_weight_grad_norm_mean=%.4f "
                             "train_blank_bias_grad=%.4f train_nonblank_bias_grad_mean=%.4f "
+                            "train_encoder_mean=%.4f train_encoder_std=%.4f "
+                            "train_encoder_token_l2_norm=%.4f "
                             "%s %s %s %s"
                         ),
                         epoch,
@@ -1636,6 +1678,7 @@ def main() -> None:
                         train_loss_step,
                         train_main_ctc_loss_step,
                         train_intermediate_ctc_loss_step,
+                        train_blank_logit_regularization_loss_step,
                         train_aed_loss_step,
                         train_liberta_distill_loss_step,
                         train_audio_teacher_loss_step,
@@ -1660,6 +1703,9 @@ def main() -> None:
                         head_row_stats["nonblank_weight_grad_norm_mean"],
                         head_row_stats["blank_bias_grad"],
                         head_row_stats["nonblank_bias_grad_mean"],
+                        encoder_stats["avg_mean"],
+                        encoder_stats["avg_std"],
+                        encoder_stats["avg_token_l2_norm"],
                         intermediate_loss_detail,
                         intermediate_length_detail,
                         memory_snapshot,
@@ -1685,6 +1731,9 @@ def main() -> None:
                             "train_loss_step": train_loss_step,
                             "train_main_ctc_loss_step": train_main_ctc_loss_step,
                             "train_intermediate_ctc_loss_step": train_intermediate_ctc_loss_step,
+                            "train_blank_logit_regularization_loss_step": (
+                                train_blank_logit_regularization_loss_step
+                            ),
                             "train_aed_loss_step": train_aed_loss_step,
                             "train_liberta_distill_loss_step": train_liberta_distill_loss_step,
                             "train_audio_teacher_loss_step": train_audio_teacher_loss_step,
@@ -1715,6 +1764,11 @@ def main() -> None:
                                 "avg_blank_nonblank_margin"
                             ],
                             "train_avg_entropy_step": ctc_logit_stats["avg_entropy"],
+                            "train_encoder_mean_step": encoder_stats["avg_mean"],
+                            "train_encoder_std_step": encoder_stats["avg_std"],
+                            "train_encoder_token_l2_norm_step": encoder_stats[
+                                "avg_token_l2_norm"
+                            ],
                             "train_blank_bias_step": head_row_stats["blank_bias"],
                             "train_blank_weight_norm_step": head_row_stats[
                                 "blank_weight_norm"
@@ -1768,6 +1822,9 @@ def main() -> None:
                                         "loss_step": train_loss_step,
                                         "main_ctc_loss_step": train_main_ctc_loss_step,
                                         "intermediate_ctc_loss_step": train_intermediate_ctc_loss_step,
+                                        "blank_logit_regularization_loss_step": (
+                                            train_blank_logit_regularization_loss_step
+                                        ),
                                         "aed_loss_step": train_aed_loss_step,
                                         "liberta_distill_loss_step": (
                                             train_liberta_distill_loss_step
@@ -1803,6 +1860,11 @@ def main() -> None:
                                             "avg_blank_nonblank_margin"
                                         ],
                                         "avg_entropy_step": ctc_logit_stats["avg_entropy"],
+                                        "encoder_mean_step": encoder_stats["avg_mean"],
+                                        "encoder_std_step": encoder_stats["avg_std"],
+                                        "encoder_token_l2_norm_step": encoder_stats[
+                                            "avg_token_l2_norm"
+                                        ],
                                         "blank_bias_step": head_row_stats["blank_bias"],
                                         "blank_weight_norm_step": head_row_stats[
                                             "blank_weight_norm"
@@ -1885,6 +1947,11 @@ def main() -> None:
                         ),
                         "train_intermediate_ctc_loss": _distributed_mean(
                             running_intermediate_ctc_loss / max(1, batch_index),
+                            device=device,
+                            distributed=distributed,
+                        ),
+                        "train_blank_logit_regularization_loss": _distributed_mean(
+                            running_blank_logit_regularization_loss / max(1, batch_index),
                             device=device,
                             distributed=distributed,
                         ),
@@ -1981,6 +2048,11 @@ def main() -> None:
             device=device,
             distributed=distributed,
         )
+        train_blank_logit_regularization_loss = _distributed_mean(
+            running_blank_logit_regularization_loss / max(1, train_batches),
+            device=device,
+            distributed=distributed,
+        )
         train_aed_loss = _distributed_mean(
             running_aed_loss / max(1, train_batches),
             device=device,
@@ -2000,11 +2072,12 @@ def main() -> None:
             _distributed_barrier()
         if is_main_process:
             logger.info(
-                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f train_audio_teacher_loss=%.4f elapsed=%s, starting validation",
+                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_blank_logit_regularization_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f train_audio_teacher_loss=%.4f elapsed=%s, starting validation",
                 epoch,
                 train_loss,
                 train_main_ctc_loss,
                 train_intermediate_ctc_loss,
+                train_blank_logit_regularization_loss,
                 train_aed_loss,
                 train_liberta_distill_loss,
                 train_audio_teacher_loss,
@@ -2036,6 +2109,7 @@ def main() -> None:
                 "train_loss": train_loss,
                 "train_main_ctc_loss": train_main_ctc_loss,
                 "train_intermediate_ctc_loss": train_intermediate_ctc_loss,
+                "train_blank_logit_regularization_loss": train_blank_logit_regularization_loss,
                 "train_aed_loss": train_aed_loss,
                 "train_liberta_distill_loss": train_liberta_distill_loss,
                 "train_audio_teacher_loss": train_audio_teacher_loss,
