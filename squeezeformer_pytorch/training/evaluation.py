@@ -29,6 +29,7 @@ from squeezeformer_pytorch.training.runtime import (
     _autocast_context,
     _average_topk_checkpoints,
     _build_aed_targets,
+    _build_trackio_metric_group_tables,
     _export_inference_checkpoint,
     _safetensors_path,
     _update_top_checkpoints,
@@ -817,6 +818,42 @@ def _evaluate_and_checkpoint(
         )
         if random_examples_table is not None:
             log_payload["val_random_samples"] = random_examples_table
+        log_payload.update(
+            _build_trackio_metric_group_tables(
+                groups={
+                    "losses": {
+                        "val_loss": val_metrics["loss"],
+                    },
+                    "quality": {
+                        "val_cer": val_metrics["cer"],
+                        "val_wer": val_metrics["wer"],
+                        **{
+                            f"val_{key}": value
+                            for key, value in val_metrics.items()
+                            if key not in {"loss", "cer", "wer"}
+                        },
+                    },
+                    "timings": {
+                        "val_forward_seconds": float(
+                            validation_timings.get("forward_seconds", 0.0)
+                        ),
+                        "val_teacher_seconds": float(
+                            validation_timings.get("teacher_seconds", 0.0)
+                        ),
+                        "val_decode_seconds": float(validation_timings.get("decode_seconds", 0.0)),
+                        "val_gather_seconds": float(validation_timings.get("gather_seconds", 0.0)),
+                    },
+                    "train_summary": train_metrics,
+                },
+                dimensions={
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "scope": "validation",
+                    "model_source": selected_source,
+                },
+                name_prefix="validation",
+            )
+        )
         trackio.log(log_payload)
 
         report = {

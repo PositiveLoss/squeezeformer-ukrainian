@@ -93,6 +93,7 @@ from squeezeformer_pytorch.training.runtime import (
     FrozenAudioTeacher,
     FrozenLibertaTeacher,
     _autocast_context,
+    _build_trackio_metric_group_tables,
     _compute_grad_norm,
     _configure_console_logger,
     _configure_trackio_storage,
@@ -1567,6 +1568,89 @@ def main() -> None:
                                 else 0
                             ),
                             **learning_rates,
+                            **_build_trackio_metric_group_tables(
+                                groups={
+                                    "losses": {
+                                        "train_loss_step": train_loss_step,
+                                        "train_main_ctc_loss_step": train_main_ctc_loss_step,
+                                        "train_intermediate_ctc_loss_step": (
+                                            train_intermediate_ctc_loss_step
+                                        ),
+                                        "train_aed_loss_step": train_aed_loss_step,
+                                        "train_liberta_distill_loss_step": (
+                                            train_liberta_distill_loss_step
+                                        ),
+                                        "train_audio_teacher_loss_step": (
+                                            train_audio_teacher_loss_step
+                                        ),
+                                    },
+                                    "ctc_diagnostics": {
+                                        "train_avg_blank_probability_step": ctc_diagnostics[
+                                            "avg_blank_probability"
+                                        ],
+                                        "train_argmax_blank_fraction_step": ctc_diagnostics[
+                                            "argmax_blank_fraction"
+                                        ],
+                                        "train_avg_top_nonblank_probability_step": (
+                                            ctc_diagnostics["avg_top_nonblank_probability"]
+                                        ),
+                                        "train_target_tokens_per_frame_step": ctc_diagnostics[
+                                            "target_tokens_per_frame"
+                                        ],
+                                        "train_avg_output_frames_step": ctc_diagnostics[
+                                            "avg_output_frames"
+                                        ],
+                                        "train_avg_target_tokens_step": ctc_diagnostics[
+                                            "avg_target_tokens"
+                                        ],
+                                    },
+                                    "optimization": {
+                                        "grad_norm": grad_norm,
+                                        "ema_decay": (
+                                            ema.current_decay() if ema is not None else 0.0
+                                        ),
+                                        "train_max_feature_frames_step": max_feature_frames,
+                                        "batch_audio_minutes": batch_audio_minutes,
+                                    },
+                                    "memory": {
+                                        "cpu_rss_bytes": (
+                                            _read_proc_status_memory_bytes("VmRSS:") or 0
+                                        ),
+                                        "cpu_peak_rss_bytes": (
+                                            _read_proc_status_memory_bytes("VmHWM:")
+                                            or _peak_process_memory_bytes()
+                                            or 0
+                                        ),
+                                        "cuda_allocated_bytes": (
+                                            torch.cuda.memory_allocated(device)
+                                            if device.type == "cuda" and torch.cuda.is_available()
+                                            else 0
+                                        ),
+                                        "cuda_reserved_bytes": (
+                                            torch.cuda.memory_reserved(device)
+                                            if device.type == "cuda" and torch.cuda.is_available()
+                                            else 0
+                                        ),
+                                        "cuda_peak_allocated_bytes": (
+                                            torch.cuda.max_memory_allocated(device)
+                                            if device.type == "cuda" and torch.cuda.is_available()
+                                            else 0
+                                        ),
+                                        "cuda_peak_reserved_bytes": (
+                                            torch.cuda.max_memory_reserved(device)
+                                            if device.type == "cuda" and torch.cuda.is_available()
+                                            else 0
+                                        ),
+                                    },
+                                    "learning_rates": learning_rates,
+                                },
+                                dimensions={
+                                    "epoch": epoch,
+                                    "global_step": global_step,
+                                    "scope": "train_step",
+                                },
+                                name_prefix="train_step",
+                            ),
                         }
                     )
 
