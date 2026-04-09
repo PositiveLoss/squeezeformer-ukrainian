@@ -591,6 +591,7 @@ def test_evaluation_runtime_resolves_audio_teacher_metadata() -> None:
     settings = resolve_evaluation_checkpoint_settings(
         {
             "training_args": {
+                "initial_ctc_blank_bias": -0.5,
                 "audio_teacher": True,
                 "audio_teacher_model_name": "facebook/wav2vec2-bert-2.0",
                 "audio_teacher_weight": 0.2,
@@ -603,6 +604,7 @@ def test_evaluation_runtime_resolves_audio_teacher_metadata() -> None:
         }
     )
 
+    assert settings["initial_ctc_blank_bias"] == -0.5
     assert settings["audio_teacher_enabled"] is True
     assert settings["audio_teacher_model_name"] == "facebook/wav2vec2-bert-2.0"
     assert settings["audio_teacher_weight"] == 0.2

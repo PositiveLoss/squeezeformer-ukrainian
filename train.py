@@ -1135,6 +1135,7 @@ def main() -> None:
             audio_teacher.hidden_size if audio_teacher is not None else encoder_config.d_model
         ),
         audio_teacher_target=audio_teacher_target,
+        initial_ctc_blank_bias=args.initial_ctc_blank_bias,
         blank_logit_offset=args.blank_logit_offset,
         blank_logit_regularization_weight=args.blank_logit_regularization_weight,
         use_transformer_engine=args.dtype == DTypeChoice.FP8,

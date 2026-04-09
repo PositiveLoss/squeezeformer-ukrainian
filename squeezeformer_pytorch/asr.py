@@ -24,7 +24,7 @@ from .model import (
 )
 
 _BLANK_PRUNE_TARGET_BYTES = 128 * 1024 * 1024
-_INITIAL_CTC_BLANK_BIAS = -0.5
+DEFAULT_INITIAL_CTC_BLANK_BIAS = 0.0
 DEFAULT_CTC_BEAM_LENGTH_BONUS = 0.1
 
 
@@ -474,6 +474,7 @@ class SqueezeformerCTC(nn.Module):
         audio_teacher_enabled: bool = False,
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
+        initial_ctc_blank_bias: float = DEFAULT_INITIAL_CTC_BLANK_BIAS,
         blank_logit_offset: float = 0.0,
         blank_logit_regularization_weight: float = 0.0,
         use_transformer_engine: bool = False,
@@ -488,6 +489,7 @@ class SqueezeformerCTC(nn.Module):
         self.liberta_distill_enabled = liberta_distill_enabled
         self.audio_teacher_enabled = audio_teacher_enabled
         self.audio_teacher_target = audio_teacher_target
+        self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
         self.blank_logit_offset = float(blank_logit_offset)
         self.blank_logit_regularization_weight = float(blank_logit_regularization_weight)
         self.use_transformer_engine = use_transformer_engine
@@ -535,16 +537,18 @@ class SqueezeformerCTC(nn.Module):
             if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
-        self._initialize_ctc_head(self.classifier)
+        self._initialize_ctc_head(self.classifier, blank_bias=self.initial_ctc_blank_bias)
+        for classifier in self.intermediate_classifiers.values():
+            self._initialize_ctc_head(classifier, blank_bias=self.initial_ctc_blank_bias)
 
     @staticmethod
-    def _initialize_ctc_head(classifier: nn.Module) -> None:
+    def _initialize_ctc_head(classifier: nn.Module, *, blank_bias: float) -> None:
         bias = getattr(classifier, "bias", None)
         if bias is None:
             return
         with torch.no_grad():
             bias.zero_()
-            bias[0] = _INITIAL_CTC_BLANK_BIAS
+            bias[0] = float(blank_bias)
 
     @staticmethod
     def _ctc_length_diagnostics(output_lengths: Tensor, target_lengths: Tensor) -> dict[str, float]:

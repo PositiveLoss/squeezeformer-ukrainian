@@ -267,11 +267,13 @@ def test_inference_runtime_resolves_audio_teacher_metadata() -> None:
         {
             "training_args": {
                 "audio_teacher": True,
+                "initial_ctc_blank_bias": -0.5,
                 "audio_teacher_target": "encoder",
             }
         }
     )
 
+    assert settings["initial_ctc_blank_bias"] == -0.5
     assert settings["audio_teacher_enabled"] is True
     assert settings["audio_teacher_target"] == "encoder"
 

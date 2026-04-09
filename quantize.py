@@ -92,6 +92,7 @@ def build_model(checkpoint_data: dict[str, Any]) -> SqueezeformerCTC:
     blank_prune_threshold = float(training_args.get("blank_prune_threshold", 0.0))
     blank_prune_layer = training_args.get("blank_prune_layer")
     blank_prune_min_keep_frames = int(training_args.get("blank_prune_min_keep_frames", 1))
+    initial_ctc_blank_bias = float(training_args.get("initial_ctc_blank_bias", 0.0))
 
     if intermediate_ctc_weight > 0.0:
         if intermediate_ctc_layers is not None:
@@ -116,6 +117,7 @@ def build_model(checkpoint_data: dict[str, Any]) -> SqueezeformerCTC:
         ),
         blank_prune_threshold=blank_prune_threshold,
         blank_prune_min_keep_frames=blank_prune_min_keep_frames,
+        initial_ctc_blank_bias=initial_ctc_blank_bias,
         use_transformer_engine=False,
     )
     model.load_state_dict(checkpoint_data["model_state_dict"])

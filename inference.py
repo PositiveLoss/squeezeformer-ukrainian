@@ -111,6 +111,7 @@ class ASRInferenceSession:
             blank_prune_layer=checkpoint_settings["blank_prune_layer"],
             blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
             blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
+            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
             aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
             aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
             aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
