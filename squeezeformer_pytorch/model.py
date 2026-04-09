@@ -578,17 +578,26 @@ class ConvolutionModule(nn.Module):
         residual = x
         x = self.input_transform(x)
         x = x.transpose(1, 2)
+        mask = pad_mask.unsqueeze(1).to(dtype=x.dtype) if pad_mask is not None else None
         x = self.pointwise_in(x)
         if self.use_glu:
             x = F.glu(torch.cat([x, x], dim=1), dim=1)
         else:
             x = self.activation1(x)
-        if pad_mask is not None:
-            x = x * pad_mask.unsqueeze(1).to(dtype=x.dtype)
+        if mask is not None:
+            x = x * mask
         x = self.depthwise(x)
+        if mask is not None:
+            x = x * mask
         x = self.batch_norm(x)
+        if mask is not None:
+            x = x * mask
         x = self.activation2(x)
+        if mask is not None:
+            x = x * mask
         x = self.pointwise_out(x)
+        if mask is not None:
+            x = x * mask
         x = x.transpose(1, 2)
         x = self.dropout(x)
         return residual + x

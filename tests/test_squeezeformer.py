@@ -408,6 +408,41 @@ def test_encoder_zeroes_padded_suffixes_after_each_block() -> None:
 
 
 @torch.no_grad()
+def test_convolution_module_masks_padded_suffix_before_batch_norm_statistics() -> None:
+    module = squeezeformer_model.ConvolutionModule(
+        dim=4,
+        kernel_size=3,
+        expansion_factor=2,
+        dropout=0.0,
+    )
+    module.train()
+
+    lengths = torch.tensor([5, 3], dtype=torch.int64)
+    pad_mask = make_sequence_mask(lengths, max_length=5)
+
+    clean = torch.randn(2, 5, 4)
+    masked = clean.clone()
+    masked[1, 3:, :] = 0.0
+
+    polluted = clean.clone()
+    polluted[1, 3:, :] = 1_000.0
+
+    clean_out = module(masked, pad_mask=pad_mask)
+
+    module_patched = squeezeformer_model.ConvolutionModule(
+        dim=4,
+        kernel_size=3,
+        expansion_factor=2,
+        dropout=0.0,
+    )
+    module_patched.load_state_dict(module.state_dict())
+    module_patched.train()
+    polluted_out = module_patched(polluted, pad_mask=pad_mask)
+
+    assert torch.allclose(clean_out[:, :3, :], polluted_out[:, :3, :], atol=1e-5, rtol=1e-4)
+
+
+@torch.no_grad()
 def test_temporal_unet_recovers_subsampled_resolution() -> None:
     model = build_squeezeformer_encoder("sm")
     model.eval()
