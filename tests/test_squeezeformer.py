@@ -23,6 +23,7 @@ from squeezeformer_pytorch import (
 )
 from squeezeformer_pytorch.asr import (
     CharacterTokenizer,
+    _logaddexp,
     load_lm_scorer,
     prune_encoder_frames_by_blank_probability,
 )
@@ -643,6 +644,19 @@ def test_character_tokenizer_encode_fails_on_oov_character() -> None:
         tokenizer.encode("абв")
 
     assert "'в'" in str(error.value)
+
+
+def test_logaddexp_matches_torch_for_finite_and_infinite_inputs() -> None:
+    pairs = [
+        (float("-inf"), -3.0),
+        (-2.0, float("-inf")),
+        (-5.0, -1.0),
+        (-0.5, -0.75),
+    ]
+
+    for left, right in pairs:
+        expected = torch.logaddexp(torch.tensor(left), torch.tensor(right)).item()
+        assert _logaddexp(left, right) == pytest.approx(expected)
 
 
 def test_safetensors_checkpoint_roundtrip(tmp_path: Path) -> None:

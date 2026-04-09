@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import math
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -953,6 +954,16 @@ def load_lm_scorer(spec: str | None) -> Callable[[str], float] | None:
     return scorer
 
 
+def _logaddexp(left: float, right: float) -> float:
+    if left == float("-inf"):
+        return right
+    if right == float("-inf"):
+        return left
+    if left > right:
+        return left + math.log1p(math.exp(right - left))
+    return right + math.log1p(math.exp(left - right))
+
+
 def ctc_prefix_beam_search(
     log_probs: Tensor,
     tokenizer: Tokenizer,
@@ -962,35 +973,50 @@ def ctc_prefix_beam_search(
 ) -> str:
     blank_id = tokenizer.blank_id
     beams: dict[tuple[int, ...], tuple[float, float]] = {(): (0.0, float("-inf"))}
+    decoded_prefix_cache: dict[tuple[int, ...], str] = {(): ""}
+    lm_bonus_cache: dict[tuple[int, ...], float] = {}
 
     for timestep in range(log_probs.size(0)):
         next_beams: dict[tuple[int, ...], tuple[float, float]] = {}
         top_values, top_indices = torch.topk(
             log_probs[timestep], k=min(beam_size * 4, log_probs.size(-1))
         )
-        for score, token_id in zip(top_values.tolist(), top_indices.tolist(), strict=True):
-            for prefix, (blank_score, nonblank_score) in beams.items():
-                total_prefix_score = torch.logsumexp(
-                    torch.tensor([blank_score, nonblank_score]),
-                    dim=0,
-                ).item()
+        beam_items = [
+            (
+                prefix,
+                blank_score,
+                nonblank_score,
+                _logaddexp(blank_score, nonblank_score),
+                prefix[-1] if prefix else None,
+            )
+            for prefix, (blank_score, nonblank_score) in beams.items()
+        ]
+        top_scores = top_values.tolist()
+        top_token_ids = top_indices.tolist()
+        for score, token_id in zip(top_scores, top_token_ids, strict=True):
+            for prefix, blank_score, nonblank_score, total_prefix_score, end_token in beam_items:
                 existing_blank, existing_nonblank = next_beams.get(
                     prefix, (float("-inf"), float("-inf"))
                 )
                 if token_id == blank_id:
                     next_beams[prefix] = (
-                        torch.logsumexp(
-                            torch.tensor([existing_blank, total_prefix_score + score]), dim=0
-                        ).item(),
+                        _logaddexp(existing_blank, total_prefix_score + score),
                         existing_nonblank,
                     )
                     continue
 
-                end_token = prefix[-1] if prefix else None
                 new_prefix = prefix + (token_id,)
                 lm_bonus = 0.0
                 if lm_scorer is not None:
-                    lm_bonus = lm_weight * float(lm_scorer(tokenizer.decode(new_prefix)))
+                    cached_bonus = lm_bonus_cache.get(new_prefix)
+                    if cached_bonus is None:
+                        decoded_prefix = decoded_prefix_cache.get(new_prefix)
+                        if decoded_prefix is None:
+                            decoded_prefix = tokenizer.decode(new_prefix)
+                            decoded_prefix_cache[new_prefix] = decoded_prefix
+                        cached_bonus = lm_weight * float(lm_scorer(decoded_prefix))
+                        lm_bonus_cache[new_prefix] = cached_bonus
+                    lm_bonus = cached_bonus
 
                 if token_id == end_token:
                     same_blank, same_nonblank = next_beams.get(
@@ -998,18 +1024,14 @@ def ctc_prefix_beam_search(
                     )
                     next_beams[prefix] = (
                         same_blank,
-                        torch.logsumexp(
-                            torch.tensor([same_nonblank, nonblank_score + score]), dim=0
-                        ).item(),
+                        _logaddexp(same_nonblank, nonblank_score + score),
                     )
                     new_blank, new_nonblank = next_beams.get(
                         new_prefix, (float("-inf"), float("-inf"))
                     )
                     next_beams[new_prefix] = (
                         new_blank,
-                        torch.logsumexp(
-                            torch.tensor([new_nonblank, blank_score + score + lm_bonus]), dim=0
-                        ).item(),
+                        _logaddexp(new_nonblank, blank_score + score + lm_bonus),
                     )
                 else:
                     new_blank, new_nonblank = next_beams.get(
@@ -1017,21 +1039,18 @@ def ctc_prefix_beam_search(
                     )
                     next_beams[new_prefix] = (
                         new_blank,
-                        torch.logsumexp(
-                            torch.tensor([new_nonblank, total_prefix_score + score + lm_bonus]),
-                            dim=0,
-                        ).item(),
+                        _logaddexp(new_nonblank, total_prefix_score + score + lm_bonus),
                     )
 
         ranked = sorted(
             next_beams.items(),
-            key=lambda item: torch.logsumexp(torch.tensor(item[1]), dim=0).item(),
+            key=lambda item: _logaddexp(item[1][0], item[1][1]),
             reverse=True,
         )[:beam_size]
         beams = dict(ranked)
 
     best_prefix = max(
         beams.items(),
-        key=lambda item: torch.logsumexp(torch.tensor(item[1]), dim=0).item(),
+        key=lambda item: _logaddexp(item[1][0], item[1][1]),
     )[0]
     return tokenizer.decode(best_prefix)
