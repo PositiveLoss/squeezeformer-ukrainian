@@ -21,7 +21,11 @@ from squeezeformer_pytorch import (
     squeezeformer_variant,
     tokenizer_from_dict,
 )
-from squeezeformer_pytorch.asr import load_lm_scorer, prune_encoder_frames_by_blank_probability
+from squeezeformer_pytorch.asr import (
+    CharacterTokenizer,
+    load_lm_scorer,
+    prune_encoder_frames_by_blank_probability,
+)
 from squeezeformer_pytorch.checkpoints import load_checkpoint, save_checkpoint
 from squeezeformer_pytorch.data import (
     AdaptiveBatchSampler,
@@ -67,6 +71,7 @@ from train import (
     _update_top_checkpoints,
     _validate_device_argument,
     _validate_fp8_runtime,
+    _validate_resume_tokenizer_configuration,
     _variant_defaults,
     build_optimizer,
     build_paper_scheduler,
@@ -81,6 +86,43 @@ def expected_subsampled_length(length: int) -> int:
     for _ in range(2):
         value = math.floor(value / 2)
     return value
+
+
+def test_validate_resume_tokenizer_configuration_rejects_tokenizer_type_mismatch() -> None:
+    checkpoint = {
+        "tokenizer": {
+            "type": "sentencepiece",
+            "model_proto_b64": "CgkKBG1vY2sQAA==",
+        }
+    }
+
+    with pytest.raises(RuntimeError) as error:
+        _validate_resume_tokenizer_configuration(
+            checkpoint=checkpoint,
+            checkpoint_path=Path("checkpoint_last.pt"),
+            requested_tokenizer_type="character",
+            tokenizer_path=None,
+        )
+
+    assert "uses tokenizer type 'sentencepiece'" in str(error.value)
+
+
+def test_validate_resume_tokenizer_configuration_rejects_tokenizer_path_mismatch(
+    tmp_path: Path,
+) -> None:
+    tokenizer_path = tmp_path / "tokenizer.json"
+    CharacterTokenizer(symbols=["а", "б"]).save(tokenizer_path)
+    checkpoint = {"tokenizer": CharacterTokenizer(symbols=["а", "в"]).to_dict()}
+
+    with pytest.raises(RuntimeError) as error:
+        _validate_resume_tokenizer_configuration(
+            checkpoint=checkpoint,
+            checkpoint_path=Path("checkpoint_last.pt"),
+            requested_tokenizer_type="character",
+            tokenizer_path=str(tokenizer_path),
+        )
+
+    assert "does not match the tokenizer loaded" in str(error.value)
 
 
 @torch.no_grad()

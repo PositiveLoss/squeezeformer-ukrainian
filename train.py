@@ -151,6 +151,37 @@ def _build_trackio_run_name(
     return run_name
 
 
+def _validate_resume_tokenizer_configuration(
+    *,
+    checkpoint: dict[str, object],
+    checkpoint_path: Path,
+    requested_tokenizer_type: str,
+    tokenizer_path: str | None,
+) -> None:
+    checkpoint_tokenizer = checkpoint.get("tokenizer")
+    if not isinstance(checkpoint_tokenizer, dict):
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' is missing tokenizer metadata or it is malformed."
+        )
+    checkpoint_tokenizer_type = str(checkpoint_tokenizer.get("type", "character"))
+    if checkpoint_tokenizer_type != requested_tokenizer_type:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' uses tokenizer type "
+            f"'{checkpoint_tokenizer_type}', but the current run requested "
+            f"'--tokenizer {requested_tokenizer_type}'. Start a fresh run or resume from a "
+            "checkpoint created with the same tokenizer type."
+        )
+    if tokenizer_path is None:
+        return
+    requested_tokenizer = load_tokenizer(tokenizer_path)
+    if requested_tokenizer.to_dict() != checkpoint_tokenizer:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' tokenizer metadata does not match the "
+            f"tokenizer loaded from '{tokenizer_path}'. Use the tokenizer artifact that created "
+            "this checkpoint or start a fresh run."
+        )
+
+
 def _distributed_mean(value: float, *, device: torch.device, distributed: bool) -> float:
     if not distributed or not dist.is_initialized():
         return value
@@ -549,6 +580,12 @@ def main() -> None:
     )
     if resume_path is not None:
         _validate_resume_checkpoint_payload(checkpoint, checkpoint_path=resume_path)
+        _validate_resume_tokenizer_configuration(
+            checkpoint=checkpoint,
+            checkpoint_path=resume_path,
+            requested_tokenizer_type=args.tokenizer,
+            tokenizer_path=args.tokenizer_path,
+        )
         logger.info(
             "resume checkpoint loaded path=%s elapsed=%s",
             resume_path,
