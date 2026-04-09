@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -62,9 +63,33 @@ def _validate_creatable_directory(argument_name: str, raw_value: str | None) -> 
         raise ValueError(f"{argument_name} is not writable via parent directory '{probe}'.")
 
 
-def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None:
+def _validate_startup_args(
+    args: argparse.Namespace,
+    *,
+    world_size: int,
+    explicit_batch_size: bool = False,
+) -> None:
     if (args.adaptive_batch_unit is None) != (args.adaptive_batch_budget is None):
         raise ValueError("--adaptive-batch-unit and --adaptive-batch-budget must be set together.")
+    dynamic_batching_modes = [
+        flag
+        for flag, enabled in (
+            ("--max-batch-duration-sec", args.max_batch_duration_sec is not None),
+            ("--max-batch-frames", args.max_batch_frames is not None),
+            ("--adaptive-batch-unit/--adaptive-batch-budget", args.adaptive_batch_unit is not None),
+        )
+        if enabled
+    ]
+    if len(dynamic_batching_modes) > 1:
+        raise ValueError(
+            "Batching controls are mutually exclusive; choose only one of "
+            "--max-batch-duration-sec, --max-batch-frames, or the adaptive batch options."
+        )
+    if explicit_batch_size and dynamic_batching_modes:
+        raise ValueError(
+            f"--batch-size cannot be combined with {dynamic_batching_modes[0]} because that "
+            "batching mode ignores sample-count batching."
+        )
     if args.distributed and world_size <= 1:
         raise ValueError("--distributed expects a torchrun-style environment with WORLD_SIZE > 1.")
     if world_size > 1 and args.compile:
@@ -265,7 +290,8 @@ def _validate_startup_args(args: argparse.Namespace, *, world_size: int) -> None
         _validate_existing_local_path_argument("--validation-dataset-source", source)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Train Squeezeformer CTC on speech-uk/cv22.")
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
     parser.add_argument(
@@ -666,7 +692,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shallow-fusion-lm-order", type=int, default=3)
     parser.add_argument("--shallow-fusion-lm-alpha", type=float, default=0.1)
     parser.add_argument("--example-limit", type=int, default=5)
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    _validate_startup_args(
+        args,
+        world_size=int(os.environ.get("WORLD_SIZE", "1")),
+        explicit_batch_size="--batch-size" in argv,
+    )
+    return args
 
 
 def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
