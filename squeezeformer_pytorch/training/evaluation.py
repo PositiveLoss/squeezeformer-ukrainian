@@ -20,7 +20,7 @@ from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import AudioFeaturizer
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import SqueezeformerConfig
-from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
+from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, ValidationModelSource
 from squeezeformer_pytorch.training.runtime import (
     ExponentialMovingAverage,
     FrozenAudioTeacher,
@@ -35,6 +35,21 @@ from squeezeformer_pytorch.training.runtime import (
 )
 
 logger = logging.getLogger("train")
+
+
+def _clone_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().clone() for key, value in module.state_dict().items()}
+
+
+def _load_cloned_state_dict(module: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    module.load_state_dict(
+        {
+            key: value.to(device=tensor.device, dtype=tensor.dtype)
+            for key, tensor in module.state_dict().items()
+            for value in (state_dict[key],)
+        },
+        strict=True,
+    )
 
 
 def greedy_decode(
@@ -626,6 +641,7 @@ def _evaluate_and_checkpoint(
     audio_teacher_weight: float,
     audio_teacher_objective: str,
     ema: ExponentialMovingAverage | None,
+    validation_model_source: ValidationModelSource,
     train_metrics: dict[str, float],
     epoch: int,
     global_step: int,
@@ -645,212 +661,226 @@ def _evaluate_and_checkpoint(
     distributed: bool,
     is_main_process: bool,
 ) -> float:
-    ema_backup = ema.apply_to(model) if ema is not None else None
-    validation = evaluate(
-        model,
-        val_loader,
-        criterion,
-        tokenizer,
-        device,
-        dtype,
-        fp8_recipe=fp8_recipe,
-        decode_strategy=decode_strategy,
-        beam_size=beam_size,
-        lm_scorer=lm_scorer,
-        lm_weight=lm_weight,
-        example_limit=example_limit,
-        intermediate_ctc_weight=intermediate_ctc_weight,
-        aed_loss_weight=aed_loss_weight,
-        liberta_teacher=liberta_teacher,
-        liberta_distill_weight=liberta_distill_weight,
-        audio_teacher=audio_teacher,
-        audio_teacher_weight=audio_teacher_weight,
-        audio_teacher_objective=audio_teacher_objective,
-        distributed=distributed,
-        is_main_process=is_main_process,
-    )
-    if ema_backup is not None:
-        ExponentialMovingAverage.restore(model, ema_backup)
-    if not is_main_process:
-        return best_val_wer
+    raw_state_dict = _clone_state_dict(model)
+    selected_source = validation_model_source
+    if selected_source == ValidationModelSource.EMA:
+        if ema is None:
+            raise RuntimeError("validation_model_source='ema' requires EMA to be enabled.")
+        ema.apply_to(model)
 
-    val_metrics = validation["metrics"]
-    validation_timings = validation.get("timings", {})
-    log_payload = {
-        "epoch": epoch,
-        "global_step": global_step,
-        **train_metrics,
-        "val_loss": val_metrics["loss"],
-        "val_cer": val_metrics["cer"],
-        "val_wer": val_metrics["wer"],
-        "val_forward_seconds": float(validation_timings.get("forward_seconds", 0.0)),
-        "val_teacher_seconds": float(validation_timings.get("teacher_seconds", 0.0)),
-        "val_decode_seconds": float(validation_timings.get("decode_seconds", 0.0)),
-        "val_gather_seconds": float(validation_timings.get("gather_seconds", 0.0)),
-    }
-    for key, value in val_metrics.items():
-        if key not in {"loss", "cer", "wer"}:
-            log_payload[f"val_{key}"] = value
-    log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
-    log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
-    hardest_examples_table = _examples_table(
-        validation["hardest_examples"],
-        split="validation",
-        category="hardest",
-        epoch=epoch,
-        global_step=global_step,
-    )
-    if hardest_examples_table is not None:
-        log_payload["val_hardest_samples"] = hardest_examples_table
-    random_examples_table = _examples_table(
-        validation["random_examples"],
-        split="validation",
-        category="random",
-        epoch=epoch,
-        global_step=global_step,
-    )
-    if random_examples_table is not None:
-        log_payload["val_random_samples"] = random_examples_table
-    trackio.log(log_payload)
+    try:
+        validation = evaluate(
+            model,
+            val_loader,
+            criterion,
+            tokenizer,
+            device,
+            dtype,
+            fp8_recipe=fp8_recipe,
+            decode_strategy=decode_strategy,
+            beam_size=beam_size,
+            lm_scorer=lm_scorer,
+            lm_weight=lm_weight,
+            example_limit=example_limit,
+            intermediate_ctc_weight=intermediate_ctc_weight,
+            aed_loss_weight=aed_loss_weight,
+            liberta_teacher=liberta_teacher,
+            liberta_distill_weight=liberta_distill_weight,
+            audio_teacher=audio_teacher,
+            audio_teacher_weight=audio_teacher_weight,
+            audio_teacher_objective=audio_teacher_objective,
+            distributed=distributed,
+            is_main_process=is_main_process,
+        )
+        if not is_main_process:
+            return best_val_wer
 
-    report = {
-        "epoch": epoch,
-        "global_step": global_step,
-        "metrics": val_metrics,
-        "hardest_examples": validation["hardest_examples"],
-        "random_examples": validation["random_examples"],
-        "speaker_metrics": validation["speaker_metrics"],
-        "split_audit": split_audit,
-    }
-    reports_dir = output_dir / "eval_reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = reports_dir / f"{report_stem}.json"
-    report_start_time = time.perf_counter()
-    report_path.write_text(
-        json.dumps(report, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    report_seconds = time.perf_counter() - report_start_time
+        val_metrics = validation["metrics"]
+        validation_timings = validation.get("timings", {})
+        log_payload = {
+            "epoch": epoch,
+            "global_step": global_step,
+            **train_metrics,
+            "val_loss": val_metrics["loss"],
+            "val_cer": val_metrics["cer"],
+            "val_wer": val_metrics["wer"],
+            "val_forward_seconds": float(validation_timings.get("forward_seconds", 0.0)),
+            "val_teacher_seconds": float(validation_timings.get("teacher_seconds", 0.0)),
+            "val_decode_seconds": float(validation_timings.get("decode_seconds", 0.0)),
+            "val_gather_seconds": float(validation_timings.get("gather_seconds", 0.0)),
+            "val_model_source": selected_source,
+        }
+        for key, value in val_metrics.items():
+            if key not in {"loss", "cer", "wer"}:
+                log_payload[f"val_{key}"] = value
+        log_payload.update(_flatten_examples("val_hardest", validation["hardest_examples"]))
+        log_payload.update(_flatten_examples("val_random", validation["random_examples"]))
+        hardest_examples_table = _examples_table(
+            validation["hardest_examples"],
+            split="validation",
+            category="hardest",
+            epoch=epoch,
+            global_step=global_step,
+        )
+        if hardest_examples_table is not None:
+            log_payload["val_hardest_samples"] = hardest_examples_table
+        random_examples_table = _examples_table(
+            validation["random_examples"],
+            split="validation",
+            category="random",
+            epoch=epoch,
+            global_step=global_step,
+        )
+        if random_examples_table is not None:
+            log_payload["val_random_samples"] = random_examples_table
+        trackio.log(log_payload)
 
-    updated_best_val_wer = min(best_val_wer, float(val_metrics["wer"]))
-    checkpoint_build_start_time = time.perf_counter()
-    checkpoint = _build_checkpoint(
-        model=model,
-        encoder_config=encoder_config,
-        tokenizer=tokenizer,
-        featurizer=featurizer,
-        epoch=epoch,
-        global_step=global_step,
-        best_val_wer=updated_best_val_wer,
-        metrics=_checkpoint_safe_metrics(log_payload),
-        optimizers=optimizers,
-        optimizer_names=optimizer_names,
-        schedulers=schedulers,
-        scaler=scaler,
-        ema=ema,
-        args=args,
-    )
-    checkpoint_build_seconds = time.perf_counter() - checkpoint_build_start_time
+        report = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "model_source": selected_source,
+            "metrics": val_metrics,
+            "hardest_examples": validation["hardest_examples"],
+            "random_examples": validation["random_examples"],
+            "speaker_metrics": validation["speaker_metrics"],
+            "split_audit": split_audit,
+        }
+        reports_dir = output_dir / "eval_reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_path = reports_dir / f"{report_stem}.json"
+        report_start_time = time.perf_counter()
+        report_path.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        report_seconds = time.perf_counter() - report_start_time
 
-    if save_last_checkpoint:
-        latest_path = output_dir / "checkpoint_last.pt"
-    else:
-        latest_path = output_dir / "checkpoint_step_last.pt"
-    latest_export_start_time = time.perf_counter()
-    save_checkpoint(checkpoint, latest_path)
-    latest_safetensors_path = _export_inference_checkpoint(checkpoint, latest_path)
-    latest_export_seconds = time.perf_counter() - latest_export_start_time
+        updated_best_val_wer = min(best_val_wer, float(val_metrics["wer"]))
+        checkpoint_build_start_time = time.perf_counter()
+        checkpoint = _build_checkpoint(
+            model=model,
+            encoder_config=encoder_config,
+            tokenizer=tokenizer,
+            featurizer=featurizer,
+            epoch=epoch,
+            global_step=global_step,
+            best_val_wer=updated_best_val_wer,
+            metrics=_checkpoint_safe_metrics(log_payload),
+            optimizers=optimizers,
+            optimizer_names=optimizer_names,
+            schedulers=schedulers,
+            scaler=scaler,
+            ema=ema,
+            args=args,
+            resume_model_state_dict=(
+                raw_state_dict if selected_source == ValidationModelSource.EMA else None
+            ),
+            validation_model_source=selected_source,
+        )
+        checkpoint_build_seconds = time.perf_counter() - checkpoint_build_start_time
 
-    if float(val_metrics["wer"]) < best_val_wer:
-        updated_best_val_wer = float(val_metrics["wer"])
-        best_path = output_dir / "checkpoint_best.pt"
-        best_export_start_time = time.perf_counter()
-        save_checkpoint(checkpoint, best_path)
-        best_safetensors_path = _export_inference_checkpoint(checkpoint, best_path)
-        best_export_seconds = time.perf_counter() - best_export_start_time
-    else:
-        best_safetensors_path = _safetensors_path(output_dir / "checkpoint_best.pt")
-        best_export_seconds = 0.0
+        if save_last_checkpoint:
+            latest_path = output_dir / "checkpoint_last.pt"
+        else:
+            latest_path = output_dir / "checkpoint_step_last.pt"
+        latest_export_start_time = time.perf_counter()
+        save_checkpoint(checkpoint, latest_path)
+        latest_safetensors_path = _export_inference_checkpoint(checkpoint, latest_path)
+        latest_export_seconds = time.perf_counter() - latest_export_start_time
 
-    topk_update_start_time = time.perf_counter()
-    _update_top_checkpoints(
-        output_dir=output_dir,
-        checkpoint=checkpoint,
-        epoch=epoch,
-        global_step=global_step,
-        val_wer=float(val_metrics["wer"]),
-        keep_top_k=args.keep_top_k,
-    )
-    topk_update_seconds = time.perf_counter() - topk_update_start_time
-    topk_average_start_time = time.perf_counter()
-    averaged_path = _average_topk_checkpoints(output_dir)
-    topk_average_seconds = time.perf_counter() - topk_average_start_time
-    checkpoint_export_seconds = (
-        report_seconds
-        + checkpoint_build_seconds
-        + latest_export_seconds
-        + best_export_seconds
-        + topk_update_seconds
-        + topk_average_seconds
-    )
-    logger.info(
-        (
-            "%s complete train_loss=%.4f val_loss=%.4f "
-            "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
-            "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
-            "val_liberta_distill_loss=%.4f val_audio_teacher_loss=%.4f val_cer=%.4f val_wer=%.4f "
-            "val_avg_blank_prob=%.4f val_empty_hyp_frac=%.4f "
-            "val_avg_hyp_chars=%.2f val_avg_hyp_words=%.2f "
-            "best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
-            "timing_decode=%.2fs timing_gather=%.2fs timing_checkpoint_export=%.2fs "
-            "report=%s latest=%s best=%s averaged=%s"
-        ),
-        report_stem,
-        float(train_metrics["train_loss"]),
-        float(val_metrics["loss"]),
-        float(val_metrics["main_ctc_loss"]),
-        float(val_metrics["intermediate_ctc_loss"]),
-        float(val_metrics["combined_ctc_loss"]),
-        float(val_metrics["aed_loss"]),
-        float(val_metrics["liberta_distill_loss"]),
-        float(val_metrics["audio_teacher_loss"]),
-        float(val_metrics["cer"]),
-        float(val_metrics["wer"]),
-        float(val_metrics["avg_blank_probability"]),
-        float(val_metrics["decoded_empty_fraction"]),
-        float(val_metrics["decoded_avg_char_length"]),
-        float(val_metrics["decoded_avg_word_length"]),
-        updated_best_val_wer,
-        float(validation_timings.get("forward_seconds", 0.0)),
-        float(validation_timings.get("teacher_seconds", 0.0)),
-        float(validation_timings.get("decode_seconds", 0.0)),
-        float(validation_timings.get("gather_seconds", 0.0)),
-        checkpoint_export_seconds,
-        report_path,
-        latest_path,
-        output_dir / "checkpoint_best.pt",
-        averaged_path if averaged_path is not None else "n/a",
-    )
-    logger.info(
-        (
-            "%s timing detail report_write=%.2fs checkpoint_build=%.2fs "
-            "latest_export=%.2fs best_export=%.2fs topk_update=%.2fs topk_average=%.2fs"
-        ),
-        report_stem,
-        report_seconds,
-        checkpoint_build_seconds,
-        latest_export_seconds,
-        best_export_seconds,
-        topk_update_seconds,
-        topk_average_seconds,
-    )
-    logger.info(
-        "exported inference artifacts latest_safe=%s best_safe=%s averaged_safe=%s",
-        latest_safetensors_path,
-        best_safetensors_path if best_safetensors_path.exists() else "n/a",
-        _safetensors_path(averaged_path).as_posix() if averaged_path is not None else "n/a",
-    )
-    return updated_best_val_wer
+        if float(val_metrics["wer"]) < best_val_wer:
+            updated_best_val_wer = float(val_metrics["wer"])
+            best_path = output_dir / "checkpoint_best.pt"
+            best_export_start_time = time.perf_counter()
+            save_checkpoint(checkpoint, best_path)
+            best_safetensors_path = _export_inference_checkpoint(checkpoint, best_path)
+            best_export_seconds = time.perf_counter() - best_export_start_time
+        else:
+            best_safetensors_path = _safetensors_path(output_dir / "checkpoint_best.pt")
+            best_export_seconds = 0.0
+
+        topk_update_start_time = time.perf_counter()
+        _update_top_checkpoints(
+            output_dir=output_dir,
+            checkpoint=checkpoint,
+            epoch=epoch,
+            global_step=global_step,
+            val_wer=float(val_metrics["wer"]),
+            keep_top_k=args.keep_top_k,
+        )
+        topk_update_seconds = time.perf_counter() - topk_update_start_time
+        topk_average_start_time = time.perf_counter()
+        averaged_path = _average_topk_checkpoints(output_dir)
+        topk_average_seconds = time.perf_counter() - topk_average_start_time
+        checkpoint_export_seconds = (
+            report_seconds
+            + checkpoint_build_seconds
+            + latest_export_seconds
+            + best_export_seconds
+            + topk_update_seconds
+            + topk_average_seconds
+        )
+        logger.info(
+            (
+                "%s complete train_loss=%.4f val_loss=%.4f "
+                "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
+                "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
+                "val_liberta_distill_loss=%.4f val_audio_teacher_loss=%.4f val_cer=%.4f val_wer=%.4f "
+                "val_avg_blank_prob=%.4f val_empty_hyp_frac=%.4f "
+                "val_avg_hyp_chars=%.2f val_avg_hyp_words=%.2f "
+                "val_model_source=%s best_val_wer=%.4f timing_forward=%.2fs timing_teacher=%.2fs "
+                "timing_decode=%.2fs timing_gather=%.2fs timing_checkpoint_export=%.2fs "
+                "report=%s latest=%s best=%s averaged=%s"
+            ),
+            report_stem,
+            float(train_metrics["train_loss"]),
+            float(val_metrics["loss"]),
+            float(val_metrics["main_ctc_loss"]),
+            float(val_metrics["intermediate_ctc_loss"]),
+            float(val_metrics["combined_ctc_loss"]),
+            float(val_metrics["aed_loss"]),
+            float(val_metrics["liberta_distill_loss"]),
+            float(val_metrics["audio_teacher_loss"]),
+            float(val_metrics["cer"]),
+            float(val_metrics["wer"]),
+            float(val_metrics["avg_blank_probability"]),
+            float(val_metrics["decoded_empty_fraction"]),
+            float(val_metrics["decoded_avg_char_length"]),
+            float(val_metrics["decoded_avg_word_length"]),
+            selected_source,
+            updated_best_val_wer,
+            float(validation_timings.get("forward_seconds", 0.0)),
+            float(validation_timings.get("teacher_seconds", 0.0)),
+            float(validation_timings.get("decode_seconds", 0.0)),
+            float(validation_timings.get("gather_seconds", 0.0)),
+            checkpoint_export_seconds,
+            report_path,
+            latest_path,
+            output_dir / "checkpoint_best.pt",
+            averaged_path if averaged_path is not None else "n/a",
+        )
+        logger.info(
+            (
+                "%s timing detail report_write=%.2fs checkpoint_build=%.2fs "
+                "latest_export=%.2fs best_export=%.2fs topk_update=%.2fs topk_average=%.2fs"
+            ),
+            report_stem,
+            report_seconds,
+            checkpoint_build_seconds,
+            latest_export_seconds,
+            best_export_seconds,
+            topk_update_seconds,
+            topk_average_seconds,
+        )
+        logger.info(
+            "exported inference artifacts latest_safe=%s best_safe=%s averaged_safe=%s",
+            latest_safetensors_path,
+            best_safetensors_path if best_safetensors_path.exists() else "n/a",
+            _safetensors_path(averaged_path).as_posix() if averaged_path is not None else "n/a",
+        )
+        return updated_best_val_wer
+    finally:
+        _load_cloned_state_dict(model, raw_state_dict)
 
 
 def _build_checkpoint(
@@ -868,8 +898,10 @@ def _build_checkpoint(
     scaler: torch.amp.GradScaler,
     ema: ExponentialMovingAverage | None,
     args: argparse.Namespace,
+    resume_model_state_dict: dict[str, torch.Tensor] | None = None,
+    validation_model_source: ValidationModelSource = ValidationModelSource.RAW,
 ) -> dict[str, object]:
-    return {
+    checkpoint = {
         "model_state_dict": model.state_dict(),
         "encoder_config": asdict(encoder_config),
         "tokenizer": tokenizer.to_dict(),
@@ -884,4 +916,8 @@ def _build_checkpoint(
         "scaler_state_dict": scaler.state_dict(),
         "ema_state_dict": ema.state_dict() if ema is not None else None,
         "training_args": vars(args),
+        "validation_model_source": validation_model_source,
     }
+    if resume_model_state_dict is not None:
+        checkpoint["resume_model_state_dict"] = resume_model_state_dict
+    return checkpoint

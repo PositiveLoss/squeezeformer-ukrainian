@@ -20,6 +20,11 @@ class DecodeStrategy(StrEnum):
     BEAM = "beam"
 
 
+class ValidationModelSource(StrEnum):
+    RAW = "raw"
+    EMA = "ema"
+
+
 class AdaptiveBatchUnit(StrEnum):
     FRAMES = "frames"
     TOKENS = "tokens"

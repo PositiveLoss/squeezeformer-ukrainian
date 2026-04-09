@@ -11,6 +11,7 @@ from squeezeformer_pytorch.runtime_types import (
     DecodeStrategy,
     DTypeChoice,
     OptimizerChoice,
+    ValidationModelSource,
 )
 from squeezeformer_pytorch.training.runtime import _validate_device_ready, resolve_device
 
@@ -569,6 +570,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)
+    parser.add_argument(
+        "--validation-model-source",
+        type=ValidationModelSource,
+        choices=list(ValidationModelSource),
+        default=ValidationModelSource.EMA,
+        help="Which model weights to use for validation and validation-selected checkpoints.",
+    )
     parser.add_argument("--muon-warmup-epochs", type=int, default=None)
     parser.add_argument("--muon-hold-epochs", type=int, default=None)
     parser.add_argument("--muon-decay-exponent", type=float, default=None)

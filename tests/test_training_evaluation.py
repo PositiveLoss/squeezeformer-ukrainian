@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 import types
+from argparse import Namespace
+from pathlib import Path
 
 import torch
 
 sys.modules.setdefault(
     "trackio",
-    types.SimpleNamespace(init=lambda **_kwargs: None, log=lambda *_args, **_kwargs: None),
+    types.SimpleNamespace(
+        init=lambda **_kwargs: None,
+        log=lambda *_args, **_kwargs: None,
+        Table=type("Table", (), {}),
+    ),
 )
 
 CharacterTokenizer = importlib.import_module("squeezeformer_pytorch.asr").CharacterTokenizer
 DTypeChoice = importlib.import_module("squeezeformer_pytorch.runtime_types").DTypeChoice
+ValidationModelSource = importlib.import_module(
+    "squeezeformer_pytorch.runtime_types"
+).ValidationModelSource
+squeezeformer_variant = importlib.import_module("squeezeformer_pytorch.model").squeezeformer_variant
 training_evaluation = importlib.import_module("squeezeformer_pytorch.training.evaluation")
 
 
@@ -227,3 +238,128 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
     assert merged["metrics"]["missing_speaker_id_samples"] == 1.0
     assert merged["hardest_examples"][0]["utterance_id"] == "utt-1"
     assert merged["random_examples"][0]["utterance_id"] == "utt-2"
+
+
+def test_evaluate_and_checkpoint_saves_validated_ema_weights_and_resume_raw(monkeypatch, tmp_path: Path) -> None:
+    class DummyTokenizer:
+        blank_id = 0
+
+        def to_dict(self) -> dict[str, object]:
+            return {"type": "character", "symbols": ["a"]}
+
+    class DummyFeaturizer:
+        def config_dict(self) -> dict[str, object]:
+            return {"sample_rate": 16_000}
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    ema = training_evaluation.ExponentialMovingAverage(model, decay=0.9)
+    ema.shadow["weight"] = torch.full_like(ema.shadow["weight"], 2.0)
+
+    captured_checkpoints: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        training_evaluation,
+        "evaluate",
+        lambda *args, **kwargs: {
+            "metrics": {
+                "loss": 1.0,
+                "main_ctc_loss": 1.0,
+                "intermediate_ctc_loss": 0.0,
+                "combined_ctc_loss": 1.0,
+                "aed_loss": 0.0,
+                "liberta_distill_loss": 0.0,
+                "audio_teacher_loss": 0.0,
+                "cer": 0.5,
+                "wer": 0.5,
+                "avg_blank_probability": 0.1,
+                "decoded_empty_fraction": 0.0,
+                "decoded_avg_char_length": 4.0,
+                "decoded_avg_word_length": 1.0,
+            },
+            "timings": {},
+            "hardest_examples": [],
+            "random_examples": [],
+            "speaker_metrics": {},
+        },
+    )
+    monkeypatch.setattr(training_evaluation.trackio, "log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        training_evaluation,
+        "save_checkpoint",
+        lambda checkpoint, _path: captured_checkpoints.append(
+            {
+                key: (
+                    {
+                        nested_key: nested_value.detach().clone()
+                        if isinstance(nested_value, torch.Tensor)
+                        else nested_value
+                        for nested_key, nested_value in value.items()
+                    }
+                    if isinstance(value, dict)
+                    else value
+                )
+                for key, value in checkpoint.items()
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        training_evaluation,
+        "_export_inference_checkpoint",
+        lambda _checkpoint, path: path.with_suffix(".safetensors"),
+    )
+    monkeypatch.setattr(training_evaluation, "_update_top_checkpoints", lambda **_kwargs: None)
+    monkeypatch.setattr(training_evaluation, "_average_topk_checkpoints", lambda _output_dir: None)
+
+    best_val_wer = training_evaluation._evaluate_and_checkpoint(
+        model=model,
+        val_loader=[],
+        criterion=torch.nn.CTCLoss(blank=0, zero_infinity=True),
+        tokenizer=DummyTokenizer(),
+        device=torch.device("cpu"),
+        dtype=DTypeChoice.FLOAT32,
+        fp8_recipe=None,
+        decode_strategy=training_evaluation.DecodeStrategy.GREEDY,
+        beam_size=1,
+        lm_scorer=None,
+        lm_weight=0.0,
+        example_limit=1,
+        intermediate_ctc_weight=0.0,
+        aed_loss_weight=0.0,
+        liberta_teacher=None,
+        liberta_distill_weight=0.0,
+        audio_teacher=None,
+        audio_teacher_weight=0.0,
+        audio_teacher_objective="hidden_mse",
+        ema=ema,
+        validation_model_source=ValidationModelSource.EMA,
+        train_metrics={"train_loss": 2.0},
+        epoch=1,
+        global_step=10,
+        output_dir=tmp_path,
+        encoder_config=squeezeformer_variant("xs"),
+        featurizer=DummyFeaturizer(),
+        optimizers=[optimizer],
+        optimizer_names=["adamw"],
+        schedulers=[scheduler],
+        scaler=scaler,
+        args=Namespace(keep_top_k=1, validation_model_source=ValidationModelSource.EMA),
+        best_val_wer=float("inf"),
+        split_audit={},
+        logger=logging.getLogger("test"),
+        save_last_checkpoint=False,
+        report_stem="epoch_0001_step_00000010",
+        distributed=False,
+        is_main_process=True,
+    )
+
+    assert best_val_wer == 0.5
+    assert captured_checkpoints
+    saved_checkpoint = captured_checkpoints[0]
+    assert float(saved_checkpoint["model_state_dict"]["weight"].item()) == 2.0
+    assert float(saved_checkpoint["resume_model_state_dict"]["weight"].item()) == 1.0
+    assert saved_checkpoint["validation_model_source"] == ValidationModelSource.EMA
+    assert float(model.weight.item()) == 1.0

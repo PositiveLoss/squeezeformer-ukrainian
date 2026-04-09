@@ -39,7 +39,7 @@ from squeezeformer_pytorch.model import (
     squeezeformer_variant,
     transformer_engine_available,
 )
-from squeezeformer_pytorch.runtime_types import DTypeChoice
+from squeezeformer_pytorch.runtime_types import DTypeChoice, ValidationModelSource
 from squeezeformer_pytorch.training import data_loading as _training_data_loading
 from squeezeformer_pytorch.training import runtime as _training_runtime
 from squeezeformer_pytorch.training.cli import (
@@ -877,7 +877,9 @@ def main() -> None:
     )
     model.to(device)
     if checkpoint is not None:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(
+            checkpoint.get("resume_model_state_dict", checkpoint["model_state_dict"])
+        )
     ddp_find_unused_parameters = (
         blank_prune_layer is not None
         and blank_prune_threshold > 0.0
@@ -965,6 +967,11 @@ def main() -> None:
         if args.ema_decay > 0
         else None
     )
+    if args.validation_model_source == ValidationModelSource.EMA and ema is None:
+        raise ValueError(
+            "--validation-model-source ema requires EMA to be enabled; set --ema-decay > 0 "
+            "or use --validation-model-source raw."
+        )
     start_epoch = 1
     global_step = 0
     best_val_wer = float("inf")
@@ -1438,6 +1445,7 @@ def main() -> None:
                         audio_teacher_weight=args.audio_teacher_weight,
                         audio_teacher_objective=args.audio_teacher_objective,
                         ema=ema,
+                        validation_model_source=args.validation_model_source,
                         train_metrics=train_metrics,
                         epoch=epoch,
                         global_step=global_step,
@@ -1530,6 +1538,7 @@ def main() -> None:
             audio_teacher_weight=args.audio_teacher_weight,
             audio_teacher_objective=args.audio_teacher_objective,
             ema=ema,
+            validation_model_source=args.validation_model_source,
             train_metrics={
                 "train_loss": train_loss,
                 "train_main_ctc_loss": train_main_ctc_loss,
