@@ -100,7 +100,14 @@ class CharacterTokenizer(Tokenizer):
         return len(self.id_to_token)
 
     def encode(self, text: str) -> list[int]:
-        return [self.token_to_id[char] for char in text if char in self.token_to_id]
+        unknown_chars = sorted({char for char in text if char not in self.token_to_id})
+        if unknown_chars:
+            formatted = ", ".join(repr(char) for char in unknown_chars)
+            raise ValueError(
+                "CharacterTokenizer encountered character(s) outside the vocabulary: "
+                f"{formatted}"
+            )
+        return [self.token_to_id[char] for char in text]
 
     def decode(self, token_ids: Iterable[int]) -> str:
         return "".join(self.id_to_token[index] for index in token_ids if index != self.blank_id)

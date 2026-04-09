@@ -636,6 +636,15 @@ def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
     assert restored.decode(token_ids)
 
 
+def test_character_tokenizer_encode_fails_on_oov_character() -> None:
+    tokenizer = CharacterTokenizer(symbols=["а", "б"])
+
+    with pytest.raises(ValueError) as error:
+        tokenizer.encode("абв")
+
+    assert "'в'" in str(error.value)
+
+
 def test_safetensors_checkpoint_roundtrip(tmp_path: Path) -> None:
     tokenizer = SentencePieceTokenizer.train(
         ["привіт світе", "це короткий тест", "мовна модель"],
