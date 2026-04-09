@@ -150,6 +150,30 @@ class SentencePieceTokenizer(Tokenizer):
         self.model_proto = model_proto
         self.blank_id = 0
         self.pad_id = 0
+        self._validate_nonblank_tokens_decode_nonempty()
+
+    def _validate_nonblank_tokens_decode_nonempty(self) -> None:
+        invalid_tokens: list[str] = []
+        for token_id in range(1, self.vocab_size):
+            decoded = self.decode([token_id])
+            if decoded != "":
+                continue
+            piece = "<unknown>"
+            id_to_piece = getattr(self.processor, "id_to_piece", None)
+            if callable(id_to_piece):
+                try:
+                    piece = str(id_to_piece(token_id))
+                except Exception:
+                    piece = "<unknown>"
+            invalid_tokens.append(f"{token_id}:{piece!r}")
+            if len(invalid_tokens) >= 8:
+                break
+        if invalid_tokens:
+            raise ValueError(
+                "SentencePiece tokenizer contains non-blank token(s) that decode to an empty "
+                "string, which is incompatible with CTC decoding. Invalid ids/pieces: "
+                + ", ".join(invalid_tokens)
+            )
 
     @classmethod
     def train(

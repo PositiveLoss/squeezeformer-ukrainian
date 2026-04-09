@@ -555,6 +555,31 @@ def test_blank_logit_offset_applies_only_during_training() -> None:
     assert torch.allclose(adjusted_eval, logits)
 
 
+def test_sentencepiece_tokenizer_rejects_empty_decoding_nonblank_token() -> None:
+    class FakeProcessor:
+        def vocab_size(self) -> int:
+            return 3
+
+        def decode(self, token_ids) -> str:
+            mapping = {
+                1: "a",
+                2: "",
+            }
+            return "".join(mapping[token_id] for token_id in token_ids)
+
+        def id_to_piece(self, token_id: int) -> str:
+            return {
+                0: "<pad>",
+                1: "a",
+                2: "<empty>",
+            }[token_id]
+
+    with pytest.raises(ValueError) as error:
+        SentencePieceTokenizer(processor=FakeProcessor(), model_proto=b"fake")
+
+    assert "decode to an empty string" in str(error.value)
+
+
 @torch.no_grad()
 def test_temporal_unet_recovers_subsampled_resolution() -> None:
     model = build_squeezeformer_encoder("sm")
