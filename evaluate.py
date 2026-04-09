@@ -157,6 +157,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--report-path", default=None)
+    parser.add_argument(
+        "--trackio",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log evaluation metrics to Trackio. Disabled by default for standalone evaluation.",
+    )
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
     args = parser.parse_args()
@@ -331,18 +337,19 @@ def main() -> None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    trackio_config = {
-        "evaluation_split": args.split,
-        "checkpoint": str(args.checkpoint),
-        "decode_strategy": args.decode_strategy,
-    }
-    trackio.init(
-        project=args.trackio_project,
-        space_id=args.trackio_space_id,
-        config=trackio_config,
-    )
-    trackio.log(metrics)
-    trackio.finish()
+    if args.trackio:
+        trackio_config = {
+            "evaluation_split": args.split,
+            "checkpoint": str(args.checkpoint),
+            "decode_strategy": args.decode_strategy,
+        }
+        trackio.init(
+            project=args.trackio_project,
+            space_id=args.trackio_space_id,
+            config=trackio_config,
+        )
+        trackio.log(metrics)
+        trackio.finish()
 
 
 if __name__ == "__main__":
