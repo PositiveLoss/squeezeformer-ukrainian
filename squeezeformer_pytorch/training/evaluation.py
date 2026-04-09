@@ -1037,6 +1037,7 @@ def _evaluate_and_checkpoint(
             output_dir / "checkpoint_best.pt",
             averaged_path if averaged_path is not None else "n/a",
         )
+        intermediate_layers = tuple(getattr(model, "intermediate_ctc_layers", ()))
         intermediate_length_detail = " ".join(
             (
                 f"layer{layer_index}_ctc_impossible="
@@ -1044,7 +1045,7 @@ def _evaluate_and_checkpoint(
                 f"layer{layer_index}_ctc_tight="
                 f"{float(val_metrics[f'layer{layer_index}_ctc_tight_fraction']):.4f}"
             )
-            for layer_index in model.intermediate_ctc_layers
+            for layer_index in intermediate_layers
             if f"layer{layer_index}_ctc_impossible_fraction" in val_metrics
         )
         if intermediate_length_detail:
