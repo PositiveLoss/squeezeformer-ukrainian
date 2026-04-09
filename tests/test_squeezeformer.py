@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import train
+import squeezeformer_pytorch.asr as squeezeformer_asr
 import squeezeformer_pytorch.model as squeezeformer_model
 from squeezeformer_pytorch import (
     NGramLanguageModel,
@@ -616,6 +617,55 @@ def test_blank_logit_offset_applies_only_during_training() -> None:
     assert torch.allclose(adjusted_train[..., 0], logits[..., 0] - 0.25)
     assert torch.allclose(adjusted_train[..., 1:], logits[..., 1:])
     assert torch.allclose(adjusted_eval, logits)
+
+
+@torch.no_grad()
+def test_ctc_log_probs_promote_bfloat16_inputs_to_float32() -> None:
+    model = SqueezeformerCTC(
+        encoder_config=squeezeformer_variant("xs"),
+        vocab_size=8,
+    )
+    model.classifier = model.classifier.to(dtype=torch.bfloat16)
+    x = torch.randn(2, 5, model.encoder_config.d_model, dtype=torch.bfloat16)
+
+    _logits, log_probs = model._chunked_logits_and_log_probs_from_classifier(model.classifier, x)
+
+    assert log_probs.dtype == torch.float32
+
+
+def test_chunked_ctc_loss_requests_float32_log_softmax(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = SqueezeformerCTC(
+        encoder_config=squeezeformer_variant("xs"),
+        vocab_size=8,
+    )
+    model.classifier = model.classifier.to(dtype=torch.bfloat16)
+    x = torch.randn(2, 6, model.encoder_config.d_model, dtype=torch.bfloat16)
+    output_lengths = torch.tensor([6, 5], dtype=torch.long)
+    targets = torch.tensor([1, 2, 3, 1, 2], dtype=torch.long)
+    target_lengths = torch.tensor([3, 2], dtype=torch.long)
+
+    observed_dtypes: list[torch.dtype | None] = []
+    original_log_softmax = squeezeformer_asr.F.log_softmax
+
+    def wrapped_log_softmax(*args, **kwargs):
+        observed_dtypes.append(kwargs.get("dtype"))
+        return original_log_softmax(*args, **kwargs)
+
+    monkeypatch.setattr(squeezeformer_asr.F, "log_softmax", wrapped_log_softmax)
+
+    loss = model._chunked_ctc_loss_from_classifier(
+        model.classifier,
+        x,
+        output_lengths,
+        targets,
+        target_lengths,
+        blank_id=0,
+    )
+
+    assert loss.item() >= 0.0
+    assert observed_dtypes == [torch.float32]
 
 
 def test_sentencepiece_tokenizer_rejects_empty_piece_nonblank_token() -> None:

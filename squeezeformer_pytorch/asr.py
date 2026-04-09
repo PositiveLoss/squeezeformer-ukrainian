@@ -564,6 +564,13 @@ class SqueezeformerCTC(nn.Module):
         adjusted_logits[..., 0] = adjusted_logits[..., 0] - self.blank_logit_offset
         return adjusted_logits
 
+    @staticmethod
+    def _ctc_log_softmax(logits: Tensor) -> Tensor:
+        # CTC is numerically sensitive under mixed precision. Compute the
+        # normalization in float32 instead of autocast bf16/fp16, mirroring the
+        # explicit float32 path already used for AED cross-entropy.
+        return F.log_softmax(logits, dim=-1, dtype=torch.float32)
+
     def _blank_logit_regularization_from_logits(
         self,
         logits: Tensor,
@@ -681,7 +688,7 @@ class SqueezeformerCTC(nn.Module):
             logits_for_log_probs = (
                 self._apply_training_blank_logit_offset(logits) if apply_blank_offset else logits
             )
-            return logits, F.log_softmax(logits_for_log_probs, dim=-1)
+            return logits, self._ctc_log_softmax(logits_for_log_probs)
 
         bytes_per_element = max(1, x.element_size())
         target_elements = max(1, _BLANK_PRUNE_TARGET_BYTES // bytes_per_element)
@@ -691,10 +698,10 @@ class SqueezeformerCTC(nn.Module):
             logits_for_log_probs = (
                 self._apply_training_blank_logit_offset(logits) if apply_blank_offset else logits
             )
-            return logits, F.log_softmax(logits_for_log_probs, dim=-1)
+            return logits, self._ctc_log_softmax(logits_for_log_probs)
 
         logits = x.new_empty((batch, time, vocab_size))
-        log_probs = x.new_empty((batch, time, vocab_size))
+        log_probs = x.new_empty((batch, time, vocab_size), dtype=torch.float32)
         start = 0
         for chunk in x.split(chunk_batch, dim=0):
             stop = start + chunk.size(0)
@@ -705,7 +712,7 @@ class SqueezeformerCTC(nn.Module):
                 else chunk_logits
             )
             logits[start:stop] = chunk_logits
-            log_probs[start:stop] = F.log_softmax(chunk_logits_for_log_probs, dim=-1)
+            log_probs[start:stop] = self._ctc_log_softmax(chunk_logits_for_log_probs)
             start = stop
         return logits, log_probs
 
@@ -762,9 +769,9 @@ class SqueezeformerCTC(nn.Module):
         if not isinstance(vocab_size, int) or vocab_size <= 0:
             logits = apply_linear_with_fp8_padding(classifier, x)
             logits_for_log_probs = self._apply_training_blank_logit_offset(logits)
-            log_probs = F.log_softmax(logits_for_log_probs, dim=-1)
+            log_probs = self._ctc_log_softmax(logits_for_log_probs)
             per_sample_losses = F.ctc_loss(
-                log_probs.float().transpose(0, 1),
+                log_probs.transpose(0, 1),
                 targets,
                 output_lengths,
                 target_lengths,
@@ -780,9 +787,9 @@ class SqueezeformerCTC(nn.Module):
         if chunk_batch >= batch:
             logits = apply_linear_with_fp8_padding(classifier, x)
             logits_for_log_probs = self._apply_training_blank_logit_offset(logits)
-            log_probs = F.log_softmax(logits_for_log_probs, dim=-1)
+            log_probs = self._ctc_log_softmax(logits_for_log_probs)
             per_sample_losses = F.ctc_loss(
-                log_probs.float().transpose(0, 1),
+                log_probs.transpose(0, 1),
                 targets,
                 output_lengths,
                 target_lengths,
@@ -802,12 +809,12 @@ class SqueezeformerCTC(nn.Module):
             stop = min(batch, start + chunk_batch)
             chunk_logits = apply_linear_with_fp8_padding(classifier, x[start:stop])
             chunk_logits_for_log_probs = self._apply_training_blank_logit_offset(chunk_logits)
-            chunk_log_probs = F.log_softmax(chunk_logits_for_log_probs, dim=-1)
+            chunk_log_probs = self._ctc_log_softmax(chunk_logits_for_log_probs)
             chunk_targets = targets[target_offsets[start] : target_offsets[stop]]
             chunk_output_lengths = output_lengths[start:stop]
             chunk_target_lengths = target_lengths[start:stop]
             per_sample_losses = F.ctc_loss(
-                chunk_log_probs.float().transpose(0, 1),
+                chunk_log_probs.transpose(0, 1),
                 chunk_targets,
                 chunk_output_lengths,
                 chunk_target_lengths,
@@ -978,7 +985,7 @@ class SqueezeformerCTC(nn.Module):
 
     def log_probs(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
         logits, output_lengths = self(features, feature_lengths)
-        return F.log_softmax(logits, dim=-1), output_lengths
+        return self._ctc_log_softmax(logits), output_lengths
 
     def log_probs_with_intermediate(
         self,
