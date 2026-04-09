@@ -456,27 +456,15 @@ def _configure_trackio_storage(output_dir: Path) -> Path:
     return trackio_dir
 
 
-def _build_trackio_metric_group_tables(
+def _build_trackio_grouped_metrics(
     *,
     groups: dict[str, dict[str, object]],
-    dimensions: dict[str, object],
-    name_prefix: str,
-) -> dict[str, trackio.Table]:
-    tables: dict[str, trackio.Table] = {}
-    for group_name, metrics in groups.items():
-        if not metrics:
-            continue
-        rows = [
-            {
-                **dimensions,
-                "group": group_name,
-                "metric": metric_name,
-                "value": metric_value,
-            }
-            for metric_name, metric_value in metrics.items()
-        ]
-        tables[f"{name_prefix}_{group_name}_metrics"] = trackio.Table(data=rows)
-    return tables
+) -> dict[str, object]:
+    return {
+        f"{group_name}/{metric_name}": metric_value
+        for group_name, metrics in groups.items()
+        for metric_name, metric_value in metrics.items()
+    }
 
 
 def _resolve_resume_checkpoint_path(

@@ -65,7 +65,7 @@ from train import (
     _build_disk_backed_record_store,
     _build_fp8_recipe,
     _build_trackio_cli_arguments_table,
-    _build_trackio_metric_group_tables,
+    _build_trackio_grouped_metrics,
     _configure_console_logger,
     _ensure_opus_decode_support,
     _launch_trackio_ui,
@@ -158,35 +158,19 @@ def test_build_trackio_cli_arguments_table_records_explicit_arguments() -> None:
     ]
 
 
-def test_build_trackio_metric_group_tables_returns_structured_tables() -> None:
-    tables = _build_trackio_metric_group_tables(
+def test_build_trackio_grouped_metrics_returns_slash_prefixed_metrics() -> None:
+    metrics = _build_trackio_grouped_metrics(
         groups={
             "losses": {"train_loss_step": 1.25, "train_aed_loss_step": 0.2},
             "optimization": {"grad_norm": 4.5},
         },
-        dimensions={"epoch": 3, "global_step": 42, "scope": "train_step"},
-        name_prefix="train_step",
     )
 
-    assert set(tables) == {"train_step_losses_metrics", "train_step_optimization_metrics"}
-    assert tables["train_step_losses_metrics"].data.to_dict("records") == [
-        {
-            "epoch": 3,
-            "global_step": 42,
-            "scope": "train_step",
-            "group": "losses",
-            "metric": "train_loss_step",
-            "value": 1.25,
-        },
-        {
-            "epoch": 3,
-            "global_step": 42,
-            "scope": "train_step",
-            "group": "losses",
-            "metric": "train_aed_loss_step",
-            "value": 0.2,
-        },
-    ]
+    assert metrics == {
+        "losses/train_loss_step": 1.25,
+        "losses/train_aed_loss_step": 0.2,
+        "optimization/grad_norm": 4.5,
+    }
 
 
 def test_launch_trackio_ui_uses_trackio_show_without_blocking(
