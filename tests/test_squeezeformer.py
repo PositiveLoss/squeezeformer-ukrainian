@@ -62,6 +62,7 @@ from train import (
     _average_topk_checkpoints,
     _build_disk_backed_record_store,
     _build_fp8_recipe,
+    _build_trackio_cli_arguments_table,
     _configure_console_logger,
     _ensure_opus_decode_support,
     _load_records_from_dataset_roots,
@@ -124,6 +125,33 @@ def test_validate_resume_tokenizer_configuration_rejects_tokenizer_path_mismatch
         )
 
     assert "does not match the tokenizer loaded" in str(error.value)
+
+
+def test_build_trackio_cli_arguments_table_records_explicit_arguments() -> None:
+    table = _build_trackio_cli_arguments_table(
+        [
+            "--device",
+            "cpu",
+            "--batch-size=16",
+            "--dataset-source",
+            "train-a.parquet",
+            "--dataset-source",
+            "train-b.parquet",
+            "--no-record-cache",
+            "--muon-decay-exponent",
+            "-0.5",
+        ]
+    )
+
+    assert table is not None
+    assert table.data.to_dict("records") == [
+        {"position": 1, "argument": "--device", "value": "cpu"},
+        {"position": 2, "argument": "--batch-size", "value": "16"},
+        {"position": 3, "argument": "--dataset-source", "value": "train-a.parquet"},
+        {"position": 4, "argument": "--dataset-source", "value": "train-b.parquet"},
+        {"position": 5, "argument": "--no-record-cache", "value": True},
+        {"position": 6, "argument": "--muon-decay-exponent", "value": "-0.5"},
+    ]
 
 
 @torch.no_grad()

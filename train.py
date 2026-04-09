@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from contextlib import nullcontext
 from copy import deepcopy
@@ -158,6 +159,45 @@ def _build_trackio_run_name(
     if global_step > 0 or start_epoch > 1:
         run_name = f"{run_name}_resume-e{start_epoch:04d}-s{global_step:08d}"
     return run_name
+
+
+def _looks_like_numeric_cli_value(token: str) -> bool:
+    return bool(re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", token))
+
+
+def _build_trackio_cli_arguments_table(argv: list[str]) -> trackio.Table | None:
+    rows: list[dict[str, object]] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-") or token == "-":
+            index += 1
+            continue
+
+        value: str | bool = True
+        if token.startswith("--") and "=" in token:
+            argument, value = token.split("=", 1)
+        else:
+            argument = token
+            next_index = index + 1
+            if next_index < len(argv):
+                next_token = argv[next_index]
+                if not next_token.startswith("-") or _looks_like_numeric_cli_value(next_token):
+                    value = next_token
+                    index = next_index
+
+        rows.append(
+            {
+                "position": len(rows) + 1,
+                "argument": argument,
+                "value": value,
+            }
+        )
+        index += 1
+
+    if not rows:
+        return None
+    return trackio.Table(data=rows)
 
 
 def _validate_resume_tokenizer_configuration(
@@ -1081,6 +1121,7 @@ def main() -> None:
         )
 
     if is_main_process:
+        cli_arguments_table = _build_trackio_cli_arguments_table(sys.argv[1:])
         trackio_run_name = _build_trackio_run_name(
             trackio_project=args.trackio_project,
             output_dir=output_dir,
@@ -1113,6 +1154,8 @@ def main() -> None:
                 "world_size": world_size,
             },
         )
+        if cli_arguments_table is not None:
+            trackio.log({"cli_arguments": cli_arguments_table})
         logger.info(
             "trackio initialized project=%s run_name=%s trackio_dir=%s elapsed_since_start=%s",
             args.trackio_project,
