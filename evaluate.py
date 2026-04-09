@@ -21,8 +21,6 @@ from squeezeformer_pytorch.data import (
     ASRDataset,
     AudioFeaturizer,
     create_dataloader,
-    download_dataset,
-    load_records,
     prevalidate_records,
 )
 from squeezeformer_pytorch.evaluation_runtime import (
@@ -32,7 +30,14 @@ from squeezeformer_pytorch.evaluation_runtime import (
 )
 from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice
-from squeezeformer_pytorch.training.cli import _validate_device_argument
+from squeezeformer_pytorch.training.cli import (
+    _validate_device_argument,
+    _validate_existing_local_path_argument,
+)
+from squeezeformer_pytorch.training.data_loading import (
+    _load_records_from_dataset_roots,
+    _resolve_sources,
+)
 from squeezeformer_pytorch.training.evaluation import evaluate
 from squeezeformer_pytorch.training.runtime import (
     FrozenLibertaTeacher,
@@ -45,6 +50,29 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a trained Squeezeformer CTC model.")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--dataset-repo", default="speech-uk/cv22")
+    parser.add_argument(
+        "--dataset-source",
+        action="append",
+        default=None,
+        help=(
+            "Dataset source to load. Repeat to combine multiple sources. Each source may be a "
+            "Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. "
+            "If omitted, --dataset-repo is used."
+        ),
+    )
+    parser.add_argument(
+        "--validation-dataset-source",
+        action="append",
+        default=None,
+        help=(
+            "Validation-only dataset source. Repeat to combine multiple sources. Each source may "
+            "be a Hugging Face dataset repo, a direct TSV/Parquet file path or URL, or a local "
+            "directory with Common Voice-style TSV or Parquet manifests plus audio files. When "
+            "provided together with --split validation, evaluation uses the full set of records "
+            "from these sources."
+        ),
+    )
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
@@ -120,7 +148,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-path", default=None)
     parser.add_argument("--trackio-project", default="squeezeformer-cv22")
     parser.add_argument("--trackio-space-id", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    for source in args.dataset_source or []:
+        _validate_existing_local_path_argument("--dataset-source", source)
+    for source in args.validation_dataset_source or []:
+        _validate_existing_local_path_argument("--validation-dataset-source", source)
+    return args
 
 
 def main() -> None:
@@ -157,19 +190,35 @@ def main() -> None:
         checkpoint_tokenizer_type=checkpoint_tokenizer_type,
     )
 
-    dataset_root = download_dataset(
-        repo_id=args.dataset_repo,
-        token=args.hf_token,
-        cache_dir=args.cache_dir,
-    )
-    records = load_records(
-        dataset_root=dataset_root,
-        split=args.split,
+    dataset_sources = _resolve_sources(args.dataset_source, fallback=args.dataset_repo)
+    validation_dataset_sources = _resolve_sources(args.validation_dataset_source)
+    selected_sources = dataset_sources
+    selected_split = args.split
+    selected_val_fraction = args.val_fraction
+    selected_test_fraction = args.test_fraction
+    if args.split == "train" and args.dataset_source:
+        selected_split = "train"
+        selected_val_fraction = 0.0
+        selected_test_fraction = 0.0
+    elif args.split == "validation" and validation_dataset_sources:
+        selected_sources = validation_dataset_sources
+        selected_split = "train"
+        selected_val_fraction = 0.0
+        selected_test_fraction = 0.0
+
+    records = _load_records_from_dataset_roots(
+        selected_sources,
+        split=selected_split,
         seed=args.seed,
-        val_fraction=args.val_fraction,
-        test_fraction=args.test_fraction,
+        val_fraction=selected_val_fraction,
+        test_fraction=selected_test_fraction,
         max_samples=args.max_samples,
+        min_transcript_chars=1,
+        max_transcript_chars=5000,
+        max_symbol_ratio=1.0,
         lowercase_transcripts=lowercase_transcripts,
+        hf_token=args.hf_token,
+        cache_dir=args.cache_dir,
     )
     if args.prevalidate_audio:
         records = prevalidate_records(records, num_workers=args.prevalidate_workers)
