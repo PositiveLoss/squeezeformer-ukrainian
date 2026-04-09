@@ -534,7 +534,7 @@ class SqueezeformerCTC(nn.Module):
         }
 
     def _apply_training_blank_logit_offset(self, logits: Tensor) -> Tensor:
-        if self.blank_logit_offset <= 0.0:
+        if not self.training or self.blank_logit_offset <= 0.0:
             return logits
         adjusted_logits = logits.clone()
         adjusted_logits[..., 0] = adjusted_logits[..., 0] - self.blank_logit_offset

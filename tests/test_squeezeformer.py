@@ -537,6 +537,25 @@ def test_only_main_ctc_head_starts_with_negative_blank_bias() -> None:
 
 
 @torch.no_grad()
+def test_blank_logit_offset_applies_only_during_training() -> None:
+    model = SqueezeformerCTC(
+        encoder_config=squeezeformer_variant("xs"),
+        vocab_size=8,
+        blank_logit_offset=0.25,
+    )
+    logits = torch.tensor([[[1.0, 2.0, 3.0]]], dtype=torch.float32)
+
+    model.train()
+    adjusted_train = model._apply_training_blank_logit_offset(logits)
+    model.eval()
+    adjusted_eval = model._apply_training_blank_logit_offset(logits)
+
+    assert torch.allclose(adjusted_train[..., 0], logits[..., 0] - 0.25)
+    assert torch.allclose(adjusted_train[..., 1:], logits[..., 1:])
+    assert torch.allclose(adjusted_eval, logits)
+
+
+@torch.no_grad()
 def test_temporal_unet_recovers_subsampled_resolution() -> None:
     model = build_squeezeformer_encoder("sm")
     model.eval()
