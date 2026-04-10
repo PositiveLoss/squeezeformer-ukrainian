@@ -29,6 +29,7 @@ from squeezeformer_pytorch.evaluation_runtime import (
     resolve_evaluation_checkpoint_settings,
     resolve_lowercase_transcripts,
 )
+from squeezeformer_pytorch.frontend import resolve_checkpoint_featurizer_config
 from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, ValidationModelSource
 from squeezeformer_pytorch.training.cli import (
@@ -197,7 +198,8 @@ def main() -> None:
     tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
     checkpoint_tokenizer_type = str(checkpoint["tokenizer"].get("type", ""))
     checkpoint_settings = resolve_evaluation_checkpoint_settings(checkpoint)
-    if checkpoint_uses_zipformer(checkpoint):
+    use_zipformer = checkpoint_uses_zipformer(checkpoint)
+    if use_zipformer:
         if args.dtype == DTypeChoice.FP8:
             raise ValueError("Zipformer checkpoints do not support FP8 evaluation.")
         encoder_config = ZipformerConfig(**checkpoint["encoder_config"])
@@ -295,7 +297,12 @@ def main() -> None:
             raise RuntimeError(
                 "Audio prevalidation removed every sample from the evaluation split."
             )
-    featurizer = AudioFeaturizer(**checkpoint.get("featurizer_config", {}))
+    featurizer = AudioFeaturizer(
+        **resolve_checkpoint_featurizer_config(
+            checkpoint.get("featurizer_config"),
+            use_zipformer=use_zipformer,
+        )
+    )
     feature_cache_dir = (
         Path(args.feature_cache_dir) / args.split if args.feature_cache_dir else None
     )

@@ -12,6 +12,7 @@ from squeezeformer_pytorch.checkpoints import (
     is_torchao_quantized_checkpoint,
     should_use_transformer_engine_for_checkpoint,
 )
+from squeezeformer_pytorch.frontend import zipformer_paper_featurizer_config
 from squeezeformer_pytorch.inference_runtime import resolve_inference_checkpoint_settings
 from squeezeformer_pytorch.runtime_types import DTypeChoice
 from squeezeformer_pytorch.training.runtime import _inference_checkpoint_payload
@@ -392,8 +393,8 @@ def test_asr_session_uses_zipformer_for_zipformer_checkpoint(
         vocab_size = 32
 
     class DummyFeaturizer:
-        def __init__(self, **_: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            captured["featurizer_kwargs"] = kwargs
 
     class DummyZipformerModel:
         def __init__(self, **kwargs: object) -> None:
@@ -440,6 +441,7 @@ def test_asr_session_uses_zipformer_for_zipformer_checkpoint(
     inference.ASRInferenceSession("checkpoint.pt", torch.device("cpu"), DTypeChoice.FLOAT32)
 
     assert captured["model_kwargs"]["encoder_config"].architecture == "zipformer"
+    assert captured["featurizer_kwargs"] == zipformer_paper_featurizer_config()
     assert captured["load_kwargs"] == {}
     assert captured["strict"] is True
     assert captured["device"] == torch.device("cpu")

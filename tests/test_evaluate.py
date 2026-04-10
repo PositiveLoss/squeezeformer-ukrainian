@@ -5,6 +5,7 @@ from dataclasses import asdict
 import evaluate
 from squeezeformer_pytorch import squeezeformer_variant
 from squeezeformer_pytorch.evaluation_runtime import resolve_evaluation_checkpoint_settings
+from squeezeformer_pytorch.frontend import zipformer_paper_featurizer_config
 from squeezeformer_pytorch.runtime_types import DTypeChoice, ValidationModelSource
 from zipformer_pytorch.asr import zipformer_variant
 
@@ -40,8 +41,8 @@ def test_evaluate_defaults_to_checkpoint_tokenizer_casing(monkeypatch) -> None:
             return self
 
     class DummyFeaturizer:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            captured["featurizer_kwargs"] = kwargs
 
     class DummyDataset:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -152,8 +153,8 @@ def test_evaluate_respects_lowercase_transcripts_override(monkeypatch) -> None:
             return self
 
     class DummyFeaturizer:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            captured["featurizer_kwargs"] = kwargs
 
     class DummyDataset:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -266,8 +267,8 @@ def test_evaluate_prefers_validation_dataset_sources_when_dataset_source_is_unse
             return self
 
     class DummyFeaturizer:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            captured["featurizer_kwargs"] = kwargs
 
     class DummyDataset:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -640,8 +641,8 @@ def test_evaluate_uses_zipformer_for_zipformer_checkpoint(monkeypatch) -> None:
             return self
 
     class DummyFeaturizer:
-        def __init__(self, **_kwargs: object) -> None:
-            pass
+        def __init__(self, **kwargs: object) -> None:
+            captured["featurizer_kwargs"] = kwargs
 
     class DummyDataset:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -734,4 +735,5 @@ def test_evaluate_uses_zipformer_for_zipformer_checkpoint(monkeypatch) -> None:
     evaluate.main()
 
     assert captured["model_kwargs"]["encoder_config"].architecture == "zipformer"
+    assert captured["featurizer_kwargs"] == zipformer_paper_featurizer_config()
     assert captured["state_dict"] == {"weight": "zipformer"}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 
 import numpy as np
@@ -17,11 +18,47 @@ except ImportError:
     SpectralFilterBankScaleType = None
 
 
+ZIPFORMER_PAPER_FEATURIZER_CONFIG: dict[str, object] = {
+    "sample_rate": 16_000,
+    "n_fft": 400,
+    "win_length": 400,
+    "hop_length": 160,
+    "n_mels": 80,
+    "backend": "torchaudio",
+    "preemphasis": 0.0,
+    "normalize_signal": False,
+    "normalize_feature": False,
+    "normalize_per_frame": False,
+}
+
+
+def zipformer_paper_featurizer_config(
+    overrides: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    config = dict(ZIPFORMER_PAPER_FEATURIZER_CONFIG)
+    if overrides is not None:
+        config.update(overrides)
+    return config
+
+
+def resolve_checkpoint_featurizer_config(
+    featurizer_config: Mapping[str, object] | None,
+    *,
+    use_zipformer: bool,
+) -> dict[str, object]:
+    if featurizer_config:
+        return dict(featurizer_config)
+    if use_zipformer:
+        return zipformer_paper_featurizer_config()
+    return {}
+
+
 class AudioFeaturizer(torch.nn.Module):
     def __init__(
         self,
         sample_rate: int = 16_000,
         n_fft: int = 400,
+        win_length: int | None = None,
         hop_length: int = 160,
         n_mels: int = 80,
         backend: str = "torchaudio",
@@ -33,6 +70,7 @@ class AudioFeaturizer(torch.nn.Module):
         super().__init__()
         self.sample_rate = sample_rate
         self.n_fft = n_fft
+        self.win_length = n_fft if win_length is None else int(win_length)
         self.n_mels = n_mels
         self.backend = backend
         self.preemphasis = preemphasis
@@ -40,10 +78,17 @@ class AudioFeaturizer(torch.nn.Module):
         self.normalize_feature = normalize_feature
         self.normalize_per_frame = normalize_per_frame
         self.hop_length = hop_length
+        if self.win_length <= 0:
+            raise ValueError(f"win_length must be > 0, got {self.win_length}.")
+        if self.win_length > self.n_fft:
+            raise ValueError(
+                f"win_length must be <= n_fft, got win_length={self.win_length}, n_fft={self.n_fft}."
+            )
         if backend == "torchaudio":
             self.mel = torchaudio.transforms.MelSpectrogram(
                 sample_rate=sample_rate,
                 n_fft=n_fft,
+                win_length=self.win_length,
                 hop_length=hop_length,
                 n_mels=n_mels,
             )
@@ -55,6 +100,11 @@ class AudioFeaturizer(torch.nn.Module):
                 raise ValueError(
                     "audioflux backend requires n_fft to be a power of two because "
                     "its mel frontend uses fft_length=2**radix2_exp."
+                )
+            if self.win_length != n_fft:
+                raise ValueError(
+                    "audioflux backend requires win_length to equal n_fft because the "
+                    "configured BFT frontend does not expose a separate analysis window."
                 )
             self.mel = None
             self._audioflux_bft = af.BFT(
@@ -85,8 +135,9 @@ class AudioFeaturizer(torch.nn.Module):
                 [waveform[:1], waveform[1:] - self.preemphasis * waveform[:-1]],
                 dim=0,
             )
-        if waveform.numel() < self.n_fft:
-            waveform = F.pad(waveform, (0, self.n_fft - waveform.numel()))
+        required_samples = max(self.n_fft, self.win_length)
+        if waveform.numel() < required_samples:
+            waveform = F.pad(waveform, (0, required_samples - waveform.numel()))
         if self.backend == "torchaudio":
             features = self.mel(waveform)
             features = torch.log(features.clamp_min(1e-5)).transpose(0, 1)
@@ -111,6 +162,7 @@ class AudioFeaturizer(torch.nn.Module):
         return {
             "sample_rate": self.sample_rate,
             "n_fft": self.n_fft,
+            "win_length": self.win_length,
             "n_mels": self.n_mels,
             "backend": self.backend,
             "preemphasis": self.preemphasis,

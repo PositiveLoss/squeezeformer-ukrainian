@@ -18,7 +18,10 @@ from squeezeformer_pytorch.checkpoints import (
     load_checkpoint,
     should_use_transformer_engine_for_checkpoint,
 )
-from squeezeformer_pytorch.frontend import AudioFeaturizer
+from squeezeformer_pytorch.frontend import (
+    AudioFeaturizer,
+    resolve_checkpoint_featurizer_config,
+)
 from squeezeformer_pytorch.inference_runtime import (
     merge_chunk_transcript as _merge_chunk_transcript,
 )
@@ -106,7 +109,8 @@ class ASRInferenceSession:
         self.tokenizer = tokenizer_from_dict(checkpoint_data["tokenizer"])
         checkpoint_settings = resolve_inference_checkpoint_settings(checkpoint_data)
         is_torchao_quantized = is_torchao_quantized_checkpoint(checkpoint_data)
-        if checkpoint_uses_zipformer(checkpoint_data):
+        use_zipformer = checkpoint_uses_zipformer(checkpoint_data)
+        if use_zipformer:
             if dtype == DTypeChoice.FP8:
                 raise ValueError("Zipformer checkpoints do not support FP8 inference.")
             encoder_config = ZipformerConfig(**checkpoint_data["encoder_config"])
@@ -157,7 +161,12 @@ class ASRInferenceSession:
         self.model.to(device)
         self.model.eval()
 
-        self.featurizer = AudioFeaturizer(**checkpoint_data.get("featurizer_config", {}))
+        self.featurizer = AudioFeaturizer(
+            **resolve_checkpoint_featurizer_config(
+                checkpoint_data.get("featurizer_config"),
+                use_zipformer=use_zipformer,
+            )
+        )
 
     def transcribe_file(self, audio_path: str | Path) -> str:
         waveform, sample_rate = torchaudio.load(str(audio_path))

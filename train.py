@@ -35,6 +35,7 @@ from squeezeformer_pytorch.data import (
     WaveformAugment,
     create_dataloader,
 )
+from squeezeformer_pytorch.frontend import zipformer_paper_featurizer_config
 from squeezeformer_pytorch.lm import NGramLanguageModel
 from squeezeformer_pytorch.model import (
     SqueezeformerConfig,
@@ -318,6 +319,30 @@ def _validate_zipformer_runtime_args(args) -> None:
         raise ValueError("--zipformer does not support LiBERTa distillation.")
     if args.audio_teacher:
         raise ValueError("--zipformer does not support audio-teacher distillation.")
+
+
+def _resolve_training_featurizer_config(
+    args,
+    *,
+    checkpoint: dict[str, object] | None,
+    use_zipformer: bool,
+) -> dict[str, object]:
+    if checkpoint is not None:
+        checkpoint_config = checkpoint.get("featurizer_config")
+        if isinstance(checkpoint_config, dict) and checkpoint_config:
+            return dict(checkpoint_config)
+    if use_zipformer:
+        return zipformer_paper_featurizer_config()
+    return {
+        "n_fft": args.n_fft,
+        "hop_length": args.hop_length,
+        "n_mels": args.n_mels,
+        "backend": args.frontend_backend,
+        "preemphasis": args.preemphasis,
+        "normalize_signal": args.normalize_signal,
+        "normalize_feature": args.normalize_feature,
+        "normalize_per_frame": args.normalize_per_frame,
+    }
 
 
 def _distributed_mean(value: float, *, device: torch.device, distributed: bool) -> float:
@@ -1018,14 +1043,11 @@ def main() -> None:
             _format_elapsed_seconds(time.perf_counter() - stage_start_time),
         )
     featurizer = AudioFeaturizer(
-        n_fft=args.n_fft,
-        hop_length=args.hop_length,
-        n_mels=args.n_mels,
-        backend=args.frontend_backend,
-        preemphasis=args.preemphasis,
-        normalize_signal=args.normalize_signal,
-        normalize_feature=args.normalize_feature,
-        normalize_per_frame=args.normalize_per_frame,
+        **_resolve_training_featurizer_config(
+            args,
+            checkpoint=checkpoint,
+            use_zipformer=use_zipformer,
+        )
     )
     specaugment = None
     waveform_augment = None
@@ -1081,8 +1103,8 @@ def main() -> None:
         len(val_records),
         distributed,
         world_size,
-        _record_store_duration_hours(train_records, hop_length=args.hop_length),
-        _record_store_duration_hours(val_records, hop_length=args.hop_length),
+        _record_store_duration_hours(train_records, hop_length=featurizer.hop_length),
+        _record_store_duration_hours(val_records, hop_length=featurizer.hop_length),
         args.num_workers,
         args.metadata_workers,
         args.persistent_workers,
@@ -1145,7 +1167,7 @@ def main() -> None:
         encoder_config = (
             ZipformerConfig(**checkpoint["encoder_config"])
             if checkpoint is not None
-            else replace(zipformer_variant(args.variant), input_dim=args.n_mels)
+            else replace(zipformer_variant(args.variant), input_dim=featurizer.n_mels)
         )
         intermediate_ctc_layers = ()
         intermediate_ctc_weight = 0.0
@@ -1808,7 +1830,7 @@ def main() -> None:
                     batch_audio_minutes = _distributed_mean(
                         _frames_to_minutes(
                             tune_effective_frames,
-                            hop_length=args.hop_length,
+                            hop_length=featurizer.hop_length,
                         ),
                         device=device,
                         distributed=distributed,
