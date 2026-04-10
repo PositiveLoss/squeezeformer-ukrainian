@@ -143,6 +143,8 @@ def ctc_batch_diagnostics(
         "sample_count": float(output_lengths.numel()),
         "output_frames_sum": float(output_lengths.sum().item()),
     }
+    if target_lengths is not None:
+        diagnostics["target_tokens_sum"] = float(target_lengths.sum().item())
     if targets is not None and target_lengths is not None:
         minimum_lengths = target_lengths.to(dtype=torch.int64).clone()
         offset = 0
@@ -152,7 +154,6 @@ def ctc_batch_diagnostics(
                 sample_targets = targets[offset : offset + length]
                 minimum_lengths[sample_index] += sample_targets[:-1].eq(sample_targets[1:]).sum()
             offset += length
-        diagnostics["target_tokens_sum"] = float(target_lengths.sum().item())
         diagnostics["impossible_sample_count"] = float(
             output_lengths.lt(minimum_lengths).sum().item()
         )

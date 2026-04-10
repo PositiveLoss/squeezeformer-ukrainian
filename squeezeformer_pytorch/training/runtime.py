@@ -523,9 +523,9 @@ def _variant_defaults(variant: str) -> SchedulerDefaults:
         return SchedulerDefaults(peak_lr=2e-3, num_time_masks=5)
     if variant == "m":
         return SchedulerDefaults(peak_lr=1.5e-3, num_time_masks=7)
-    if variant == "ml":
+    if variant in {"ml", "l"}:
         return SchedulerDefaults(peak_lr=1e-3, num_time_masks=10)
-    return SchedulerDefaults(peak_lr=5e-4, num_time_masks=10)
+    raise ValueError(f"Unknown variant defaults requested for '{variant}'.")
 
 
 def _resolve_optimizer_learning_rates(

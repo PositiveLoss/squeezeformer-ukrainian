@@ -163,7 +163,7 @@ def test_variant_scheduler_defaults_match_paper_recipe() -> None:
     assert _variant_defaults("sm").peak_lr == 2e-3
     assert _variant_defaults("m").peak_lr == 1.5e-3
     assert _variant_defaults("ml").peak_lr == 1e-3
-    assert _variant_defaults("l").peak_lr == 5e-4
+    assert _variant_defaults("l").peak_lr == 1e-3
 
 
 def test_parse_args_accepts_run_trackio_ui_flag() -> None:

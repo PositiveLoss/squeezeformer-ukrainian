@@ -624,12 +624,13 @@ class SqueezeformerCTC(nn.Module):
             "sample_count": float(output_lengths.numel()),
             "output_frames_sum": float(output_lengths.sum().item()),
         }
+        if target_lengths is not None:
+            diagnostics["target_tokens_sum"] = float(target_lengths.sum().item())
         if targets is not None and target_lengths is not None:
             minimum_lengths = SqueezeformerCTC._ctc_minimum_alignment_lengths(
                 targets,
                 target_lengths,
             )
-            diagnostics["target_tokens_sum"] = float(target_lengths.sum().item())
             diagnostics["impossible_sample_count"] = float(
                 output_lengths.lt(minimum_lengths).sum().item()
             )
