@@ -80,6 +80,7 @@ from train import (
     _load_train_val_records,
     _resolve_dataset_roots,
     _resolve_dataset_sources,
+    _resolve_optimizer_learning_rates,
     _should_warn_on_blank_starvation,
     _update_top_checkpoints,
     _validate_device_argument,
@@ -1022,6 +1023,44 @@ def test_variant_table_matches_paper() -> None:
     for name, values in expected.items():
         cfg = squeezeformer_variant(name)
         assert (cfg.num_layers, cfg.d_model, cfg.num_heads) == values
+
+
+def test_default_adamw_learning_rate_is_capped_when_not_explicitly_set() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+        ]
+    )
+
+    peak_lr, muon_lr, adamw_lr = _resolve_optimizer_learning_rates(
+        args,
+        variant_defaults=_variant_defaults("sm"),
+    )
+
+    assert peak_lr == 2e-3
+    assert muon_lr == 2e-3
+    assert adamw_lr == 3e-4
+
+
+def test_explicit_learning_rate_still_applies_to_default_adamw_path() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+            "--learning-rate",
+            "0.0015",
+        ]
+    )
+
+    peak_lr, muon_lr, adamw_lr = _resolve_optimizer_learning_rates(
+        args,
+        variant_defaults=_variant_defaults("sm"),
+    )
+
+    assert peak_lr == 0.0015
+    assert muon_lr == 0.0015
+    assert adamw_lr == 0.0015
 
 
 def test_stochastic_depth_enabled_for_larger_variants() -> None:

@@ -92,6 +92,9 @@ class SchedulerDefaults(NamedTuple):
     num_time_masks: int
 
 
+_DEFAULT_ADAMW_LR_CAP = 3e-4
+
+
 class FrozenLibertaTeacher:
     def __init__(
         self,
@@ -523,6 +526,28 @@ def _variant_defaults(variant: str) -> SchedulerDefaults:
     if variant == "ml":
         return SchedulerDefaults(peak_lr=1e-3, num_time_masks=10)
     return SchedulerDefaults(peak_lr=5e-4, num_time_masks=10)
+
+
+def _resolve_optimizer_learning_rates(
+    args: argparse.Namespace,
+    *,
+    variant_defaults: SchedulerDefaults,
+) -> tuple[float, float, float]:
+    peak_lr = (
+        float(args.learning_rate)
+        if args.learning_rate is not None
+        else float(variant_defaults.peak_lr)
+    )
+    muon_lr = float(args.muon_learning_rate) if args.muon_learning_rate is not None else peak_lr
+    if args.adamw_learning_rate is not None:
+        adamw_lr = float(args.adamw_learning_rate)
+    elif args.learning_rate is not None:
+        adamw_lr = peak_lr
+    elif args.optimizer == OptimizerChoice.ADAMW:
+        adamw_lr = min(peak_lr, _DEFAULT_ADAMW_LR_CAP)
+    else:
+        adamw_lr = peak_lr
+    return peak_lr, muon_lr, adamw_lr
 
 
 def _parse_intermediate_ctc_layers(value: object) -> tuple[int, ...]:

@@ -111,6 +111,7 @@ from squeezeformer_pytorch.training.runtime import (
     _resolve_intermediate_ctc_settings,
     _resolve_liberta_settings,
     _resolve_model_load_dtype,
+    _resolve_optimizer_learning_rates,
     _resolve_resume_checkpoint_path,
     _validate_resume_checkpoint_payload,
     _variant_defaults,
@@ -1202,9 +1203,10 @@ def main() -> None:
     use_grad_scaler = device.type == "cuda" and args.dtype == DTypeChoice.FLOAT16
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
-    peak_lr = args.learning_rate if args.learning_rate is not None else variant_defaults.peak_lr
-    muon_lr = args.muon_learning_rate if args.muon_learning_rate is not None else peak_lr
-    adamw_lr = args.adamw_learning_rate if args.adamw_learning_rate is not None else peak_lr
+    peak_lr, muon_lr, adamw_lr = _resolve_optimizer_learning_rates(
+        args,
+        variant_defaults=variant_defaults,
+    )
     muon_weight_decay = (
         args.muon_weight_decay if args.muon_weight_decay is not None else args.weight_decay
     )
