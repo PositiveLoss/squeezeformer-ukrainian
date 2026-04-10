@@ -46,6 +46,15 @@ from squeezeformer_pytorch.training.runtime import (
     resolve_device,
 )
 from train import _build_trackio_run_name
+from zipformer_pytorch.asr import ZipformerCTC, ZipformerConfig
+
+
+def checkpoint_uses_zipformer(checkpoint_data: dict[str, object]) -> bool:
+    training_args = checkpoint_data.get("training_args")
+    if isinstance(training_args, dict) and bool(training_args.get("zipformer")):
+        return True
+    encoder_config = checkpoint_data.get("encoder_config")
+    return isinstance(encoder_config, dict) and str(encoder_config.get("architecture", "")) == "zipformer"
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,27 +193,41 @@ def main() -> None:
     checkpoint = load_checkpoint(args.checkpoint, map_location="cpu")
     tokenizer = tokenizer_from_dict(checkpoint["tokenizer"])
     checkpoint_tokenizer_type = str(checkpoint["tokenizer"].get("type", ""))
-    encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
     checkpoint_settings = resolve_evaluation_checkpoint_settings(checkpoint)
-    model = SqueezeformerCTC(
-        encoder_config=encoder_config,
-        vocab_size=tokenizer.vocab_size,
-        intermediate_ctc_layers=checkpoint_settings["resolved_intermediate_ctc_layers"],
-        blank_prune_layer=checkpoint_settings["blank_prune_layer"],
-        blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
-        blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
-        initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-        identical_initial_ctc_heads=checkpoint_settings["identical_initial_ctc_heads"],
-        aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
-        aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
-        aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
-        aed_decoder_dropout=checkpoint_settings["aed_decoder_dropout"],
-        liberta_distill_enabled=checkpoint_settings["liberta_distill_enabled"],
-        use_transformer_engine=should_use_transformer_engine_for_checkpoint(
-            checkpoint,
-            requested_dtype=args.dtype,
-        ),
-    )
+    if checkpoint_uses_zipformer(checkpoint):
+        if args.dtype == DTypeChoice.FP8:
+            raise ValueError("Zipformer checkpoints do not support FP8 evaluation.")
+        encoder_config = ZipformerConfig(**checkpoint["encoder_config"])
+        model = ZipformerCTC(
+            encoder_config=encoder_config,
+            vocab_size=tokenizer.vocab_size,
+            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+            blank_logit_offset=float(checkpoint.get("training_args", {}).get("blank_logit_offset", 0.0)),
+            blank_logit_regularization_weight=float(
+                checkpoint.get("training_args", {}).get("blank_logit_regularization_weight", 0.0)
+            ),
+        )
+    else:
+        encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
+        model = SqueezeformerCTC(
+            encoder_config=encoder_config,
+            vocab_size=tokenizer.vocab_size,
+            intermediate_ctc_layers=checkpoint_settings["resolved_intermediate_ctc_layers"],
+            blank_prune_layer=checkpoint_settings["blank_prune_layer"],
+            blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
+            blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
+            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+            identical_initial_ctc_heads=checkpoint_settings["identical_initial_ctc_heads"],
+            aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
+            aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
+            aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
+            aed_decoder_dropout=checkpoint_settings["aed_decoder_dropout"],
+            liberta_distill_enabled=checkpoint_settings["liberta_distill_enabled"],
+            use_transformer_engine=should_use_transformer_engine_for_checkpoint(
+                checkpoint,
+                requested_dtype=args.dtype,
+            ),
+        )
     selected_validation_model_source = (
         args.validation_model_source
         if args.validation_model_source is not None

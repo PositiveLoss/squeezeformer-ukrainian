@@ -31,6 +31,7 @@ from squeezeformer_pytorch.model import (
     transformer_engine_available,
 )
 from squeezeformer_pytorch.runtime_types import DTypeChoice
+from zipformer_pytorch.asr import ZipformerCTC, ZipformerConfig
 
 try:
     import transformer_engine.pytorch as te
@@ -43,6 +44,14 @@ except (ImportError, OSError):
 DEFAULT_CHECKPOINT = (
     "https://huggingface.co/speech-uk/squeezeformer-sm/resolve/main/checkpoint_best.pt"
 )
+
+
+def checkpoint_uses_zipformer(checkpoint_data: dict[str, object]) -> bool:
+    training_args = checkpoint_data.get("training_args")
+    if isinstance(training_args, dict) and bool(training_args.get("zipformer")):
+        return True
+    encoder_config = checkpoint_data.get("encoder_config")
+    return isinstance(encoder_config, dict) and str(encoder_config.get("architecture", "")) == "zipformer"
 
 
 def _download_hf_checkpoint(repo_id: str, filename: str) -> str:
@@ -92,34 +101,52 @@ class ASRInferenceSession:
             metadata_path=self.checkpoint_metadata_path,
         )
         self.tokenizer = tokenizer_from_dict(checkpoint_data["tokenizer"])
-        encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
         checkpoint_settings = resolve_inference_checkpoint_settings(checkpoint_data)
         is_torchao_quantized = is_torchao_quantized_checkpoint(checkpoint_data)
-        use_transformer_engine = should_use_transformer_engine_for_checkpoint(
-            checkpoint_data,
-            requested_dtype=dtype,
-        )
-        if dtype == DTypeChoice.FP8:
-            if is_torchao_quantized:
-                raise ValueError("TorchAO quantized checkpoints do not support FP8 inference.")
-            validate_fp8_inference_runtime(device, encoder_config)
+        if checkpoint_uses_zipformer(checkpoint_data):
+            if dtype == DTypeChoice.FP8:
+                raise ValueError("Zipformer checkpoints do not support FP8 inference.")
+            encoder_config = ZipformerConfig(**checkpoint_data["encoder_config"])
+            self.model = ZipformerCTC(
+                encoder_config=encoder_config,
+                vocab_size=self.tokenizer.vocab_size,
+                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+                blank_logit_offset=float(
+                    checkpoint_data.get("training_args", {}).get("blank_logit_offset", 0.0)
+                ),
+                blank_logit_regularization_weight=float(
+                    checkpoint_data.get("training_args", {}).get(
+                        "blank_logit_regularization_weight", 0.0
+                    )
+                ),
+            )
+        else:
+            encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
+            use_transformer_engine = should_use_transformer_engine_for_checkpoint(
+                checkpoint_data,
+                requested_dtype=dtype,
+            )
+            if dtype == DTypeChoice.FP8:
+                if is_torchao_quantized:
+                    raise ValueError("TorchAO quantized checkpoints do not support FP8 inference.")
+                validate_fp8_inference_runtime(device, encoder_config)
 
-        self.model = SqueezeformerCTC(
-            encoder_config=encoder_config,
-            vocab_size=self.tokenizer.vocab_size,
-            intermediate_ctc_layers=checkpoint_settings["resolved_intermediate_ctc_layers"],
-            blank_prune_layer=checkpoint_settings["blank_prune_layer"],
-            blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
-            blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
-            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-            identical_initial_ctc_heads=checkpoint_settings["identical_initial_ctc_heads"],
-            aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
-            aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
-            aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
-            aed_decoder_dropout=checkpoint_settings["aed_decoder_dropout"],
-            liberta_distill_enabled=checkpoint_settings["liberta_distill_enabled"],
-            use_transformer_engine=use_transformer_engine,
-        )
+            self.model = SqueezeformerCTC(
+                encoder_config=encoder_config,
+                vocab_size=self.tokenizer.vocab_size,
+                intermediate_ctc_layers=checkpoint_settings["resolved_intermediate_ctc_layers"],
+                blank_prune_layer=checkpoint_settings["blank_prune_layer"],
+                blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
+                blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
+                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+                identical_initial_ctc_heads=checkpoint_settings["identical_initial_ctc_heads"],
+                aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
+                aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
+                aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
+                aed_decoder_dropout=checkpoint_settings["aed_decoder_dropout"],
+                liberta_distill_enabled=checkpoint_settings["liberta_distill_enabled"],
+                use_transformer_engine=use_transformer_engine,
+            )
         if is_torchao_quantized:
             self.model.load_state_dict(checkpoint_data["model_state_dict"], assign=True)
         else:

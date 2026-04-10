@@ -15,6 +15,7 @@ from squeezeformer_pytorch.checkpoints import (
 from squeezeformer_pytorch.inference_runtime import resolve_inference_checkpoint_settings
 from squeezeformer_pytorch.runtime_types import DTypeChoice
 from squeezeformer_pytorch.training.runtime import _inference_checkpoint_payload
+from zipformer_pytorch.asr import zipformer_variant
 
 
 def test_resolve_checkpoint_path_supports_hf_repo_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -380,3 +381,64 @@ def test_asr_session_rejects_fp8_for_torchao_checkpoint(
 
     with pytest.raises(ValueError, match="do not support FP8 inference"):
         inference.ASRInferenceSession("checkpoint.pt", torch.device("cpu"), DTypeChoice.FP8)
+
+
+def test_asr_session_uses_zipformer_for_zipformer_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyTokenizer:
+        vocab_size = 32
+
+    class DummyFeaturizer:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    class DummyZipformerModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured["model_kwargs"] = kwargs
+
+        def load_state_dict(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            strict: bool = True,
+            **kwargs,
+        ):
+            captured["load_kwargs"] = kwargs
+            captured["strict"] = strict
+            captured["state_dict"] = state_dict
+
+        def to(self, device: torch.device):
+            captured["device"] = device
+            return self
+
+        def eval(self):
+            captured["eval_called"] = True
+            return self
+
+    checkpoint_data = {
+        "tokenizer": {"type": "character", "symbols": ["а"]},
+        "encoder_config": asdict(zipformer_variant("xs")),
+        "training_args": {"zipformer": True},
+        "featurizer_config": {},
+        "model_state_dict": {"weight": torch.zeros(1)},
+    }
+
+    monkeypatch.setattr(inference, "load_checkpoint", lambda *_args, **_kwargs: checkpoint_data)
+    monkeypatch.setattr(inference, "tokenizer_from_dict", lambda *_args, **_kwargs: DummyTokenizer())
+    monkeypatch.setattr(inference, "AudioFeaturizer", DummyFeaturizer)
+    monkeypatch.setattr(inference, "ZipformerCTC", DummyZipformerModel)
+    monkeypatch.setattr(
+        inference,
+        "SqueezeformerCTC",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected squeezeformer path")),
+    )
+
+    inference.ASRInferenceSession("checkpoint.pt", torch.device("cpu"), DTypeChoice.FLOAT32)
+
+    assert captured["model_kwargs"]["encoder_config"].architecture == "zipformer"
+    assert captured["load_kwargs"] == {}
+    assert captured["strict"] is True
+    assert captured["device"] == torch.device("cpu")
+    assert captured["eval_called"] is True

@@ -115,7 +115,7 @@ class ByPass(nn.Module):
         self.c = nn.Parameter(torch.ones(1,1,self.num_features))
 
     def forward(self,x,y):
-        return (torch.ones(1, 1, self.num_features) - self.c) * x + self.c * y
+        return (1.0 - self.c) * x + self.c * y
 
 class ConvNextLayer(nn.Module):
     def __init__(self,dim):

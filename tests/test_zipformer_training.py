@@ -31,3 +31,17 @@ def test_zipformer_ctc_returns_training_outputs_with_main_log_probs() -> None:
     assert outputs["main_ctc_loss"] is not None
     assert outputs["intermediate_ctc_losses"] == {}
     assert outputs["blank_logit_regularization_loss"].dtype == torch.float32
+
+
+def test_zipformer_ctc_forward_runs_on_meta_device() -> None:
+    model = ZipformerCTC(
+        encoder_config=ZipformerConfig(input_dim=8, model_dim=16, num_layers=2, num_heads=4),
+        vocab_size=6,
+    ).to("meta")
+    features = torch.randn(2, 12, 8, device="meta")
+    feature_lengths = torch.tensor([12, 9], dtype=torch.long, device="meta")
+
+    logits, output_lengths = model(features, feature_lengths)
+
+    assert logits.device.type == "meta"
+    assert output_lengths.device.type == "meta"
