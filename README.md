@@ -520,10 +520,25 @@ HF_TOKEN=... uv run python train.py \
 Distributed training:
 
 ```bash
-HF_TOKEN=... torchrun --nproc_per_node=2 train.py \
+HF_TOKEN=... uv run squeezeformer-torchrun --nproc_per_node=2 train.py \
   --distributed \
   --variant sm \
   --output-dir artifacts/cv22-sm-ddp
+```
+
+The launcher sets `OMP_NUM_THREADS` automatically when it is unset so `torchrun` does not force
+each rank down to `1`. Export `OMP_NUM_THREADS` yourself before launch if you want a different
+value.
+
+Distributed Zipformer training:
+
+```bash
+HF_TOKEN=... uv run squeezeformer-torchrun --nproc_per_node=2 train.py \
+  --distributed \
+  --zipformer \
+  --variant sm \
+  --tokenizer sentencepiece \
+  --output-dir artifacts/zipformer-sm-ddp
 ```
 
 Local resumable smoke test:
