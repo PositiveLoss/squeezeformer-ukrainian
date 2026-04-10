@@ -61,8 +61,30 @@ def _subsample_length(
             raise ValueError(
                 "The current implementation expects the paper's fixed 3x3 stride-2 subsampler."
             )
-        output = torch.div(output, stride, rounding_mode="floor")
+        output = _downsample_lengths_clamp_positive(output, stride=stride)
     return output
+
+
+def _downsample_lengths_clamp_positive(lengths: Tensor, *, stride: int) -> Tensor:
+    downsampled = torch.div(lengths.to(dtype=torch.int64), stride, rounding_mode="floor")
+    return torch.where(lengths > 0, downsampled.clamp_min(1), downsampled)
+
+
+def _pad_conv2d_input_for_kernel(
+    x: Tensor,
+    *,
+    kernel_size: int,
+    min_right_pad: int,
+    min_bottom_pad: int,
+) -> Tensor:
+    pad_right = max(min_right_pad, kernel_size - x.size(-1))
+    pad_bottom = max(min_bottom_pad, kernel_size - x.size(-2))
+    return F.pad(x, (0, pad_right, 0, pad_bottom))
+
+
+def _pad_conv1d_input_for_kernel(x: Tensor, *, kernel_size: int, min_right_pad: int) -> Tensor:
+    pad_right = max(min_right_pad, kernel_size - x.size(-1))
+    return F.pad(x, (0, pad_right))
 
 
 def transformer_engine_available() -> bool:
@@ -777,9 +799,19 @@ class Conv2dSubsampling(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x = x.unsqueeze(1)
-        x = F.pad(x, (0, 1, 0, 1))
+        x = _pad_conv2d_input_for_kernel(
+            x,
+            kernel_size=3,
+            min_right_pad=1,
+            min_bottom_pad=1,
+        )
         x = self.activation(self._apply_conv1(x))
-        x = F.pad(x, (0, 1, 0, 1))
+        x = _pad_conv2d_input_for_kernel(
+            x,
+            kernel_size=3,
+            min_right_pad=1,
+            min_bottom_pad=1,
+        )
         if self.depthwise_separable:
             x = self._apply_depthwise_separable_conv2(x)
         else:
@@ -828,11 +860,15 @@ class TimeReductionLayer(nn.Module):
         x = x.transpose(1, 2)
         pad_mask = make_sequence_mask(lengths, max_length=x.size(-1))
         x = x * pad_mask.unsqueeze(1).to(dtype=x.dtype)
-        x = F.pad(x, (0, max(0, self.kernel_size - self.stride)))
+        x = _pad_conv1d_input_for_kernel(
+            x,
+            kernel_size=self.kernel_size,
+            min_right_pad=max(0, self.kernel_size - self.stride),
+        )
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = x.transpose(1, 2)
-        lengths = torch.div(lengths, self.stride, rounding_mode="floor")
+        lengths = _downsample_lengths_clamp_positive(lengths, stride=self.stride)
         return x, lengths
 
 

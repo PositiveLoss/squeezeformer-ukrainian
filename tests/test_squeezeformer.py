@@ -771,6 +771,22 @@ def test_temporal_unet_handles_odd_length_sequences() -> None:
 
 
 @torch.no_grad()
+def test_encoder_handles_physically_tiny_inputs_without_crashing() -> None:
+    model = build_squeezeformer_encoder("sm")
+    model.eval()
+
+    for length in (1, 2, 3, 4, 5, 7):
+        lengths = torch.tensor([length], dtype=torch.int64)
+        features = torch.randn(1, length, 80)
+
+        outputs, output_lengths = model(features, lengths)
+
+        assert output_lengths.item() >= 1
+        assert outputs.shape == (1, int(output_lengths.item()), model.config.d_model)
+        assert torch.isfinite(outputs).all()
+
+
+@torch.no_grad()
 def test_encoder_can_return_mid_layer_hidden_state() -> None:
     model = build_squeezeformer_encoder("xs")
     model.eval()
