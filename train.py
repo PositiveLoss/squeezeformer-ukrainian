@@ -1561,6 +1561,8 @@ def main() -> None:
                 decoder_targets = None
                 decoder_target_lengths = None
             next_global_step = global_step + 1 if should_step else global_step
+            if use_zipformer and hasattr(model, "set_batch_count"):
+                model.set_batch_count(global_step)
             should_log_step = should_step and next_global_step % args.log_every == 0
             should_collect_log_probs = should_log_step and is_main_process
 

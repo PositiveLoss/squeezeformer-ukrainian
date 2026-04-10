@@ -12,6 +12,7 @@ class DTypeChoice(StrEnum):
 
 class OptimizerChoice(StrEnum):
     MUON = "muon"
+    SCALEDADAM = "scaledadam"
     ADAMW = "adamw"
 
 

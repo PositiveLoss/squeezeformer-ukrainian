@@ -839,6 +839,14 @@ def _resolve_float_tuple(values: str) -> tuple[float, ...]:
 
 
 def _resolve_scheduler_kwargs(args: argparse.Namespace, optimizer_name: str) -> dict[str, float]:
+    if optimizer_name == "scaledadam":
+        return {
+            "schedule_type": "eden",
+            "eden_step_scale": 5000.0,
+            "eden_epoch_scale": 6.0,
+            "eden_warmup_steps": 500,
+            "eden_start_scale": 0.5,
+        }
     if optimizer_name == "muon":
         return {
             "warmup_epochs": (

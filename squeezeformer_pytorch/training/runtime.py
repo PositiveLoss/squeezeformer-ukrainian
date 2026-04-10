@@ -25,6 +25,7 @@ from squeezeformer_pytorch.model import (
     transformer_engine_available,
 )
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
+from zipformer_pytorch.optim import ScaledAdam
 
 try:
     import transformer_engine.pytorch as te
@@ -93,6 +94,7 @@ class SchedulerDefaults(NamedTuple):
 
 
 _DEFAULT_ADAMW_LR_CAP = 3e-4
+_DEFAULT_SCALEDADAM_LR = 4.5e-2
 
 
 class FrozenLibertaTeacher:
@@ -533,11 +535,12 @@ def _resolve_optimizer_learning_rates(
     *,
     variant_defaults: SchedulerDefaults,
 ) -> tuple[float, float, float]:
-    peak_lr = (
-        float(args.learning_rate)
-        if args.learning_rate is not None
-        else float(variant_defaults.peak_lr)
-    )
+    if args.learning_rate is not None:
+        peak_lr = float(args.learning_rate)
+    elif args.optimizer == OptimizerChoice.SCALEDADAM:
+        peak_lr = _DEFAULT_SCALEDADAM_LR
+    else:
+        peak_lr = float(variant_defaults.peak_lr)
     muon_lr = float(args.muon_learning_rate) if args.muon_learning_rate is not None else peak_lr
     if args.adamw_learning_rate is not None:
         adamw_lr = float(args.adamw_learning_rate)
@@ -904,10 +907,32 @@ def _compute_grad_norm(parameters, norm_type: float = 2.0) -> Tensor:
 def build_paper_scheduler(
     optimizer: torch.optim.Optimizer,
     steps_per_epoch: int,
+    schedule_type: str = "paper",
     warmup_epochs: int = 20,
     hold_epochs: int = 160,
     decay_exponent: float = 1.0,
+    eden_step_scale: float = 5000.0,
+    eden_epoch_scale: float = 6.0,
+    eden_warmup_steps: int = 500,
+    eden_start_scale: float = 0.5,
 ):
+    if schedule_type == "eden":
+        def lr_lambda(step: int) -> float:
+            batch_index = step + 1
+            epoch_index = batch_index / max(1, steps_per_epoch)
+            factor = (
+                ((batch_index**2 + eden_step_scale**2) / (eden_step_scale**2)) ** -0.25
+            ) * (((epoch_index**2 + eden_epoch_scale**2) / (eden_epoch_scale**2)) ** -0.25)
+            if batch_index >= eden_warmup_steps:
+                warmup_factor = 1.0
+            else:
+                warmup_factor = eden_start_scale + (1.0 - eden_start_scale) * (
+                    batch_index / max(1, eden_warmup_steps)
+                )
+            return factor * warmup_factor
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
     warmup_steps = max(1, warmup_epochs * steps_per_epoch)
     hold_steps = max(0, hold_epochs * steps_per_epoch)
 
@@ -952,6 +977,10 @@ def build_optimizer(
                 lr=adamw_lr,
             )
         ], ["adamw"]
+
+    if optimizer_name == OptimizerChoice.SCALEDADAM:
+        params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        return [ScaledAdam(params, lr=muon_lr)], ["scaledadam"]
 
     muon_params = []
     adamw_decay_params = []

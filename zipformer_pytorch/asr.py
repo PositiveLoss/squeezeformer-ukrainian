@@ -7,27 +7,116 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from zipformer_pytorch.zipformer import ZipformerBlock
+from zipformer_pytorch.zipformer import Zipformer
+
+
+_DEFAULT_DOWNSAMPLING = (1, 2, 4, 8, 4, 2)
+_DEFAULT_ENCODER_DIM = (192, 256, 384, 512, 384, 256)
+_DEFAULT_NUM_LAYERS = (2, 2, 3, 4, 3, 2)
+_DEFAULT_NUM_HEADS = (4, 4, 4, 8, 4, 4)
+_DEFAULT_FEEDFORWARD_DIM = (512, 768, 1024, 1536, 1024, 768)
+_DEFAULT_CNN_KERNELS = (31, 31, 15, 15, 15, 31)
+
+
+def _expand_stack_value(name: str, value: tuple[int, ...], num_stacks: int) -> tuple[int, ...]:
+    if len(value) == num_stacks:
+        return value
+    if len(value) == 1:
+        return value * num_stacks
+    raise ValueError(
+        f"ZipformerConfig.{name} must have length 1 or {num_stacks}, got {len(value)}."
+    )
 
 
 @dataclass(frozen=True)
 class ZipformerConfig:
     architecture: str = "zipformer"
     input_dim: int = 80
-    model_dim: int = 256
-    num_layers: int = 6
-    num_heads: int = 4
-    ff_mult: int = 4
-    input_dropout: float = 0.1
+    output_downsampling_factor: int = 2
+    downsampling_factor: tuple[int, ...] = _DEFAULT_DOWNSAMPLING
+    encoder_dim: tuple[int, ...] = _DEFAULT_ENCODER_DIM
+    num_encoder_layers: tuple[int, ...] = _DEFAULT_NUM_LAYERS
+    num_heads: tuple[int, ...] = _DEFAULT_NUM_HEADS
+    query_head_dim: tuple[int, ...] = (32,)
+    value_head_dim: tuple[int, ...] = (12,)
+    pos_head_dim: tuple[int, ...] = (4,)
+    feedforward_dim: tuple[int, ...] = _DEFAULT_FEEDFORWARD_DIM
+    cnn_module_kernel: tuple[int, ...] = _DEFAULT_CNN_KERNELS
+    pos_dim: int = 48
+    dropout: float = 0.1
+
+    @property
+    def num_stacks(self) -> int:
+        return len(self.downsampling_factor)
+
+    @property
+    def resolved_query_head_dim(self) -> tuple[int, ...]:
+        return _expand_stack_value("query_head_dim", self.query_head_dim, self.num_stacks)
+
+    @property
+    def resolved_value_head_dim(self) -> tuple[int, ...]:
+        return _expand_stack_value("value_head_dim", self.value_head_dim, self.num_stacks)
+
+    @property
+    def resolved_pos_head_dim(self) -> tuple[int, ...]:
+        return _expand_stack_value("pos_head_dim", self.pos_head_dim, self.num_stacks)
+
+    @property
+    def model_dim(self) -> int:
+        return max(self.encoder_dim)
+
+    @property
+    def num_layers(self) -> int:
+        return sum(self.num_encoder_layers)
 
 
 ZIPFORMER_VARIANTS = {
-    "xs": ZipformerConfig(model_dim=128, num_layers=4, num_heads=4),
-    "s": ZipformerConfig(model_dim=192, num_layers=5, num_heads=4),
-    "sm": ZipformerConfig(model_dim=256, num_layers=6, num_heads=4),
-    "m": ZipformerConfig(model_dim=320, num_layers=8, num_heads=4),
-    "ml": ZipformerConfig(model_dim=384, num_layers=10, num_heads=6),
-    "l": ZipformerConfig(model_dim=512, num_layers=12, num_heads=8),
+    "xs": ZipformerConfig(
+        encoder_dim=(64, 96, 128, 160, 128, 96),
+        num_encoder_layers=(1, 1, 1, 1, 1, 1),
+        num_heads=(4, 4, 4, 4, 4, 4),
+        query_head_dim=(16,),
+        value_head_dim=(8,),
+        feedforward_dim=(192, 256, 384, 512, 384, 256),
+        pos_dim=24,
+    ),
+    "s": ZipformerConfig(
+        encoder_dim=(96, 128, 192, 256, 192, 128),
+        num_encoder_layers=(1, 1, 2, 2, 2, 1),
+        num_heads=(4, 4, 4, 4, 4, 4),
+        query_head_dim=(24,),
+        value_head_dim=(8,),
+        feedforward_dim=(256, 384, 512, 768, 512, 384),
+        pos_dim=32,
+    ),
+    "sm": ZipformerConfig(),
+    "m": ZipformerConfig(
+        encoder_dim=(256, 320, 512, 640, 512, 320),
+        num_encoder_layers=(2, 2, 4, 6, 4, 2),
+        num_heads=(4, 4, 8, 8, 8, 4),
+        query_head_dim=(32,),
+        value_head_dim=(12,),
+        feedforward_dim=(768, 1024, 1536, 2048, 1536, 1024),
+        pos_dim=48,
+    ),
+    "ml": ZipformerConfig(
+        encoder_dim=(256, 384, 576, 768, 576, 384),
+        num_encoder_layers=(3, 3, 5, 7, 5, 3),
+        num_heads=(4, 4, 8, 8, 8, 4),
+        query_head_dim=(32,),
+        value_head_dim=(12,),
+        feedforward_dim=(1024, 1280, 2048, 3072, 2048, 1280),
+        pos_dim=64,
+    ),
+    "l": ZipformerConfig(
+        encoder_dim=(320, 512, 768, 1024, 768, 512),
+        num_encoder_layers=(4, 4, 6, 8, 6, 4),
+        num_heads=(8, 8, 8, 8, 8, 8),
+        query_head_dim=(32,),
+        value_head_dim=(16,),
+        feedforward_dim=(1280, 1792, 2560, 3584, 2560, 1792),
+        pos_dim=64,
+    ),
 }
 
 
@@ -46,20 +135,24 @@ class ZipformerEncoder(nn.Module):
     def __init__(self, config: ZipformerConfig) -> None:
         super().__init__()
         self.config = config
-        self.input_norm = nn.LayerNorm(config.input_dim)
-        self.input_projection = nn.Linear(config.input_dim, config.model_dim)
-        self.input_dropout = nn.Dropout(config.input_dropout)
-        self.blocks = nn.ModuleList(
-            [
-                ZipformerBlock(
-                    config.model_dim,
-                    heads=config.num_heads,
-                    mult=config.ff_mult,
-                )
-                for _ in range(config.num_layers)
-            ]
+        self.encoder = Zipformer(
+            input_dim=config.input_dim,
+            output_downsampling_factor=config.output_downsampling_factor,
+            downsampling_factor=config.downsampling_factor,
+            encoder_dim=config.encoder_dim,
+            num_encoder_layers=config.num_encoder_layers,
+            num_heads=config.num_heads,
+            query_head_dim=config.resolved_query_head_dim,
+            pos_head_dim=config.resolved_pos_head_dim,
+            value_head_dim=config.resolved_value_head_dim,
+            feedforward_dim=config.feedforward_dim,
+            cnn_module_kernel=config.cnn_module_kernel,
+            pos_dim=config.pos_dim,
+            dropout=config.dropout,
         )
-        self.output_norm = nn.LayerNorm(config.model_dim)
+
+    def set_batch_count(self, batch_count: int) -> None:
+        self.encoder.set_batch_count(batch_count)
 
     def forward(
         self,
@@ -72,17 +165,8 @@ class ZipformerEncoder(nn.Module):
                 f"{self.config.input_dim}, got {features.size(-1)}."
             )
         output_lengths = feature_lengths.to(dtype=torch.int64).clamp_(1, features.size(1))
-        padding_mask = _make_padding_mask(output_lengths, max_length=features.size(1))
-
-        x = self.input_projection(self.input_norm(features))
-        x = self.input_dropout(x)
-        x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
-        for block in self.blocks:
-            x = block(x, mask=padding_mask)
-            x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
-        x = self.output_norm(x)
-        x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
-        return x, output_lengths
+        encoded, output_lengths = self.encoder(features, output_lengths)
+        return encoded, output_lengths
 
 
 class ZipformerCTC(nn.Module):
@@ -119,6 +203,9 @@ class ZipformerCTC(nn.Module):
         )
         self._initialize_ctc_head(blank_bias=self.initial_ctc_blank_bias)
 
+    def set_batch_count(self, batch_count: int) -> None:
+        self.encoder.set_batch_count(batch_count)
+
     def _initialize_ctc_head(self, *, blank_bias: float) -> None:
         with torch.no_grad():
             self.classifier.bias.zero_()
@@ -144,9 +231,7 @@ class ZipformerCTC(nn.Module):
     ) -> Tensor:
         if self.blank_logit_regularization_weight <= 0.0:
             return logits.new_zeros((), dtype=torch.float32)
-        valid_mask = torch.arange(logits.size(1), device=output_lengths.device).unsqueeze(
-            0
-        ) < output_lengths.unsqueeze(1)
+        valid_mask = torch.arange(logits.size(1), device=output_lengths.device).unsqueeze(0) < output_lengths.unsqueeze(1)
         if not bool(valid_mask.any()):
             return logits.new_zeros((), dtype=torch.float32)
         blank_logits = logits[..., blank_id]
@@ -183,9 +268,7 @@ class ZipformerCTC(nn.Module):
             raise RuntimeError("Audio teacher projection head is disabled for this model.")
         mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
         pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
-        pooled = pooled / lengths.clamp_min(1).to(
-            device=hidden.device, dtype=hidden.dtype
-        ).unsqueeze(1)
+        pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
         return self.audio_teacher_projection(pooled)
 
     def forward(
@@ -228,12 +311,10 @@ class ZipformerCTC(nn.Module):
                 target_lengths,
                 blank_id=blank_id,
             )
-            output["blank_logit_regularization_loss"] = (
-                self._blank_logit_regularization_from_logits(
-                    logits,
-                    output_lengths,
-                    blank_id=blank_id,
-                )
+            output["blank_logit_regularization_loss"] = self._blank_logit_regularization_from_logits(
+                logits,
+                output_lengths,
+                blank_id=blank_id,
             )
         if return_main_log_probs:
             output["main_logits"] = logits
