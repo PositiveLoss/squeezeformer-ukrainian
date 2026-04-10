@@ -109,6 +109,8 @@ def _validate_startup_args(
             raise ValueError("--zipformer does not support LiBERTa distillation.")
         if args.audio_teacher:
             raise ValueError("--zipformer does not support audio-teacher distillation.")
+    if args.zipformer_transducer and not args.zipformer:
+        raise ValueError("--zipformer-transducer requires --zipformer.")
 
     requested_device = resolve_device(args.device)
     _validate_device_ready(requested_device)
@@ -126,6 +128,11 @@ def _validate_startup_args(
         "--log-every": args.log_every,
         "--keep-top-k": args.keep_top_k,
         "--beam-size": args.beam_size,
+        "--zipformer-transducer-context-size": args.zipformer_transducer_context_size,
+        "--zipformer-transducer-decoder-dim": args.zipformer_transducer_decoder_dim,
+        "--zipformer-transducer-joiner-dim": args.zipformer_transducer_joiner_dim,
+        "--zipformer-transducer-prune-range": args.zipformer_transducer_prune_range,
+        "--zipformer-transducer-joiner-chunk-size": args.zipformer_transducer_joiner_chunk_size,
         "--spm-vocab-size": args.spm_vocab_size,
         "--warmup-epochs": args.warmup_epochs,
         "--hold-epochs": args.hold_epochs,
@@ -372,7 +379,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Train with Zipformer blocks from zipformer_pytorch instead of Squeezeformer.",
     )
+    parser.add_argument(
+        "--zipformer-transducer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the Zipformer transducer objective and beam-search decoder instead of the "
+            "Zipformer CTC head."
+        ),
+    )
     parser.add_argument("--variant", default="sm", choices=["xs", "s", "sm", "m", "ml", "l"])
+    parser.add_argument("--zipformer-transducer-context-size", type=int, default=2)
+    parser.add_argument("--zipformer-transducer-decoder-dim", type=int, default=512)
+    parser.add_argument("--zipformer-transducer-joiner-dim", type=int, default=512)
+    parser.add_argument("--zipformer-transducer-prune-range", type=int, default=5)
+    parser.add_argument("--zipformer-transducer-joiner-chunk-size", type=int, default=32)
     parser.add_argument("--output-dir", default="artifacts/squeezeformer-cv22")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=500)

@@ -6,6 +6,7 @@ from zipformer_pytorch.asr import (
     ZipformerConfig,
     ZipformerCTC,
     ZipformerEncoder,
+    ZipformerTransducer,
     zipformer_variant,
 )
 from zipformer_pytorch.zipformer.zipformer import (
@@ -63,6 +64,38 @@ def test_zipformer_ctc_returns_training_outputs_with_main_log_probs() -> None:
     assert outputs["blank_logit_regularization_loss"].dtype == torch.float32
 
 
+def test_zipformer_transducer_returns_pruned_loss_and_backward_runs() -> None:
+    model = ZipformerTransducer(
+        encoder_config=_tiny_zipformer_config(),
+        vocab_size=6,
+        blank_id=0,
+        decoder_dim=16,
+        joiner_dim=16,
+        context_size=2,
+        prune_range=3,
+        joiner_chunk_size=2,
+    )
+    features = torch.randn(2, 12, 8)
+    feature_lengths = torch.tensor([12, 10], dtype=torch.long)
+    targets = torch.tensor([1, 2, 3], dtype=torch.long)
+    target_lengths = torch.tensor([2, 1], dtype=torch.long)
+
+    outputs = model(
+        features,
+        feature_lengths,
+        return_training_outputs=True,
+        targets=targets,
+        target_lengths=target_lengths,
+        blank_id=0,
+    )
+
+    loss = outputs["pruned_transducer_loss"]
+    assert loss is not None
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
 def test_zipformer_ctc_forward_runs_on_meta_device() -> None:
     model = ZipformerCTC(
         encoder_config=_tiny_zipformer_config(),
@@ -75,6 +108,34 @@ def test_zipformer_ctc_forward_runs_on_meta_device() -> None:
 
     assert logits.device.type == "meta"
     assert output_lengths.device.type == "meta"
+
+
+def test_zipformer_transducer_decodes_with_greedy_and_beam_search() -> None:
+    model = ZipformerTransducer(
+        encoder_config=_tiny_zipformer_config(),
+        vocab_size=4,
+        blank_id=0,
+        decoder_dim=16,
+        joiner_dim=16,
+        context_size=2,
+        prune_range=3,
+        joiner_chunk_size=2,
+    ).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+        model.joiner.output_linear.bias[1] = 8.0
+        model.joiner.output_linear.bias[0] = 0.0
+
+    features = torch.randn(1, 12, 8)
+    feature_lengths = torch.tensor([12], dtype=torch.long)
+    encoded, output_lengths = model.encode(features, feature_lengths)
+
+    greedy_tokens = model.decode_token_ids(encoded, output_lengths, strategy="greedy")[0]
+    beam_tokens = model.decode_token_ids(encoded, output_lengths, strategy="beam", beam_size=4)[0]
+
+    assert greedy_tokens
+    assert greedy_tokens == beam_tokens
 
 
 def test_zipformer_encoder_masks_padding_inside_blocks() -> None:

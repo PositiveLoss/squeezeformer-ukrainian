@@ -33,8 +33,8 @@ from squeezeformer_pytorch.model import (
     SqueezeformerConfig,
     transformer_engine_available,
 )
-from squeezeformer_pytorch.runtime_types import DTypeChoice
-from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC
+from squeezeformer_pytorch.runtime_types import DTypeChoice, DecodeStrategy
+from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC, ZipformerTransducer
 
 try:
     import transformer_engine.pytorch as te
@@ -79,6 +79,17 @@ def _download_default_hf_checkpoint(repo_id: str) -> str:
     )
 
 
+def checkpoint_uses_zipformer_transducer(checkpoint_data: dict[str, object]) -> bool:
+    training_args = checkpoint_data.get("training_args")
+    if isinstance(training_args, dict) and "zipformer_transducer" in training_args:
+        return bool(training_args.get("zipformer_transducer"))
+    model_state_dict = checkpoint_data.get("model_state_dict")
+    return isinstance(model_state_dict, dict) and any(
+        key.startswith("decoder.") or key.startswith("joiner.")
+        for key in model_state_dict
+    )
+
+
 class ASRInferenceSession:
     def __init__(
         self,
@@ -114,19 +125,34 @@ class ASRInferenceSession:
             if dtype == DTypeChoice.FP8:
                 raise ValueError("Zipformer checkpoints do not support FP8 inference.")
             encoder_config = ZipformerConfig(**checkpoint_data["encoder_config"])
-            self.model = ZipformerCTC(
-                encoder_config=encoder_config,
-                vocab_size=self.tokenizer.vocab_size,
-                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-                blank_logit_offset=float(
-                    checkpoint_data.get("training_args", {}).get("blank_logit_offset", 0.0)
-                ),
-                blank_logit_regularization_weight=float(
-                    checkpoint_data.get("training_args", {}).get(
-                        "blank_logit_regularization_weight", 0.0
-                    )
-                ),
-            )
+            training_args = checkpoint_data.get("training_args", {})
+            if checkpoint_uses_zipformer_transducer(checkpoint_data):
+                self.model = ZipformerTransducer(
+                    encoder_config=encoder_config,
+                    vocab_size=self.tokenizer.vocab_size,
+                    blank_id=self.tokenizer.blank_id,
+                    decoder_dim=int(training_args.get("zipformer_transducer_decoder_dim", 512)),
+                    joiner_dim=int(training_args.get("zipformer_transducer_joiner_dim", 512)),
+                    context_size=int(training_args.get("zipformer_transducer_context_size", 2)),
+                    prune_range=int(training_args.get("zipformer_transducer_prune_range", 5)),
+                    joiner_chunk_size=int(
+                        training_args.get("zipformer_transducer_joiner_chunk_size", 32)
+                    ),
+                )
+            else:
+                self.model = ZipformerCTC(
+                    encoder_config=encoder_config,
+                    vocab_size=self.tokenizer.vocab_size,
+                    initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+                    blank_logit_offset=float(
+                        checkpoint_data.get("training_args", {}).get("blank_logit_offset", 0.0)
+                    ),
+                    blank_logit_regularization_weight=float(
+                        checkpoint_data.get("training_args", {}).get(
+                            "blank_logit_regularization_weight", 0.0
+                        )
+                    ),
+                )
         else:
             encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
             use_transformer_engine = should_use_transformer_engine_for_checkpoint(
@@ -189,6 +215,15 @@ class ASRInferenceSession:
                 fp8_recipe=self.fp8_recipe,
             ),
         ):
+            if getattr(self.model, "is_transducer", False):
+                encoded, output_lengths = self.model.encode(features, feature_lengths)
+                token_ids = self.model.decode_token_ids(
+                    encoded,
+                    output_lengths,
+                    strategy=str(DecodeStrategy.BEAM),
+                    beam_size=4,
+                )[0]
+                return self.tokenizer.decode(token_ids)
             log_probs, _ = self.model.log_probs(features, feature_lengths)
 
         token_ids = log_probs.argmax(dim=-1)[0].cpu().tolist()

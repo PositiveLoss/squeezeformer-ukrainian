@@ -47,7 +47,7 @@ from squeezeformer_pytorch.training.runtime import (
     resolve_device,
 )
 from train import _build_trackio_run_name
-from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC
+from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC, ZipformerTransducer
 
 
 def checkpoint_uses_zipformer(checkpoint_data: dict[str, object]) -> bool:
@@ -58,6 +58,17 @@ def checkpoint_uses_zipformer(checkpoint_data: dict[str, object]) -> bool:
     return (
         isinstance(encoder_config, dict)
         and str(encoder_config.get("architecture", "")) == "zipformer"
+    )
+
+
+def checkpoint_uses_zipformer_transducer(checkpoint_data: dict[str, object]) -> bool:
+    training_args = checkpoint_data.get("training_args")
+    if isinstance(training_args, dict) and "zipformer_transducer" in training_args:
+        return bool(training_args.get("zipformer_transducer"))
+    model_state_dict = checkpoint_data.get("model_state_dict")
+    return isinstance(model_state_dict, dict) and any(
+        key.startswith("decoder.") or key.startswith("joiner.")
+        for key in model_state_dict
     )
 
 
@@ -203,17 +214,37 @@ def main() -> None:
         if args.dtype == DTypeChoice.FP8:
             raise ValueError("Zipformer checkpoints do not support FP8 evaluation.")
         encoder_config = ZipformerConfig(**checkpoint["encoder_config"])
-        model = ZipformerCTC(
-            encoder_config=encoder_config,
-            vocab_size=tokenizer.vocab_size,
-            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-            blank_logit_offset=float(
-                checkpoint.get("training_args", {}).get("blank_logit_offset", 0.0)
-            ),
-            blank_logit_regularization_weight=float(
-                checkpoint.get("training_args", {}).get("blank_logit_regularization_weight", 0.0)
-            ),
-        )
+        training_args = checkpoint.get("training_args", {})
+        if checkpoint_uses_zipformer_transducer(checkpoint):
+            model = ZipformerTransducer(
+                encoder_config=encoder_config,
+                vocab_size=tokenizer.vocab_size,
+                blank_id=tokenizer.blank_id,
+                decoder_dim=int(training_args.get("zipformer_transducer_decoder_dim", 512)),
+                joiner_dim=int(training_args.get("zipformer_transducer_joiner_dim", 512)),
+                context_size=int(training_args.get("zipformer_transducer_context_size", 2)),
+                prune_range=int(training_args.get("zipformer_transducer_prune_range", 5)),
+                joiner_chunk_size=int(
+                    training_args.get("zipformer_transducer_joiner_chunk_size", 32)
+                ),
+            )
+            args.decode_strategy = DecodeStrategy.BEAM
+            args.beam_size = 4
+        else:
+            model = ZipformerCTC(
+                encoder_config=encoder_config,
+                vocab_size=tokenizer.vocab_size,
+                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
+                blank_logit_offset=float(
+                    checkpoint.get("training_args", {}).get("blank_logit_offset", 0.0)
+                ),
+                blank_logit_regularization_weight=float(
+                    checkpoint.get("training_args", {}).get(
+                        "blank_logit_regularization_weight",
+                        0.0,
+                    )
+                ),
+            )
     else:
         encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
         model = SqueezeformerCTC(

@@ -7,6 +7,16 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from zipformer_pytorch.transducer import (
+    StatelessDecoder,
+    TransducerJoiner,
+    batched_rnnt_loss,
+    linear_prune_ranges,
+    make_decoder_inputs,
+    targets_to_padded,
+    transducer_greedy_search_batch,
+    transducer_modified_beam_search_batch,
+)
 from zipformer_pytorch.zipformer import Zipformer
 
 
@@ -319,6 +329,298 @@ class ZipformerCTC(nn.Module):
     def log_probs(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
         logits, output_lengths = self(features, feature_lengths)
         return self._ctc_log_softmax(logits), output_lengths
+
+    def to_config_dict(self) -> dict[str, object]:
+        return asdict(self.encoder_config)
+
+
+class ZipformerTransducer(nn.Module):
+    is_transducer = True
+
+    def __init__(
+        self,
+        encoder_config: ZipformerConfig,
+        vocab_size: int,
+        *,
+        blank_id: int = 0,
+        decoder_dim: int = 512,
+        joiner_dim: int = 512,
+        context_size: int = 2,
+        prune_range: int = 5,
+        joiner_chunk_size: int = 32,
+        audio_teacher_enabled: bool = False,
+        audio_teacher_hidden_size: int = 1024,
+        audio_teacher_target: str = "encoder",
+    ) -> None:
+        super().__init__()
+        self.encoder_config = encoder_config
+        self.blank_id = int(blank_id)
+        self.decoder_dim = int(decoder_dim)
+        self.joiner_dim = int(joiner_dim)
+        self.context_size = int(context_size)
+        self.prune_range = int(prune_range)
+        self.joiner_chunk_size = max(1, int(joiner_chunk_size))
+        self.audio_teacher_target = audio_teacher_target
+        self.intermediate_ctc_layers: tuple[int, ...] = ()
+        self.blank_prune_layer = None
+        self.blank_prune_threshold = 0.0
+        self.blank_prune_min_keep_frames = 1
+        self.aed_decoder = None
+
+        self.encoder = ZipformerEncoder(encoder_config)
+        self.decoder = StatelessDecoder(
+            vocab_size=vocab_size,
+            decoder_dim=self.decoder_dim,
+            blank_id=self.blank_id,
+            context_size=self.context_size,
+        )
+        self.joiner = TransducerJoiner(
+            encoder_dim=encoder_config.model_dim,
+            decoder_dim=self.decoder_dim,
+            joiner_dim=self.joiner_dim,
+            vocab_size=vocab_size,
+        )
+        self.audio_teacher_projection = (
+            nn.Linear(encoder_config.model_dim, audio_teacher_hidden_size)
+            if audio_teacher_enabled and audio_teacher_target == "encoder"
+            else None
+        )
+
+    def set_batch_count(self, batch_count: int) -> None:
+        self.encoder.set_batch_count(batch_count)
+
+    def project_encoder_for_audio_teacher(self, hidden: Tensor, lengths: Tensor) -> Tensor:
+        if self.audio_teacher_projection is None:
+            raise RuntimeError("Audio teacher projection head is disabled for this model.")
+        mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
+        pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
+        pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
+        return self.audio_teacher_projection(pooled)
+
+    def encode(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
+        return self.encoder(features, feature_lengths)
+
+    def _banded_log_probs(
+        self,
+        encoded: Tensor,
+        decoder_out: Tensor,
+        targets_padded: Tensor,
+        target_lengths: Tensor,
+        output_lengths: Tensor,
+        ranges: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        batch_size, max_time, _ = encoded.shape
+        max_target_length = int(targets_padded.size(1))
+        u_plus_one = max_target_length + 1
+        blank_chunks: list[Tensor] = []
+        label_chunks: list[Tensor] = []
+        projected_encoder = self.joiner.encoder_proj(encoded)
+        projected_decoder = self.joiner.decoder_proj(decoder_out)
+        target_lengths_expanded = target_lengths.view(batch_size, 1, 1)
+
+        for start in range(0, max_time, self.joiner_chunk_size):
+            stop = min(max_time, start + self.joiner_chunk_size)
+            current_ranges = ranges[:, start:stop]
+            current_encoder = projected_encoder[:, start:stop].unsqueeze(2)
+            gather_index = current_ranges.unsqueeze(-1).expand(
+                -1,
+                -1,
+                -1,
+                projected_decoder.size(-1),
+            )
+            current_decoder = torch.gather(
+                projected_decoder.unsqueeze(1).expand(-1, stop - start, -1, -1),
+                dim=2,
+                index=gather_index,
+            )
+            logits = self.joiner(
+                current_encoder,
+                current_decoder,
+                project_input=False,
+            )
+            log_probs = F.log_softmax(logits.float(), dim=-1)
+            blank_chunk = encoded.new_full(
+                (batch_size, stop - start, u_plus_one),
+                float("-inf"),
+                dtype=torch.float32,
+            ).scatter_reduce(
+                2,
+                current_ranges,
+                log_probs[..., self.blank_id],
+                reduce="amax",
+                include_self=True,
+            )
+            if max_target_length == 0:
+                blank_chunks.append(blank_chunk)
+                label_chunks.append(
+                    encoded.new_full(
+                        (batch_size, stop - start, 0),
+                        float("-inf"),
+                        dtype=torch.float32,
+                    )
+                )
+                continue
+            label_indices = current_ranges.clamp_max(max_target_length - 1)
+            target_band = torch.gather(
+                targets_padded.unsqueeze(1).expand(-1, stop - start, -1),
+                dim=2,
+                index=label_indices,
+            )
+            label_scores = torch.gather(
+                log_probs,
+                dim=-1,
+                index=target_band.unsqueeze(-1),
+            ).squeeze(-1)
+            valid_emit = current_ranges < target_lengths_expanded
+            label_scores = torch.where(
+                valid_emit,
+                label_scores,
+                label_scores.new_full(label_scores.shape, float("-inf")),
+            )
+            label_chunk = encoded.new_full(
+                (batch_size, stop - start, max_target_length),
+                float("-inf"),
+                dtype=torch.float32,
+            ).scatter_reduce(
+                2,
+                label_indices,
+                label_scores,
+                reduce="amax",
+                include_self=True,
+            )
+            blank_chunks.append(blank_chunk)
+            label_chunks.append(label_chunk)
+
+        blank_log_probs = torch.cat(blank_chunks, dim=1)
+        label_log_probs = (
+            torch.cat(label_chunks, dim=1)
+            if label_chunks
+            else encoded.new_full((batch_size, max_time, 0), float("-inf"), dtype=torch.float32)
+        )
+
+        valid_time = torch.arange(max_time, device=output_lengths.device).view(1, -1, 1) < output_lengths.view(
+            batch_size,
+            1,
+            1,
+        )
+        valid_blank_u = torch.arange(u_plus_one, device=target_lengths.device).view(1, 1, -1) <= target_lengths.view(
+            batch_size,
+            1,
+            1,
+        )
+        blank_log_probs = torch.where(
+            valid_time & valid_blank_u,
+            blank_log_probs,
+            blank_log_probs.new_full(blank_log_probs.shape, float("-inf")),
+        )
+        if max_target_length > 0:
+            valid_label_u = torch.arange(max_target_length, device=target_lengths.device).view(
+                1,
+                1,
+                -1,
+            ) < target_lengths.view(batch_size, 1, 1)
+            label_log_probs = torch.where(
+                valid_time & valid_label_u,
+                label_log_probs,
+                label_log_probs.new_full(label_log_probs.shape, float("-inf")),
+            )
+        return blank_log_probs, label_log_probs
+
+    def _pruned_transducer_loss(
+        self,
+        encoded: Tensor,
+        output_lengths: Tensor,
+        targets: Tensor,
+        target_lengths: Tensor,
+    ) -> Tensor:
+        targets_padded = targets_to_padded(targets, target_lengths)
+        decoder_inputs = make_decoder_inputs(targets_padded, blank_id=self.blank_id)
+        decoder_out = self.decoder(decoder_inputs, need_pad=True)
+        ranges = linear_prune_ranges(
+            output_lengths,
+            target_lengths,
+            prune_range=self.prune_range,
+        )
+        blank_log_probs, label_log_probs = self._banded_log_probs(
+            encoded,
+            decoder_out,
+            targets_padded,
+            target_lengths,
+            output_lengths,
+            ranges,
+        )
+        return batched_rnnt_loss(
+            blank_log_probs,
+            label_log_probs,
+            output_lengths.to(torch.long),
+            target_lengths.to(torch.long),
+        )
+
+    def decode_token_ids(
+        self,
+        encoded: Tensor,
+        output_lengths: Tensor,
+        *,
+        strategy: str,
+        beam_size: int = 4,
+    ) -> list[list[int]]:
+        if strategy == "greedy":
+            return transducer_greedy_search_batch(self, encoded, output_lengths)
+        return transducer_modified_beam_search_batch(
+            self,
+            encoded,
+            output_lengths,
+            beam_size=beam_size,
+        )
+
+    def forward(
+        self,
+        features: Tensor,
+        feature_lengths: Tensor,
+        *,
+        return_training_outputs: bool = False,
+        targets: Tensor | None = None,
+        target_lengths: Tensor | None = None,
+        blank_id: int | None = None,
+        return_main_log_probs: bool = False,
+        decoder_inputs: Tensor | None = None,
+        liberta_lengths: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | dict[str, Any]:
+        del decoder_inputs, liberta_lengths, return_main_log_probs
+        if blank_id is not None and int(blank_id) != self.blank_id:
+            raise ValueError(
+                f"ZipformerTransducer was built with blank_id={self.blank_id}, got {blank_id}."
+            )
+        encoded, output_lengths = self.encoder(features, feature_lengths)
+        if not return_training_outputs:
+            return encoded, output_lengths
+
+        output: dict[str, Any] = {
+            "encoded": encoded,
+            "output_lengths": output_lengths,
+            "main_ctc_loss": None,
+            "blank_logit_regularization_loss": encoded.new_zeros((), dtype=torch.float32),
+            "intermediate_ctc_losses": {},
+            "intermediate_ctc_diagnostics": {},
+            "main_logits": None,
+            "main_log_probs": None,
+            "pruned_transducer_loss": None,
+        }
+        if targets is not None and target_lengths is not None:
+            pruned_loss = self._pruned_transducer_loss(
+                encoded,
+                output_lengths,
+                targets,
+                target_lengths,
+            )
+            output["main_ctc_loss"] = pruned_loss
+            output["pruned_transducer_loss"] = pruned_loss
+        if self.audio_teacher_projection is not None:
+            output["audio_teacher_student_states"] = self.project_encoder_for_audio_teacher(
+                encoded,
+                output_lengths,
+            )
+        return output
 
     def to_config_dict(self) -> dict[str, object]:
         return asdict(self.encoder_config)

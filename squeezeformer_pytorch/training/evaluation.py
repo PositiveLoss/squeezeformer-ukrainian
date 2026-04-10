@@ -15,7 +15,7 @@ import trackio
 from torch import nn
 from torch.nn import functional as F
 
-from squeezeformer_pytorch.asr import SqueezeformerCTC, Tokenizer, ctc_prefix_beam_search
+from squeezeformer_pytorch.asr import Tokenizer, ctc_prefix_beam_search
 from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import AudioFeaturizer
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
@@ -89,7 +89,7 @@ def greedy_decode(
 
 
 def decode_batch(
-    log_probs: torch.Tensor,
+    decode_source: torch.Tensor | None,
     output_lengths: torch.Tensor,
     tokenizer: Tokenizer,
     strategy: DecodeStrategy,
@@ -97,7 +97,23 @@ def decode_batch(
     lm_scorer=None,
     lm_weight: float = 0.0,
     beam_length_bonus: float = 0.1,
+    *,
+    model=None,
 ) -> list[str]:
+    if getattr(model, "is_transducer", False):
+        if decode_source is None:
+            raise ValueError("Transducer decoding requires encoder outputs as the decode source.")
+        token_sequences = model.decode_token_ids(
+            decode_source,
+            output_lengths,
+            strategy=str(strategy),
+            beam_size=beam_size,
+        )
+        return [tokenizer.decode(token_ids) for token_ids in token_sequences]
+
+    if decode_source is None:
+        raise ValueError("CTC decoding requires log probabilities as the decode source.")
+    log_probs = decode_source
     if strategy == DecodeStrategy.GREEDY:
         return greedy_decode(log_probs, output_lengths, tokenizer)
     return [
@@ -558,7 +574,7 @@ def _merge_evaluation_shards(
 
 
 def evaluate(
-    model: SqueezeformerCTC,
+    model: nn.Module,
     dataloader,
     criterion: nn.CTCLoss,
     tokenizer: Tokenizer,
@@ -754,19 +770,20 @@ def evaluate(
                 utterance_ids.extend(batch["utterance_ids"])
                 speaker_ids.extend(batch["speaker_ids"])
                 has_speaker_ids.extend(batch["has_speaker_ids"])
-                diagnostics = ctc_batch_diagnostics(
-                    log_probs,
-                    output_lengths,
-                    tokenizer,
-                    targets=targets,
-                    target_lengths=target_lengths,
-                )
-                total_blank_probability += diagnostics["blank_probability_sum"]
-                total_decoded_frames += int(diagnostics["decoded_frames"])
-                total_argmax_blank_frames += diagnostics["argmax_blank_frames"]
-                total_top_nonblank_probability += diagnostics["top_nonblank_probability_sum"]
-                total_target_tokens += diagnostics.get("target_tokens_sum", 0.0)
-                total_samples += diagnostics["sample_count"]
+                if log_probs is not None:
+                    diagnostics = ctc_batch_diagnostics(
+                        log_probs,
+                        output_lengths,
+                        tokenizer,
+                        targets=targets,
+                        target_lengths=target_lengths,
+                    )
+                    total_blank_probability += diagnostics["blank_probability_sum"]
+                    total_decoded_frames += int(diagnostics["decoded_frames"])
+                    total_argmax_blank_frames += diagnostics["argmax_blank_frames"]
+                    total_top_nonblank_probability += diagnostics["top_nonblank_probability_sum"]
+                    total_target_tokens += diagnostics.get("target_tokens_sum", 0.0)
+                    total_samples += diagnostics["sample_count"]
                 for layer_index, layer_diagnostics in intermediate_ctc_diagnostics_map.items():
                     current = intermediate_ctc_diagnostics_totals.setdefault(
                         int(layer_index),
@@ -785,7 +802,7 @@ def evaluate(
                     )
                 decode_start_time = time.perf_counter()
                 decoded_hypotheses = decode_batch(
-                    log_probs,
+                    encoded if getattr(model, "is_transducer", False) else log_probs,
                     output_lengths,
                     tokenizer=tokenizer,
                     strategy=decode_strategy,
@@ -793,6 +810,7 @@ def evaluate(
                     lm_scorer=lm_scorer,
                     lm_weight=lm_weight,
                     beam_length_bonus=beam_length_bonus,
+                    model=model,
                 )
                 total_decode_seconds += time.perf_counter() - decode_start_time
                 hypotheses.extend(decoded_hypotheses)

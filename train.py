@@ -122,7 +122,12 @@ from squeezeformer_pytorch.training.runtime import (
 from squeezeformer_pytorch.training.runtime import (
     _validate_device_ready as _runtime_validate_device_ready,
 )
-from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC, zipformer_variant
+from zipformer_pytorch.asr import (
+    ZipformerConfig,
+    ZipformerCTC,
+    ZipformerTransducer,
+    zipformer_variant,
+)
 
 DiskBackedRecordStore = _DiskBackedRecordStore
 _build_disk_backed_record_store = _data_loading_build_disk_backed_record_store
@@ -286,6 +291,19 @@ def _checkpoint_uses_zipformer(checkpoint: dict[str, object] | None) -> bool:
     )
 
 
+def _checkpoint_uses_zipformer_transducer(checkpoint: dict[str, object] | None) -> bool:
+    if checkpoint is None:
+        return False
+    training_args = checkpoint.get("training_args")
+    if isinstance(training_args, dict) and "zipformer_transducer" in training_args:
+        return bool(training_args.get("zipformer_transducer"))
+    model_state_dict = checkpoint.get("model_state_dict")
+    return isinstance(model_state_dict, dict) and any(
+        key.startswith("decoder.") or key.startswith("joiner.")
+        for key in model_state_dict
+    )
+
+
 def _resolve_zipformer_usage(
     *,
     args,
@@ -302,6 +320,29 @@ def _resolve_zipformer_usage(
         )
     args.zipformer = checkpoint_uses_zipformer or bool(args.zipformer)
     return bool(args.zipformer)
+
+
+def _resolve_zipformer_transducer_usage(
+    *,
+    args,
+    checkpoint: dict[str, object] | None,
+    checkpoint_path: Path | None,
+) -> bool:
+    checkpoint_uses_transducer = _checkpoint_uses_zipformer_transducer(checkpoint)
+    if checkpoint is None:
+        return bool(args.zipformer_transducer)
+    if args.zipformer and args.zipformer_transducer and not checkpoint_uses_transducer:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' was created for Zipformer CTC, so it cannot "
+            "be resumed with --zipformer-transducer."
+        )
+    if checkpoint_uses_transducer and not args.zipformer:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' uses Zipformer transducer and requires "
+            "--zipformer."
+        )
+    args.zipformer_transducer = checkpoint_uses_transducer or bool(args.zipformer_transducer)
+    return bool(args.zipformer_transducer)
 
 
 def _validate_zipformer_runtime_args(args) -> None:
@@ -494,24 +535,26 @@ def _should_warn_on_blank_starvation(
 
 def _decode_train_preview_hypotheses(
     *,
-    log_probs: torch.Tensor,
+    decode_source: torch.Tensor,
     output_lengths: torch.Tensor,
     tokenizer,
     beam_size: int,
     lm_scorer,
     lm_weight: float,
     beam_length_bonus: float,
+    model: nn.Module,
 ) -> tuple[str, str]:
-    preview_log_probs = log_probs[:1]
+    preview_source = decode_source[:1]
     preview_output_lengths = output_lengths[:1]
     greedy_hypothesis = decode_batch(
-        preview_log_probs,
+        preview_source,
         preview_output_lengths,
         tokenizer=tokenizer,
         strategy=DecodeStrategy.GREEDY,
+        model=model,
     )[0]
     beam_hypothesis = decode_batch(
-        preview_log_probs,
+        preview_source,
         preview_output_lengths,
         tokenizer=tokenizer,
         strategy=DecodeStrategy.BEAM,
@@ -519,6 +562,7 @@ def _decode_train_preview_hypotheses(
         lm_scorer=lm_scorer,
         lm_weight=lm_weight,
         beam_length_bonus=beam_length_bonus,
+        model=model,
     )[0]
     return greedy_hypothesis, beam_hypothesis
 
@@ -909,8 +953,15 @@ def main() -> None:
         checkpoint=checkpoint,
         checkpoint_path=resume_path,
     )
+    use_zipformer_transducer = _resolve_zipformer_transducer_usage(
+        args=args,
+        checkpoint=checkpoint,
+        checkpoint_path=resume_path,
+    )
     if use_zipformer:
         _validate_zipformer_runtime_args(args)
+    if use_zipformer_transducer and not use_zipformer:
+        raise RuntimeError("--zipformer-transducer requires --zipformer.")
     if use_zipformer:
         (
             aed_decoder_enabled,
@@ -970,6 +1021,9 @@ def main() -> None:
             args,
             checkpoint,
         )
+    if use_zipformer_transducer:
+        args.decode_strategy = DecodeStrategy.BEAM
+        args.beam_size = 4
     stage_start_time = time.perf_counter()
     logger.info(
         "preparing tokenizer mode=%s resume=%s tokenizer_path=%s",
@@ -1269,7 +1323,11 @@ def main() -> None:
     stage_start_time = time.perf_counter()
     logger.info(
         "building model architecture=%s variant=%s dtype=%s compile=%s intermediate_ctc_layers=%s identical_initial_ctc_heads=%s aed=%s liberta=%s audio_teacher=%s blank_prune_layer=%s",
-        "zipformer" if use_zipformer else "squeezeformer",
+        (
+            "zipformer-transducer"
+            if use_zipformer_transducer
+            else ("zipformer" if use_zipformer else "squeezeformer")
+        ),
         args.variant,
         args.dtype,
         args.compile,
@@ -1280,7 +1338,23 @@ def main() -> None:
         audio_teacher_enabled,
         blank_prune_layer,
     )
-    if use_zipformer:
+    if use_zipformer_transducer:
+        model = ZipformerTransducer(
+            encoder_config=encoder_config,
+            vocab_size=tokenizer.vocab_size,
+            blank_id=tokenizer.blank_id,
+            decoder_dim=args.zipformer_transducer_decoder_dim,
+            joiner_dim=args.zipformer_transducer_joiner_dim,
+            context_size=args.zipformer_transducer_context_size,
+            prune_range=args.zipformer_transducer_prune_range,
+            joiner_chunk_size=args.zipformer_transducer_joiner_chunk_size,
+            audio_teacher_enabled=audio_teacher is not None,
+            audio_teacher_hidden_size=(
+                audio_teacher.hidden_size if audio_teacher is not None else encoder_config.model_dim
+            ),
+            audio_teacher_target=audio_teacher_target,
+        )
+    elif use_zipformer:
         model = ZipformerCTC(
             encoder_config=encoder_config,
             vocab_size=tokenizer.vocab_size,
@@ -2030,13 +2104,16 @@ def main() -> None:
                             )
                         preview_greedy_hypothesis, preview_beam_hypothesis = (
                             _decode_train_preview_hypotheses(
-                                log_probs=log_probs,
+                                decode_source=(
+                                    encoded if getattr(model, "is_transducer", False) else log_probs
+                                ),
                                 output_lengths=output_lengths,
                                 tokenizer=tokenizer,
                                 beam_size=args.beam_size,
                                 lm_scorer=lm_scorer,
                                 lm_weight=args.lm_weight,
                                 beam_length_bonus=args.beam_length_bonus,
+                                model=model,
                             )
                         )
                         logger.info(
