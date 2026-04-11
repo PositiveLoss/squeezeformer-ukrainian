@@ -1992,6 +1992,24 @@ def test_adaptive_batch_sampler_respects_token_budget() -> None:
         assert total_tokens <= 6
 
 
+def test_adaptive_batch_sampler_respects_frame_budget_and_keeps_all_indices() -> None:
+    records = [
+        AudioRecord(None, None, "a", "0", estimated_frames=20),
+        AudioRecord(None, None, "bb", "1", estimated_frames=25),
+        AudioRecord(None, None, "ccc", "2", estimated_frames=40),
+        AudioRecord(None, None, "dddd", "3", estimated_frames=45),
+        AudioRecord(None, None, "eeeee", "4", estimated_frames=70),
+    ]
+    sampler = AdaptiveBatchSampler(records, target_batch_units=90, unit="frames", shuffle=False)
+
+    batches = list(iter(sampler))
+
+    assert sorted(index for batch in batches for index in batch) == list(range(len(records)))
+    for batch in batches:
+        total_frames = sum(records[index].estimated_frames for index in batch)
+        assert total_frames <= 90
+
+
 def test_ema_decay_warmup_increases_toward_target() -> None:
     model = torch.nn.Linear(4, 4)
     ema = ExponentialMovingAverage(model, decay=0.9, warmup_steps=4)
