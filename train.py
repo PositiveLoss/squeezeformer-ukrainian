@@ -281,6 +281,10 @@ def _hf_upload_allow_patterns(args) -> list[str] | None:
     return patterns or None
 
 
+def _hf_upload_token(args) -> str | None:
+    return getattr(args, "hf_upload_token", None) or getattr(args, "hf_token", None)
+
+
 def _hf_upload_checkpoint_format(args) -> str:
     checkpoint_format = str(getattr(args, "hf_upload_checkpoint_format", "all")).lower()
     if checkpoint_format not in {"pt", "safetensors", "all"}:
@@ -329,7 +333,7 @@ def _prepare_hf_checkpoint_upload(
     try:
         HfApi().create_repo(
             repo_id=repo_id,
-            token=getattr(args, "hf_token", None),
+            token=_hf_upload_token(args),
             private=getattr(args, "hf_upload_private", None),
             repo_type=repo_type,
             exist_ok=True,
@@ -382,7 +386,7 @@ def _upload_checkpoint_folder_to_hf(
             path_in_repo=path_in_repo,
             commit_message=commit_message,
             commit_description=commit_description,
-            token=getattr(args, "hf_token", None),
+            token=_hf_upload_token(args),
             repo_type=repo_type,
             revision=getattr(args, "hf_upload_revision", None),
             allow_patterns=_hf_upload_allow_patterns(args),

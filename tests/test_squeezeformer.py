@@ -1176,6 +1176,7 @@ def test_upload_checkpoint_folder_to_hf_uses_cli_options(
             "hf_upload_allow_pattern": ["checkpoint*"],
             "hf_upload_ignore_pattern": ["*.tmp"],
             "hf_upload_fail_on_error": True,
+            "hf_upload_token": "upload-token",
             "hf_token": "hf_abcdefghijklmnopqrstuvwxyz123456",
         },
     )()
@@ -1204,7 +1205,7 @@ def test_upload_checkpoint_folder_to_hf_uses_cli_options(
         "**/*.pt",
         "*.tmp",
     ]
-    assert calls[0]["token"] == "hf_abcdefghijklmnopqrstuvwxyz123456"
+    assert calls[0]["token"] == "upload-token"
 
 
 def test_hf_upload_checkpoint_format_pt_ignores_safetensors_artifacts() -> None:

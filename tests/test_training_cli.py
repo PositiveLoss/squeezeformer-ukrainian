@@ -172,6 +172,8 @@ def test_parse_args_accepts_hf_checkpoint_upload_options() -> None:
             "--hf-upload-checkpoints",
             "--hf-upload-repo-id",
             "speech-uk/checkpoints",
+            "--hf-upload-token",
+            "upload-token",
             "--hf-upload-repo-type",
             "model",
             "--hf-upload-path-in-repo",
@@ -189,6 +191,7 @@ def test_parse_args_accepts_hf_checkpoint_upload_options() -> None:
 
     assert args.hf_upload_checkpoints is True
     assert args.hf_upload_repo_id == "speech-uk/checkpoints"
+    assert args.hf_upload_token == "upload-token"
     assert args.hf_upload_repo_type == "model"
     assert args.hf_upload_path_in_repo == "runs/demo"
     assert args.hf_upload_revision == "main"

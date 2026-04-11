@@ -336,6 +336,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--cache-dir", default=None)
     parser.add_argument(
+        "--hf-upload-token",
+        default=os.environ.get("HF_UPLOAD_TOKEN"),
+        help=(
+            "Hugging Face token used for checkpoint uploads. Defaults to HF_UPLOAD_TOKEN, "
+            "then falls back to --hf-token/HF_TOKEN when omitted."
+        ),
+    )
+    parser.add_argument(
         "--hf-upload-checkpoints",
         action=argparse.BooleanOptionalAction,
         default=False,
