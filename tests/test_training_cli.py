@@ -62,19 +62,6 @@ def test_parse_args_rejects_multiple_dynamic_batching_modes() -> None:
     )
 
 
-def test_parse_args_accepts_initial_ctc_blank_bias() -> None:
-    args = parse_args(
-        [
-            "--device",
-            "cpu",
-            "--initial-ctc-blank-bias",
-            "-0.5",
-        ]
-    )
-
-    assert args.initial_ctc_blank_bias == -0.5
-
-
 def test_parse_args_accepts_beam_length_bonus() -> None:
     args = parse_args(
         [
@@ -102,7 +89,6 @@ def test_parse_args_defaults_match_paper_recipe() -> None:
     assert args.spm_vocab_size == 128
     assert args.warmup_epochs == 20
     assert args.hold_epochs == 160
-    assert args.initial_ctc_blank_bias == 0.0
     assert args.ema_decay == 0.0
     assert args.validation_model_source == ValidationModelSource.RAW
 

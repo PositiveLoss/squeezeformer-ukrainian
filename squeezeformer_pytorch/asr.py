@@ -24,7 +24,6 @@ from .model import (
 )
 
 _CTC_HEAD_TARGET_BYTES = 128 * 1024 * 1024
-DEFAULT_INITIAL_CTC_BLANK_BIAS = 0.0
 DEFAULT_CTC_BEAM_LENGTH_BONUS = 0.1
 
 
@@ -375,7 +374,6 @@ class SqueezeformerCTC(nn.Module):
         audio_teacher_enabled: bool = False,
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
-        initial_ctc_blank_bias: float = DEFAULT_INITIAL_CTC_BLANK_BIAS,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
@@ -384,7 +382,6 @@ class SqueezeformerCTC(nn.Module):
         self.liberta_distill_enabled = liberta_distill_enabled
         self.audio_teacher_enabled = audio_teacher_enabled
         self.audio_teacher_target = audio_teacher_target
-        self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
         self.use_transformer_engine = use_transformer_engine
         self.encoder = SqueezeformerEncoder(
             encoder_config,
@@ -417,16 +414,15 @@ class SqueezeformerCTC(nn.Module):
             if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
-        self._initialize_ctc_head(self.classifier, blank_bias=self.initial_ctc_blank_bias)
+        self._initialize_ctc_head(self.classifier)
 
     @staticmethod
-    def _initialize_ctc_head(classifier: nn.Module, *, blank_bias: float) -> None:
+    def _initialize_ctc_head(classifier: nn.Module) -> None:
         bias = getattr(classifier, "bias", None)
         if bias is None:
             return
         with torch.no_grad():
             bias.zero_()
-            bias[0] = float(blank_bias)
 
     @staticmethod
     def _ctc_length_diagnostics(

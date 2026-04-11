@@ -396,18 +396,6 @@ def test_ctc_head_defaults_to_zero_blank_bias() -> None:
     assert torch.isclose(model.classifier.bias[0], torch.tensor(0.0))
     assert torch.count_nonzero(model.classifier.bias[1:]) == 0
 
-
-@torch.no_grad()
-def test_initial_ctc_blank_bias_applies_to_ctc_head() -> None:
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=16,
-        initial_ctc_blank_bias=-0.5,
-    )
-
-    assert torch.isclose(model.classifier.bias[0], torch.tensor(-0.5))
-
-
 def test_ctc_length_diagnostics_count_repeated_adjacent_targets() -> None:
     targets = torch.tensor([1, 1, 2, 3, 4, 4], dtype=torch.long)
     target_lengths = torch.tensor([3, 3], dtype=torch.long)

@@ -655,14 +655,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--audio-teacher-layer", type=int, default=-1)
     parser.add_argument("--audio-teacher-sample-rate", type=int, default=16_000)
     parser.add_argument("--audio-teacher-max-seconds", type=float, default=30.0)
-    parser.add_argument(
-        "--initial-ctc-blank-bias",
-        type=float,
-        default=0.0,
-        help=(
-            "Initial bias assigned to the blank row of each CTC classifier head. Defaults to 0.0."
-        ),
-    )
     parser.add_argument("--ema-decay", type=float, default=0.0)
     parser.add_argument("--ema-warmup-steps", type=int, default=0)
     parser.add_argument(

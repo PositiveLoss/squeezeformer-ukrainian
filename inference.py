@@ -143,7 +143,6 @@ class ASRInferenceSession:
                 self.model = ZipformerCTC(
                     encoder_config=encoder_config,
                     vocab_size=self.tokenizer.vocab_size,
-                    initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
                 )
         else:
             encoder_config = SqueezeformerConfig.from_mapping(checkpoint_data["encoder_config"])
@@ -159,7 +158,6 @@ class ASRInferenceSession:
             self.model = SqueezeformerCTC(
                 encoder_config=encoder_config,
                 vocab_size=self.tokenizer.vocab_size,
-                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
                 aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
                 aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
                 aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],

@@ -1318,7 +1318,6 @@ def main() -> None:
                 audio_teacher.hidden_size if audio_teacher is not None else encoder_config.model_dim
             ),
             audio_teacher_target=audio_teacher_target,
-            initial_ctc_blank_bias=args.initial_ctc_blank_bias,
         )
     else:
         model = SqueezeformerCTC(
@@ -1334,7 +1333,6 @@ def main() -> None:
                 audio_teacher.hidden_size if audio_teacher is not None else encoder_config.d_model
             ),
             audio_teacher_target=audio_teacher_target,
-            initial_ctc_blank_bias=args.initial_ctc_blank_bias,
             use_transformer_engine=args.dtype == DTypeChoice.FP8,
         )
     model.to(device)

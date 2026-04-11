@@ -177,14 +177,12 @@ class ZipformerCTC(nn.Module):
         audio_teacher_enabled: bool = False,
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
-        initial_ctc_blank_bias: float = 0.0,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
         self.intermediate_ctc_layers: tuple[int, ...] = ()
         self.aed_decoder = None
         self.audio_teacher_target = audio_teacher_target
-        self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
 
         self.encoder = ZipformerEncoder(encoder_config)
         self.classifier = nn.Linear(encoder_config.model_dim, vocab_size)
@@ -193,15 +191,14 @@ class ZipformerCTC(nn.Module):
             if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
-        self._initialize_ctc_head(blank_bias=self.initial_ctc_blank_bias)
+        self._initialize_ctc_head()
 
     def set_batch_count(self, batch_count: int) -> None:
         self.encoder.set_batch_count(batch_count)
 
-    def _initialize_ctc_head(self, *, blank_bias: float) -> None:
+    def _initialize_ctc_head(self) -> None:
         with torch.no_grad():
             self.classifier.bias.zero_()
-            self.classifier.bias[0] = float(blank_bias)
 
     @staticmethod
     def _ctc_log_softmax(logits: Tensor) -> Tensor:

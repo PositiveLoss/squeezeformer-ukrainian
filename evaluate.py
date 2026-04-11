@@ -234,14 +234,12 @@ def main() -> None:
             model = ZipformerCTC(
                 encoder_config=encoder_config,
                 vocab_size=tokenizer.vocab_size,
-                initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
             )
     else:
         encoder_config = SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
         model = SqueezeformerCTC(
             encoder_config=encoder_config,
             vocab_size=tokenizer.vocab_size,
-            initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
             aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
             aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
             aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
