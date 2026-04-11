@@ -137,6 +137,13 @@ def test_probe_audio_metadata_falls_back_to_load_when_info_is_unavailable(
     assert probe_audio_metadata(None, b"opus") == (48_000, 48_000)
 
 
+def test_audio_preview_filename_strips_source_audio_extension() -> None:
+    assert (
+        train._audio_preview_filename(0, "/content/cv22/common_voice_uk_38194628.wav")
+        == "sample_000000_content_cv22_common_voice_uk_38194628"
+    )
+
+
 def test_save_audio_preview_samples_writes_wav_transcripts_and_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

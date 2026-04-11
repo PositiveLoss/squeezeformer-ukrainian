@@ -659,6 +659,10 @@ def _audio_preview_filename(index: int, utterance_id: str) -> str:
     safe_utterance_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", utterance_id).strip("._")
     if not safe_utterance_id:
         safe_utterance_id = f"utt{index}"
+    for suffix in (".wav", ".flac", ".mp3", ".opus", ".ogg", ".m4a", ".aac"):
+        if safe_utterance_id.lower().endswith(suffix):
+            safe_utterance_id = safe_utterance_id[: -len(suffix)]
+            break
     return f"sample_{index:06d}_{safe_utterance_id[:80]}"
 
 
