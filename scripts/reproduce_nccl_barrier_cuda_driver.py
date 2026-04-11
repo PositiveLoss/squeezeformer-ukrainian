@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -88,25 +89,52 @@ def _nccl_version() -> str:
     return str(version)
 
 
+def _run_nvidia_smi(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["nvidia-smi", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def _process_error_summary(result: subprocess.CompletedProcess[str]) -> str:
+    details = [f"exit={result.returncode}"]
+    stderr = " ".join(line.strip() for line in result.stderr.splitlines() if line.strip())
+    stdout = " ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
+    if stderr:
+        details.append(f"stderr={stderr}")
+    if stdout:
+        details.append(f"stdout={stdout}")
+    return ", ".join(details)
+
+
+def _nvidia_smi_cuda_version() -> str:
+    try:
+        result = _run_nvidia_smi([])
+    except FileNotFoundError:
+        return "nvidia-smi unavailable"
+    except subprocess.SubprocessError as exc:
+        return f"error: {type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        return f"error: {_process_error_summary(result)}"
+    match = re.search(r"CUDA Version:\s*([0-9.]+)", result.stdout)
+    return match.group(1) if match else "unreported"
+
+
 def _nvidia_smi_versions() -> str:
     try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=driver_version,cuda_version",
-                "--format=csv,noheader",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        result = _run_nvidia_smi(["--query-gpu=driver_version", "--format=csv,noheader"])
     except FileNotFoundError:
         return "nvidia-smi unavailable"
     except subprocess.SubprocessError as exc:
         return f"nvidia-smi error: {type(exc).__name__}: {exc}"
-    output = " | ".join(line.strip() for line in result.stdout.splitlines() if line.strip())
-    return output or "nvidia-smi returned no GPU rows"
+    if result.returncode != 0:
+        return f"nvidia-smi error: {_process_error_summary(result)}"
+    driver_versions = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    driver_text = ", ".join(dict.fromkeys(driver_versions)) or "unreported"
+    return f"driver={driver_text} nvidia_smi_cuda={_nvidia_smi_cuda_version()}"
 
 
 def _print_diagnostics() -> None:
