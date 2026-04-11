@@ -266,8 +266,6 @@ def _validate_startup_args(
         raise ValueError(
             f"--speed-factors must contain only positive values, got {args.speed_factors}."
         )
-    _resolve_block_pattern(args.block_pattern)
-
     _validate_creatable_directory("--output-dir", args.output_dir)
     _validate_creatable_directory("--feature-cache-dir", args.feature_cache_dir)
     _validate_creatable_directory("--record-cache-dir", args.record_cache_dir)
@@ -708,30 +706,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
     )
     parser.add_argument(
-        "--attention-backend",
-        default="relative",
-        choices=["relative", "flash"],
-        help=(
-            "Attention implementation. 'flash' prefers kernels-community/flash-attn2 on "
-            "supported CUDA setups and falls back to PyTorch scaled_dot_product_attention."
-        ),
-    )
-    parser.add_argument(
-        "--disable-flash-attn2-kernels",
-        dest="disable_flash_attn2_kernels",
-        action="store_true",
-        help="Disable kernels-community/flash-attn2 and use PyTorch SDPA for the flash backend.",
-    )
-    parser.add_argument(
-        "--disable-flash-attention",
-        action="store_true",
-        help=(
-            "Disable the flash attention backend entirely and force the encoder to use "
-            "relative attention instead of flash-attn2 or PyTorch SDPA."
-        ),
-    )
-    parser.add_argument("--block-pattern", default="M,s,C,s")
-    parser.add_argument(
         "--frontend-backend",
         default="torchaudio",
         choices=["torchaudio", "audioflux"],
@@ -802,13 +776,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         explicit_batch_size="--batch-size" in argv,
     )
     return args
-
-
-def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
-    tokens = tuple(token.strip() for token in block_pattern.split(",") if token.strip())
-    if not tokens or any(token not in {"M", "C", "s"} for token in tokens):
-        raise ValueError("block pattern must be a comma-separated sequence drawn from M,C,s")
-    return tokens
 
 
 def _resolve_float_tuple(values: str) -> tuple[float, ...]:

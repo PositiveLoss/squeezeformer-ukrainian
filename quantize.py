@@ -84,7 +84,7 @@ def resolve_device(device_arg: str) -> torch.device:
 
 def build_model(checkpoint_data: dict[str, Any]) -> SqueezeformerCTC:
     tokenizer = tokenizer_from_dict(checkpoint_data["tokenizer"])
-    encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
+    encoder_config = SqueezeformerConfig.from_mapping(checkpoint_data["encoder_config"])
     training_args = checkpoint_data.get("training_args", {})
     initial_ctc_blank_bias = float(training_args.get("initial_ctc_blank_bias", 0.0))
 

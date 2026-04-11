@@ -154,7 +154,7 @@ class ASRInferenceSession:
                     ),
                 )
         else:
-            encoder_config = SqueezeformerConfig(**checkpoint_data["encoder_config"])
+            encoder_config = SqueezeformerConfig.from_mapping(checkpoint_data["encoder_config"])
             use_transformer_engine = should_use_transformer_engine_for_checkpoint(
                 checkpoint_data,
                 requested_dtype=dtype,

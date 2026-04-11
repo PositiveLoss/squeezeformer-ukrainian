@@ -71,7 +71,7 @@ def _load_model(args: argparse.Namespace) -> tuple[SqueezeformerCTC, object]:
         if "encoder_config" in checkpoint:
             from squeezeformer_pytorch.model import SqueezeformerConfig
 
-            config = SqueezeformerConfig(**checkpoint["encoder_config"])
+            config = SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
         model = SqueezeformerCTC(
             encoder_config=config,
             vocab_size=tokenizer.vocab_size,

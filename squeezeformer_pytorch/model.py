@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import logging
 import math
-from dataclasses import dataclass, replace
-from functools import lru_cache
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, replace
 from typing import Callable
 
 import torch
@@ -14,11 +13,6 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .masking import make_attention_mask, make_sequence_mask
 
 try:
-    from kernels import get_kernel
-except ImportError:
-    get_kernel = None
-
-try:
     import transformer_engine.pytorch as te
 except (ImportError, OSError):
     te = None
@@ -26,27 +20,7 @@ except (ImportError, OSError):
 
 FP8_SHAPE_ALIGNMENT = 16
 _CUDA_CONV2D_32BIT_INDEX_LIMIT = torch.iinfo(torch.int32).max
-_FLASH_ATTN2_REPO_ID = "kernels-community/flash-attn2"
-_FLASH_ATTN2_WARNING_CACHE: set[str] = set()
-logger = logging.getLogger(__name__)
-
-
-def _warn_flash_attn2_once(reason: str) -> None:
-    if reason in _FLASH_ATTN2_WARNING_CACHE:
-        return
-    _FLASH_ATTN2_WARNING_CACHE.add(reason)
-    logger.warning("flash-attn2 disabled; falling back to SDPA: %s", reason)
-
-
-@lru_cache(maxsize=1)
-def _load_flash_attn2_kernel():
-    if get_kernel is None:
-        return None
-    try:
-        return get_kernel(_FLASH_ATTN2_REPO_ID)
-    except Exception as exc:
-        _warn_flash_attn2_once(f"unable to load {_FLASH_ATTN2_REPO_ID} ({exc})")
-        return None
+_SQUEEZEFORMER_BLOCK_PATTERN = ("M", "s", "C", "s")
 
 
 def _subsample_length(
@@ -303,170 +277,6 @@ class RelPositionMultiHeadAttention(nn.Module):
         return apply_linear_with_fp8_padding(self.out_proj, context)
 
 
-class FlashMultiHeadAttention(nn.Module):
-    """Flash-attn2 or PyTorch SDPA-backed MHA.
-
-    The Hugging Face `kernels-community/flash-attn2` kernel is preferred on
-    supported CUDA runtimes. When the kernel package/runtime/build is missing or
-    does not support the current shapes, dtype, or dropout mode, this module
-    falls back to PyTorch SDPA.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        flash_attn2_enabled: bool = True,
-        use_transformer_engine: bool = False,
-    ) -> None:
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-
-        self.query = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
-        self.key = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
-        self.value = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
-        self.out_proj = make_linear(dim, dim, use_transformer_engine=use_transformer_engine)
-        self.dropout_p = dropout
-        self._flash_attn2_enabled = flash_attn2_enabled
-
-    def _shape(self, x: Tensor) -> Tensor:
-        batch, time, _ = x.shape
-        return x.view(batch, time, self.num_heads, self.head_dim).transpose(1, 2)
-
-    @staticmethod
-    def _to_sdpa_mask(mask: Tensor) -> Tensor:
-        if mask.dim() == 2:
-            return (mask.unsqueeze(1) & mask.unsqueeze(2)).unsqueeze(1)
-        return mask.unsqueeze(1)
-
-    @staticmethod
-    def _heads_first_to_last(x: Tensor) -> Tensor:
-        return x.transpose(1, 2).contiguous()
-
-    @staticmethod
-    def _heads_last_to_first(x: Tensor) -> Tensor:
-        return x.transpose(1, 2).contiguous()
-
-    @staticmethod
-    def _infer_sequence_lengths(mask: Tensor) -> Tensor:
-        if mask.dim() == 2:
-            return mask.sum(dim=-1, dtype=torch.int32)
-        return mask.any(dim=-1).sum(dim=-1, dtype=torch.int32)
-
-    @staticmethod
-    def _cu_seqlens(lengths: Tensor) -> Tensor:
-        cu_seqlens = torch.zeros(lengths.size(0) + 1, device=lengths.device, dtype=torch.int32)
-        cu_seqlens[1:] = torch.cumsum(lengths.to(dtype=torch.int32), dim=0)
-        return cu_seqlens
-
-    @staticmethod
-    def _pack_padded_sequences(x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
-        steps = torch.arange(x.size(1), device=x.device).unsqueeze(0)
-        sequence_mask = steps < lengths.unsqueeze(1)
-        return x[sequence_mask], sequence_mask
-
-    @staticmethod
-    def _unpack_padded_sequences(
-        packed: Tensor,
-        sequence_mask: Tensor,
-        *,
-        batch: int,
-        time: int,
-    ) -> Tensor:
-        out = packed.new_zeros((batch, time, packed.size(1), packed.size(2)))
-        out[sequence_mask] = packed
-        return out
-
-    def _maybe_disable_flash_attn2(self, exc: Exception) -> None:
-        self._flash_attn2_enabled = False
-        _warn_flash_attn2_once(str(exc))
-
-    def _supports_flash_attn2(self, query: Tensor) -> bool:
-        return (
-            self._flash_attn2_enabled
-            and query.device.type == "cuda"
-            and query.dtype in (torch.float16, torch.bfloat16)
-        )
-
-    def _flash_attn2(
-        self,
-        query: Tensor,
-        key: Tensor,
-        value: Tensor,
-        mask: Tensor | None,
-    ) -> Tensor | None:
-        if not self._supports_flash_attn2(query):
-            return None
-        kernel = _load_flash_attn2_kernel()
-        if kernel is None:
-            return None
-        dropout_p = self.dropout_p if self.training else 0.0
-        try:
-            if mask is None:
-                return kernel.fwd(
-                    q=query,
-                    k=key,
-                    v=value,
-                    p_dropout=dropout_p,
-                    is_causal=False,
-                )[0]
-
-            lengths = self._infer_sequence_lengths(mask)
-            if torch.any(lengths <= 0):
-                return None
-            packed_query, sequence_mask = self._pack_padded_sequences(query, lengths)
-            packed_key, _ = self._pack_padded_sequences(key, lengths)
-            packed_value, _ = self._pack_padded_sequences(value, lengths)
-            packed_out = kernel.varlen_fwd(
-                q=packed_query,
-                k=packed_key,
-                v=packed_value,
-                cu_seqlens_q=self._cu_seqlens(lengths),
-                cu_seqlens_k=self._cu_seqlens(lengths),
-                max_seqlen_q=int(lengths.max().item()),
-                max_seqlen_k=int(lengths.max().item()),
-                p_dropout=dropout_p,
-                is_causal=False,
-            )[0]
-            return self._unpack_padded_sequences(
-                packed_out,
-                sequence_mask,
-                batch=query.size(0),
-                time=query.size(1),
-            )
-        except Exception as exc:
-            self._maybe_disable_flash_attn2(exc)
-            return None
-
-    def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
-        query = self._shape(apply_linear_with_fp8_padding(self.query, x))
-        key = self._shape(apply_linear_with_fp8_padding(self.key, x))
-        value = self._shape(apply_linear_with_fp8_padding(self.value, x))
-        flash_query = self._heads_first_to_last(query)
-        flash_key = self._heads_first_to_last(key)
-        flash_value = self._heads_first_to_last(value)
-        flash_context = self._flash_attn2(flash_query, flash_key, flash_value, mask)
-        if flash_context is not None:
-            context = self._heads_last_to_first(flash_context)
-        else:
-            attn_mask = self._to_sdpa_mask(mask) if mask is not None else None
-            context = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False,
-            )
-        context = context.transpose(1, 2).contiguous().view(x.size(0), x.size(1), self.dim)
-        return apply_linear_with_fp8_padding(self.out_proj, context)
-
-
 class FeedForwardModule(nn.Module):
     def __init__(
         self,
@@ -516,8 +326,6 @@ class AttentionModule(nn.Module):
         num_heads: int,
         dropout: float = 0.1,
         adaptive_scale: bool = True,
-        attention_backend: str = "relative",
-        flash_attn2_enabled: bool = True,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
@@ -526,33 +334,18 @@ class AttentionModule(nn.Module):
             if adaptive_scale
             else make_layer_norm(dim, use_transformer_engine=use_transformer_engine)
         )
-        if attention_backend == "relative":
-            self.attn: nn.Module = RelPositionMultiHeadAttention(
-                dim=dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                use_transformer_engine=use_transformer_engine,
-            )
-        elif attention_backend == "flash":
-            self.attn = FlashMultiHeadAttention(
-                dim=dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                flash_attn2_enabled=flash_attn2_enabled,
-                use_transformer_engine=use_transformer_engine,
-            )
-        else:
-            raise ValueError(f"Unsupported attention backend: {attention_backend}")
-        self.attention_backend = attention_backend
+        self.attn = RelPositionMultiHeadAttention(
+            dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, pos: Tensor, mask: Tensor | None = None) -> Tensor:
         residual = x
         x = self.input_transform(x)
-        if self.attention_backend == "relative":
-            x = self.attn(x, pos=pos, mask=mask)
-        else:
-            x = self.attn(x, mask=mask)
+        x = self.attn(x, pos=pos, mask=mask)
         x = self.dropout(x)
         return residual + x
 
@@ -564,7 +357,6 @@ class ConvolutionModule(nn.Module):
         kernel_size: int = 31,
         expansion_factor: int = 2,
         dropout: float = 0.1,
-        use_glu: bool = False,
         adaptive_scale: bool = True,
         use_transformer_engine: bool = False,
     ) -> None:
@@ -578,11 +370,6 @@ class ConvolutionModule(nn.Module):
             else make_layer_norm(dim, use_transformer_engine=use_transformer_engine)
         )
         self.pointwise_in = nn.Conv1d(dim, hidden_dim, kernel_size=1)
-        self.use_glu = use_glu
-        if use_glu:
-            raise NotImplementedError(
-                "The paper's final Squeezeformer replaces GLU with Swish everywhere."
-            )
         self.activation1 = nn.SiLU()
         self.depthwise = nn.Conv1d(
             hidden_dim,
@@ -591,7 +378,6 @@ class ConvolutionModule(nn.Module):
             padding=kernel_size // 2,
             groups=hidden_dim,
         )
-        self.time_norm = nn.LayerNorm(hidden_dim)
         self.activation2 = nn.SiLU()
         self.pointwise_out = nn.Conv1d(hidden_dim, dim, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
@@ -602,19 +388,13 @@ class ConvolutionModule(nn.Module):
         x = x.transpose(1, 2)
         mask = pad_mask.unsqueeze(1).to(dtype=x.dtype) if pad_mask is not None else None
         x = self.pointwise_in(x)
-        if self.use_glu:
-            x = F.glu(torch.cat([x, x], dim=1), dim=1)
-        else:
-            x = self.activation1(x)
+        x = self.activation1(x)
         if mask is not None:
             x = x * mask
         x = self.depthwise(x)
         if mask is not None:
             x = x * mask
         x = x.transpose(1, 2)
-        x = self.time_norm(x)
-        if pad_mask is not None:
-            x = x * pad_mask.unsqueeze(-1).to(dtype=x.dtype)
         x = self.activation2(x)
         if pad_mask is not None:
             x = x * pad_mask.unsqueeze(-1).to(dtype=x.dtype)
@@ -634,8 +414,6 @@ class MHSAFFModule(nn.Module):
         num_heads: int,
         ff_expansion_factor: int,
         dropout: float,
-        attention_backend: str,
-        flash_attn2_enabled: bool = True,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
@@ -644,8 +422,6 @@ class MHSAFFModule(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             adaptive_scale=True,
-            attention_backend=attention_backend,
-            flash_attn2_enabled=flash_attn2_enabled,
             use_transformer_engine=use_transformer_engine,
         )
         self.mid_norm = make_layer_norm(dim, use_transformer_engine=use_transformer_engine)
@@ -682,7 +458,6 @@ class ConvFFModule(nn.Module):
             kernel_size=kernel_size,
             expansion_factor=conv_expansion_factor,
             dropout=dropout,
-            use_glu=False,
             adaptive_scale=True,
             use_transformer_engine=use_transformer_engine,
         )
@@ -714,14 +489,10 @@ class SqueezeformerBlock(nn.Module):
         conv_expansion_factor: int,
         dropout: float,
         block_pattern: tuple[str, ...],
-        attention_backend: str,
-        flash_attn2_enabled: bool = True,
-        drop_path_rate: float = 0.0,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.block_pattern = block_pattern
-        self.drop_path_rate = drop_path_rate
         layers: list[nn.Module] = []
         for token in block_pattern:
             if token == "M":
@@ -731,8 +502,6 @@ class SqueezeformerBlock(nn.Module):
                         num_heads=num_heads,
                         ff_expansion_factor=ff_expansion_factor,
                         dropout=dropout,
-                        attention_backend=attention_backend,
-                        flash_attn2_enabled=flash_attn2_enabled,
                         use_transformer_engine=use_transformer_engine,
                     )
                 )
@@ -760,33 +529,22 @@ class SqueezeformerBlock(nn.Module):
         attn_mask: Tensor | None,
         pad_mask: Tensor | None,
     ) -> Tensor:
-        residual = x
         for token, layer in zip(self.block_pattern, self.layers, strict=True):
             if token == "M":
                 x = layer(x, pos=pos, attn_mask=attn_mask)
             elif token == "C":
                 x = layer(x, pad_mask=pad_mask)
-        if self.training and self.drop_path_rate > 0:
-            keep_prob = 1.0 - self.drop_path_rate
-            shape = (x.size(0),) + (1,) * (x.dim() - 1)
-            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-            binary_mask = torch.floor(random_tensor)
-            x = residual + (x - residual) * binary_mask / keep_prob
         return x
 
 
 class Conv2dSubsampling(nn.Module):
-    def __init__(self, in_features: int, channels: int, depthwise_separable: bool = True) -> None:
+    def __init__(self, in_features: int, channels: int) -> None:
         super().__init__()
         self.in_features = in_features
         self.channels = channels
         self.conv1 = nn.Conv2d(1, channels, kernel_size=3, stride=2)
-        self.depthwise_separable = depthwise_separable
-        if depthwise_separable:
-            self.conv2_dw = nn.Conv2d(channels, channels, kernel_size=3, stride=2, groups=channels)
-            self.conv2_pw = nn.Conv2d(channels, channels, kernel_size=1)
-        else:
-            self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=2)
+        self.conv2_dw = nn.Conv2d(channels, channels, kernel_size=3, stride=2, groups=channels)
+        self.conv2_pw = nn.Conv2d(channels, channels, kernel_size=1)
         self.activation = nn.ReLU()
         out_features = self._output_freq_bins(in_features) * channels
         self.output_dim = out_features
@@ -812,10 +570,7 @@ class Conv2dSubsampling(nn.Module):
             min_right_pad=1,
             min_bottom_pad=1,
         )
-        if self.depthwise_separable:
-            x = self._apply_depthwise_separable_conv2(x)
-        else:
-            x = self._apply_conv2(x)
+        x = self._apply_depthwise_separable_conv2(x)
         x = self.activation(x)
         batch, channels, time, freq = x.shape
         return x.permute(0, 2, 1, 3).contiguous().view(batch, time, channels * freq)
@@ -825,12 +580,6 @@ class Conv2dSubsampling(nn.Module):
             return self.conv1(x)
         max_batch = _safe_conv2d_batch_size(x, self.conv1)
         return torch.cat([self.conv1(chunk) for chunk in x.split(max_batch, dim=0)], dim=0)
-
-    def _apply_conv2(self, x: Tensor) -> Tensor:
-        if not _conv2d_requires_chunking(x, self.conv2):
-            return self.conv2(x)
-        max_batch = _safe_conv2d_batch_size(x, self.conv2)
-        return torch.cat([self.conv2(chunk) for chunk in x.split(max_batch, dim=0)], dim=0)
 
     def _apply_depthwise_separable_conv2(self, x: Tensor) -> Tensor:
         if not _conv2d_requires_chunking(x, self.conv2_dw) and not _conv2d_requires_chunking(
@@ -904,20 +653,19 @@ class SqueezeformerConfig:
     ff_expansion_factor: int = 4
     conv_expansion_factor: int = 2
     dropout: float = 0.1
-    depthwise_subsampling: bool = True
-    block_pattern: tuple[str, ...] = ("M", "s", "C", "s")
     time_reduction_kernel_size: int = 3
     activation_checkpointing: bool = False
-    stochastic_depth_rate: float = 0.0
     time_reduce_idx: tuple[int, ...] = (7,)
     time_recover_idx: tuple[int, ...] = (15,)
-    attention_backend: str = "relative"
-    flash_attn2_enabled: bool = True
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "block_pattern", tuple(self.block_pattern))
         object.__setattr__(self, "time_reduce_idx", tuple(self.time_reduce_idx))
         object.__setattr__(self, "time_recover_idx", tuple(self.time_recover_idx))
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> SqueezeformerConfig:
+        valid_fields = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in values.items() if key in valid_fields})
 
 
 VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
@@ -946,7 +694,6 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=324,
         num_layers=20,
         num_heads=4,
-        stochastic_depth_rate=0.03,
         time_reduce_idx=(9,),
         time_recover_idx=(19,),
     ),
@@ -954,7 +701,6 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=512,
         num_layers=18,
         num_heads=8,
-        stochastic_depth_rate=0.05,
         time_reduce_idx=(8,),
         time_recover_idx=(17,),
     ),
@@ -962,7 +708,6 @@ VARIANT_CONFIGS: dict[str, SqueezeformerConfig] = {
         d_model=640,
         num_layers=22,
         num_heads=8,
-        stochastic_depth_rate=0.1,
         time_reduce_idx=(10,),
         time_recover_idx=(21,),
     ),
@@ -991,7 +736,6 @@ class SqueezeformerEncoder(nn.Module):
         self.subsampling = Conv2dSubsampling(
             in_features=config.input_features,
             channels=config.d_model,
-            depthwise_separable=config.depthwise_subsampling,
         )
         self.input_projection = make_linear(
             self.subsampling.output_dim,
@@ -1031,15 +775,10 @@ class SqueezeformerEncoder(nn.Module):
                     ff_expansion_factor=config.ff_expansion_factor,
                     conv_expansion_factor=config.conv_expansion_factor,
                     dropout=config.dropout,
-                    block_pattern=config.block_pattern,
-                    attention_backend=config.attention_backend,
-                    flash_attn2_enabled=config.flash_attn2_enabled,
-                    drop_path_rate=(
-                        config.stochastic_depth_rate * layer_index / max(1, config.num_layers - 1)
-                    ),
+                    block_pattern=_SQUEEZEFORMER_BLOCK_PATTERN,
                     use_transformer_engine=use_transformer_engine,
                 )
-                for layer_index in range(config.num_layers)
+                for _ in range(config.num_layers)
             ]
         )
 
@@ -1101,22 +840,14 @@ class SqueezeformerEncoder(nn.Module):
                     make_sequence_mask(lengths, max_length=x.size(1)),
                     target_length=padded_time,
                 )
-                attn_mask = (
-                    pad_mask
-                    if self.config.attention_backend == "flash"
-                    else _pad_attn_mask_to_length(
-                        make_attention_mask(lengths, max_length=x.size(1)),
-                        target_length=padded_time,
-                    )
+                attn_mask = _pad_attn_mask_to_length(
+                    make_attention_mask(lengths, max_length=x.size(1)),
+                    target_length=padded_time,
                 )
             else:
                 pos = self.positional_encoding(x)
                 pad_mask = make_sequence_mask(lengths, max_length=x.size(1))
-                attn_mask = (
-                    pad_mask
-                    if self.config.attention_backend == "flash"
-                    else make_attention_mask(lengths, max_length=x.size(1))
-                )
+                attn_mask = make_attention_mask(lengths, max_length=x.size(1))
             if self.config.activation_checkpointing and self.training:
                 x = activation_checkpoint(
                     lambda a, b, c, d: block(a, pos=b, attn_mask=c, pad_mask=d),

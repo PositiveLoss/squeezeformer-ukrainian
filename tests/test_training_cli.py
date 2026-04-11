@@ -62,30 +62,6 @@ def test_parse_args_rejects_multiple_dynamic_batching_modes() -> None:
     )
 
 
-def test_parse_args_accepts_disable_flash_attn2_kernels_flag() -> None:
-    args = parse_args(
-        [
-            "--device",
-            "cpu",
-            "--disable-flash-attn2-kernels",
-        ]
-    )
-
-    assert args.disable_flash_attn2_kernels is True
-
-
-def test_parse_args_accepts_disable_flash_attention_flag() -> None:
-    args = parse_args(
-        [
-            "--device",
-            "cpu",
-            "--disable-flash-attention",
-        ]
-    )
-
-    assert args.disable_flash_attention is True
-
-
 def test_parse_args_accepts_blank_logit_training_controls() -> None:
     args = parse_args(
         [
@@ -135,7 +111,6 @@ def test_parse_args_defaults_match_paper_recipe() -> None:
     assert args.initial_ctc_blank_bias == 0.0
     assert args.ema_decay == 0.0
     assert args.validation_model_source == ValidationModelSource.RAW
-    assert args.attention_backend == "relative"
 
 
 def test_variant_scheduler_defaults_match_paper_recipe() -> None:

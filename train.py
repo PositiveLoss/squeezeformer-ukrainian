@@ -46,7 +46,6 @@ from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, Val
 from squeezeformer_pytorch.training import data_loading as _training_data_loading
 from squeezeformer_pytorch.training import runtime as _training_runtime
 from squeezeformer_pytorch.training.cli import (
-    _resolve_block_pattern,
     _resolve_float_tuple,
     _resolve_scheduler_kwargs,
     _validate_startup_args,
@@ -1222,24 +1221,14 @@ def main() -> None:
         )
     else:
         encoder_config = (
-            SqueezeformerConfig(**checkpoint["encoder_config"])
+            SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
             if checkpoint is not None
             else squeezeformer_variant(args.variant)
         )
         if checkpoint is None:
-            attention_backend = (
-                "relative" if args.disable_flash_attention else args.attention_backend
-            )
             encoder_config = replace(
                 deepcopy(encoder_config),
-                block_pattern=_resolve_block_pattern(args.block_pattern),
                 activation_checkpointing=args.activation_checkpointing,
-                attention_backend=attention_backend,
-            )
-        if args.disable_flash_attn2_kernels:
-            encoder_config = replace(
-                deepcopy(encoder_config),
-                flash_attn2_enabled=False,
             )
     args.aed_decoder = aed_decoder_enabled
     args.aed_decoder_layers = aed_decoder_layers

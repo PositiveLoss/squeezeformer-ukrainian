@@ -780,13 +780,6 @@ def evaluate(
     return merged_results
 
 
-def _resolve_block_pattern(block_pattern: str) -> tuple[str, ...]:
-    tokens = tuple(token.strip() for token in block_pattern.split(",") if token.strip())
-    if not tokens or any(token not in {"M", "C", "s"} for token in tokens):
-        raise ValueError("block pattern must be a comma-separated sequence drawn from M,C,s")
-    return tokens
-
-
 def _resolve_float_tuple(values: str) -> tuple[float, ...]:
     parsed = tuple(float(value.strip()) for value in values.split(",") if value.strip())
     if not parsed:

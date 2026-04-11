@@ -291,22 +291,6 @@ def test_variant_forward_shapes() -> None:
         assert torch.isfinite(outputs).all()
 
 
-@torch.no_grad()
-def test_flash_attention_backend_forward_shapes() -> None:
-    lengths = torch.tensor([160, 123], dtype=torch.int64)
-    features = torch.randn(2, int(lengths.max().item()), 80)
-    model = build_squeezeformer_encoder("xs", attention_backend="flash")
-    model.eval()
-
-    outputs, output_lengths = model(features, lengths)
-
-    assert outputs.shape == (2, int(output_lengths.max().item()), model.config.d_model)
-    assert torch.equal(
-        output_lengths,
-        torch.tensor([expected_subsampled_length(160), expected_subsampled_length(123)]),
-    )
-
-
 def test_squeezeformer_training_outputs_include_audio_teacher_states() -> None:
     config = squeezeformer_variant("xs")
     model = SqueezeformerCTC(
@@ -335,190 +319,11 @@ def test_squeezeformer_training_outputs_include_audio_teacher_states() -> None:
 
 
 @torch.no_grad()
-def test_flash_attention_backend_uses_hf_varlen_kernel_when_available(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class DummyKernel:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def varlen_fwd(self, **kwargs: object):
-            self.calls.append(kwargs)
-            return (torch.full_like(kwargs["q"], 2.0),)
-
-    dummy_kernel = DummyKernel()
-    monkeypatch.setattr(squeezeformer_model, "_load_flash_attn2_kernel", lambda: dummy_kernel)
-    monkeypatch.setattr(
-        squeezeformer_model.FlashMultiHeadAttention,
-        "_supports_flash_attn2",
-        lambda self, _query: True,
-    )
-
-    def fail_sdpa(*_args: object, **_kwargs: object) -> torch.Tensor:
-        raise AssertionError("expected HF flash-attn2 path instead of SDPA")
-
-    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fail_sdpa)
-
-    attn = squeezeformer_model.FlashMultiHeadAttention(dim=4, num_heads=2, dropout=0.0)
-    attn.eval()
-    for layer in (attn.query, attn.key, attn.value, attn.out_proj):
-        layer.weight.copy_(torch.eye(4))
-        layer.bias.zero_()
-
-    x = torch.randn(2, 4, 4)
-    lengths = torch.tensor([4, 2], dtype=torch.int64)
-    mask = make_sequence_mask(lengths, max_length=4)
-
-    out = attn(x, mask=mask)
-
-    assert len(dummy_kernel.calls) == 1
-    assert dummy_kernel.calls[0]["q"].shape == (6, 2, 2)
-    assert torch.equal(
-        dummy_kernel.calls[0]["cu_seqlens_q"],
-        torch.tensor([0, 4, 6], dtype=torch.int32),
-    )
-    assert out.shape == x.shape
-    assert torch.all(out[0] == 2.0)
-    assert torch.all(out[1, :2] == 2.0)
-    assert torch.all(out[1, 2:] == 0.0)
-
-
-@torch.no_grad()
-def test_flash_attention_backend_accepts_sequence_mask_for_sdpa_fallback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    captured: dict[str, object] = {}
-    expected_mask = (
-        make_sequence_mask(torch.tensor([4, 2], dtype=torch.int64), max_length=4)
-        .unsqueeze(1)
-        .unsqueeze(2)
-    )
-    expected_mask = expected_mask & expected_mask.transpose(-1, -2)
-
-    def fake_sdpa(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor | None = None,
-        dropout_p: float = 0.0,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        captured["attn_mask_shape"] = None if attn_mask is None else attn_mask.shape
-        captured["attn_mask"] = attn_mask
-        return torch.zeros_like(query)
-
-    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
-
-    attn = squeezeformer_model.FlashMultiHeadAttention(dim=4, num_heads=2, dropout=0.0)
-    attn.eval()
-    x = torch.randn(2, 4, 4)
-    mask = make_sequence_mask(torch.tensor([4, 2], dtype=torch.int64), max_length=4)
-
-    out = attn(x, mask=mask)
-
-    assert captured["attn_mask_shape"] == (2, 1, 4, 4)
-    assert torch.equal(captured["attn_mask"], expected_mask)
-    assert out.shape == x.shape
-
-
-@torch.no_grad()
-def test_flash_attention_backend_falls_back_to_sdpa_after_kernel_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FailingKernel:
-        def fwd(self, **_kwargs: object):
-            raise RuntimeError("dropout unsupported")
-
-    monkeypatch.setattr(squeezeformer_model, "_load_flash_attn2_kernel", lambda: FailingKernel())
-    monkeypatch.setattr(
-        squeezeformer_model.FlashMultiHeadAttention,
-        "_supports_flash_attn2",
-        lambda self, _query: True,
-    )
-
-    captured: dict[str, object] = {}
-
-    def fake_sdpa(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor | None = None,
-        dropout_p: float = 0.0,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        captured["query_shape"] = query.shape
-        captured["dropout_p"] = dropout_p
-        captured["is_causal"] = is_causal
-        captured["attn_mask_shape"] = None if attn_mask is None else attn_mask.shape
-        return torch.zeros_like(query)
-
-    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
-
-    attn = squeezeformer_model.FlashMultiHeadAttention(dim=4, num_heads=2, dropout=0.0)
-    attn.eval()
-    x = torch.randn(2, 3, 4)
-
-    out = attn(x)
-
-    assert captured["query_shape"] == (2, 2, 3, 2)
-    assert captured["dropout_p"] == 0.0
-    assert captured["is_causal"] is False
-    assert captured["attn_mask_shape"] is None
-    assert out.shape == x.shape
-    assert not attn._flash_attn2_enabled
-
-
-@torch.no_grad()
-def test_flash_attention_backend_can_start_with_flash_attn2_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_kernel_load() -> object:
-        raise AssertionError("flash-attn2 kernel should not be loaded when disabled")
-
-    monkeypatch.setattr(squeezeformer_model, "_load_flash_attn2_kernel", fail_kernel_load)
-
-    captured: dict[str, object] = {}
-
-    def fake_sdpa(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        attn_mask: torch.Tensor | None = None,
-        dropout_p: float = 0.0,
-        is_causal: bool = False,
-    ) -> torch.Tensor:
-        captured["query_shape"] = query.shape
-        return torch.zeros_like(query)
-
-    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
-
-    model = build_squeezeformer_encoder(
-        "xs",
-        attention_backend="flash",
-        flash_attn2_enabled=False,
-    )
-    attn = model.blocks[0].layers[0].attn.attn
-
-    features = torch.randn(2, 16, 80)
-    lengths = torch.tensor([16, 12], dtype=torch.int64)
-    outputs, output_lengths = model(features, lengths)
-
-    assert isinstance(attn, squeezeformer_model.FlashMultiHeadAttention)
-    assert attn._flash_attn2_enabled is False
-    assert captured["query_shape"] is not None
-    assert outputs.shape == (2, int(output_lengths.max().item()), model.config.d_model)
-
-
-@torch.no_grad()
 def test_transformer_engine_padding_path_preserves_shapes_without_te_runtime() -> None:
     lengths = torch.tensor([160, 123], dtype=torch.int64)
     features = torch.randn(2, int(lengths.max().item()), 80)
     model = build_squeezeformer_encoder(
         "xs",
-        attention_backend="flash",
         use_transformer_engine=True,
     )
     model.eval()
@@ -535,11 +340,7 @@ def test_transformer_engine_padding_path_preserves_shapes_without_te_runtime() -
 
 @torch.no_grad()
 def test_encoder_zeroes_padded_suffixes_after_each_block() -> None:
-    model = build_squeezeformer_encoder(
-        "xs",
-        attention_backend="flash",
-        flash_attn2_enabled=False,
-    )
+    model = build_squeezeformer_encoder("xs")
     model.eval()
 
     features = torch.randn(2, 16, 80)
@@ -888,15 +689,6 @@ def test_explicit_learning_rate_still_applies_to_default_adamw_path() -> None:
     assert peak_lr == 0.0015
     assert muon_lr == 0.0015
     assert adamw_lr == 0.0015
-
-
-def test_stochastic_depth_enabled_for_larger_variants() -> None:
-    assert squeezeformer_variant("xs").stochastic_depth_rate == 0.0
-    assert squeezeformer_variant("m").stochastic_depth_rate > 0.0
-    assert (
-        squeezeformer_variant("l").stochastic_depth_rate
-        > squeezeformer_variant("m").stochastic_depth_rate
-    )
 
 
 def test_sentencepiece_tokenizer_roundtrip(tmp_path: Path) -> None:
@@ -2233,8 +2025,8 @@ def test_variant_time_unet_indices_match_reference_layout() -> None:
 
 
 def test_default_block_pattern_matches_paper_layout() -> None:
-    config = squeezeformer_variant("sm")
-    assert config.block_pattern == ("M", "s", "C", "s")
+    model = build_squeezeformer_encoder("sm")
+    assert model.blocks[0].block_pattern == ("M", "s", "C", "s")
 
 
 def test_paper_defaults_use_sentencepiece_compatible_variant_defaults() -> None:

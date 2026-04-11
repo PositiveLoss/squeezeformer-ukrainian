@@ -246,7 +246,7 @@ def main() -> None:
                 ),
             )
     else:
-        encoder_config = SqueezeformerConfig(**checkpoint["encoder_config"])
+        encoder_config = SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
         model = SqueezeformerCTC(
             encoder_config=encoder_config,
             vocab_size=tokenizer.vocab_size,
