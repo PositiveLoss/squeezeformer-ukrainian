@@ -52,6 +52,10 @@ from squeezeformer_pytorch.data import (
     normalize_transcript,
     transcript_is_usable,
 )
+from squeezeformer_pytorch.frontend import (
+    estimate_num_feature_frames,
+    zipformer_paper_featurizer_config,
+)
 from squeezeformer_pytorch.masking import (
     make_attention_mask,
     make_padding_mask,
@@ -98,6 +102,23 @@ def expected_subsampled_length(length: int) -> int:
     for _ in range(2):
         value = math.floor(value / 2)
     return value
+
+
+def test_estimate_num_feature_frames_matches_torchaudio_frontend() -> None:
+    featurizer = AudioFeaturizer(**zipformer_paper_featurizer_config())
+    for num_samples in (1, 159, 160, 399, 400, 16_000, 32_000):
+        actual_frames = featurizer(torch.zeros(num_samples), 16_000).size(0)
+        estimated_frames = estimate_num_feature_frames(
+            num_samples,
+            sample_rate=16_000,
+            target_sample_rate=featurizer.sample_rate,
+            n_fft=featurizer.n_fft,
+            win_length=featurizer.win_length,
+            hop_length=featurizer.hop_length,
+            backend=featurizer.backend,
+        )
+
+        assert estimated_frames == actual_frames
 
 
 def test_validate_resume_tokenizer_configuration_rejects_tokenizer_type_mismatch() -> None:
@@ -915,6 +936,25 @@ def test_load_records_works_without_speaker_id_field(tmp_path: Path) -> None:
     assert len(records) == 2
     assert all(record.speaker_id is None for record in records)
     assert all(not record.has_speaker_id for record in records)
+
+
+def test_load_records_estimates_centered_torchaudio_frames(tmp_path: Path) -> None:
+    manifest = tmp_path / "train.tsv"
+    manifest.write_text(
+        "path\tsentence\tid\tduration\na.wav\tце тест\tutt0\t1.0\n",
+        encoding="utf-8",
+    )
+
+    records = load_records(
+        dataset_root=tmp_path,
+        split="train",
+        seed=13,
+        val_fraction=0.0,
+        test_fraction=0.0,
+    )
+
+    assert records[0].num_samples == 16_000
+    assert records[0].estimated_frames == 101
 
 
 def test_load_records_preserves_case_when_lowercase_disabled(tmp_path: Path) -> None:
@@ -2370,6 +2410,36 @@ def test_disk_backed_record_store_is_pickle_safe_after_open(tmp_path: Path) -> N
 
     assert len(restored) == 1
     assert restored[0].utterance_id == "utt0"
+
+
+def test_disk_backed_record_store_recomputes_centered_frame_estimate(tmp_path: Path) -> None:
+    records_path = tmp_path / "records.jsonl"
+    payload = {
+        "audio_path": "dummy.wav",
+        "audio_blob_path": None,
+        "transcript": "це тест",
+        "utterance_id": "utt0",
+        "speaker_id": None,
+        "has_speaker_id": False,
+    }
+    records_path.write_text(json.dumps(payload, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    offsets = array.array("Q", [0])
+    estimated_frames = array.array("I", [20])
+    num_samples = array.array("Q", [3200])
+    sample_rates = array.array("I", [16_000])
+    store = DiskBackedRecordStore(
+        records_path, offsets, estimated_frames, num_samples, sample_rates
+    )
+    featurizer = AudioFeaturizer(**zipformer_paper_featurizer_config())
+
+    store.populate_metadata(
+        hop_length=featurizer.hop_length,
+        num_workers=1,
+        featurizer=featurizer,
+    )
+
+    assert store[0].estimated_frames == 21
 
 
 def test_muon_optimizer_partition_uses_encoder_hidden_weights(

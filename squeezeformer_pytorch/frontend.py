@@ -32,6 +32,36 @@ ZIPFORMER_PAPER_FEATURIZER_CONFIG: dict[str, object] = {
 }
 
 
+def estimate_num_feature_frames(
+    num_samples: int,
+    *,
+    sample_rate: int = 16_000,
+    target_sample_rate: int = 16_000,
+    n_fft: int = 400,
+    win_length: int | None = None,
+    hop_length: int = 160,
+    backend: str = "torchaudio",
+) -> int:
+    if num_samples <= 0 or sample_rate <= 0 or target_sample_rate <= 0:
+        return 0
+    if hop_length <= 0:
+        raise ValueError(f"hop_length must be > 0, got {hop_length}.")
+    effective_samples = int(num_samples)
+    if sample_rate != target_sample_rate:
+        effective_samples = max(
+            1,
+            int(math.ceil((effective_samples * target_sample_rate) / sample_rate)),
+        )
+    analysis_window = max(int(n_fft), int(win_length if win_length is not None else n_fft))
+    effective_samples = max(effective_samples, analysis_window)
+    if backend == "torchaudio":
+        # torchaudio's MelSpectrogram uses centered STFT by default, adding n_fft // 2
+        # samples of padding on both sides. With no additional explicit padding this gives
+        # floor(num_samples / hop_length) + 1 frames after our minimum-length padding.
+        return max(1, (effective_samples // hop_length) + 1)
+    return max(1, int(effective_samples / hop_length))
+
+
 def zipformer_paper_featurizer_config(
     overrides: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
@@ -157,6 +187,17 @@ class AudioFeaturizer(torch.nn.Module):
                 std = features.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-5)
             features = (features - mean) / std
         return features
+
+    def estimate_num_frames(self, num_samples: int, sample_rate: int) -> int:
+        return estimate_num_feature_frames(
+            num_samples,
+            sample_rate=sample_rate,
+            target_sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            backend=self.backend,
+        )
 
     def config_dict(self) -> dict[str, object]:
         return {

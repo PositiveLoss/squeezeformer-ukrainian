@@ -25,13 +25,24 @@ from torch.nn import functional as F
 from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
 
 from .asr import Tokenizer
-from .frontend import AudioFeaturizer, SpecAugment, WaveformAugment
+from .frontend import (
+    AudioFeaturizer,
+    SpecAugment,
+    WaveformAugment,
+    estimate_num_feature_frames,
+)
 
 TRANSCRIPT_COLUMNS = ("sentence", "transcript", "transcription", "text", "normalized_text")
 AUDIO_COLUMNS = ("path", "audio")
 
 
 logger = logging.getLogger("train")
+
+_DEFAULT_FEATURE_SAMPLE_RATE = 16_000
+_DEFAULT_FEATURE_N_FFT = 400
+_DEFAULT_FEATURE_WIN_LENGTH = 400
+_DEFAULT_FEATURE_HOP_LENGTH = 160
+_DEFAULT_FEATURE_BACKEND = "torchaudio"
 
 
 def _epoch_shuffled_order(length: int, *, seed: int, epoch: int) -> list[int]:
@@ -223,6 +234,28 @@ class AudioRecord:
     has_speaker_id: bool = False
     num_samples: int = 0
     sample_rate: int = 0
+
+
+def estimate_feature_frames_from_metadata(
+    num_samples: int,
+    sample_rate: int,
+    *,
+    hop_length: int = _DEFAULT_FEATURE_HOP_LENGTH,
+    featurizer: AudioFeaturizer | None = None,
+) -> int:
+    if num_samples <= 0 or sample_rate <= 0:
+        return 0
+    if featurizer is not None:
+        return featurizer.estimate_num_frames(num_samples, sample_rate)
+    return estimate_num_feature_frames(
+        num_samples,
+        sample_rate=sample_rate,
+        target_sample_rate=_DEFAULT_FEATURE_SAMPLE_RATE,
+        n_fft=_DEFAULT_FEATURE_N_FFT,
+        win_length=_DEFAULT_FEATURE_WIN_LENGTH,
+        hop_length=hop_length,
+        backend=_DEFAULT_FEATURE_BACKEND,
+    )
 
 
 def normalize_transcript(text: str, lowercase: bool = True) -> str:
@@ -657,7 +690,12 @@ def _build_cv_record(
     utterance_id = str(row.get("id") or audio_path or scanned_rows)
     raw_speaker_id = row.get("client_id") or row.get("speaker_id") or row.get("speaker")
     speaker_id = str(raw_speaker_id) if raw_speaker_id not in {None, ""} else None
-    estimated_frames = max(1, int((duration_seconds * 16000) / 160))
+    num_samples = max(1, int(round(duration_seconds * _DEFAULT_FEATURE_SAMPLE_RATE)))
+    estimated_frames = estimate_feature_frames_from_metadata(
+        num_samples,
+        _DEFAULT_FEATURE_SAMPLE_RATE,
+        hop_length=_DEFAULT_FEATURE_HOP_LENGTH,
+    )
     return AudioRecord(
         audio_path=audio_path,
         audio_bytes=audio_bytes,
@@ -666,8 +704,8 @@ def _build_cv_record(
         speaker_id=speaker_id,
         has_speaker_id=speaker_id is not None,
         estimated_frames=estimated_frames,
-        num_samples=max(1, int(round(duration_seconds * 16_000))),
-        sample_rate=16_000,
+        num_samples=num_samples,
+        sample_rate=_DEFAULT_FEATURE_SAMPLE_RATE,
     )
 
 
@@ -1591,15 +1629,25 @@ def prevalidate_records(
     return validated_records
 
 
-def estimate_record_frames(record: AudioRecord, hop_length: int) -> int:
-    if record.estimated_frames > 0 and record.num_samples > 0 and record.sample_rate > 0:
-        return record.estimated_frames
-    num_samples, sample_rate = probe_audio_metadata(record.audio_path, record.audio_bytes)
+def estimate_record_frames(
+    record: AudioRecord,
+    hop_length: int,
+    featurizer: AudioFeaturizer | None = None,
+) -> int:
+    num_samples = int(record.num_samples)
+    sample_rate = int(record.sample_rate)
     if num_samples <= 0 or sample_rate <= 0:
-        return 0
+        num_samples, sample_rate = probe_audio_metadata(record.audio_path, record.audio_bytes)
+    if num_samples <= 0 or sample_rate <= 0:
+        return max(0, int(record.estimated_frames))
     object.__setattr__(record, "num_samples", num_samples)
     object.__setattr__(record, "sample_rate", sample_rate)
-    estimated_frames = max(1, int(num_samples / hop_length))
+    estimated_frames = estimate_feature_frames_from_metadata(
+        num_samples,
+        sample_rate,
+        hop_length=hop_length,
+        featurizer=featurizer,
+    )
     object.__setattr__(record, "estimated_frames", estimated_frames)
     return estimated_frames
 
@@ -1608,9 +1656,10 @@ def materialize_record_metadata(
     records: list[AudioRecord],
     hop_length: int,
     num_workers: int = 4,
+    featurizer: AudioFeaturizer | None = None,
 ) -> list[AudioRecord]:
     def populate(record: AudioRecord) -> AudioRecord:
-        estimate_record_frames(record, hop_length=hop_length)
+        estimate_record_frames(record, hop_length=hop_length, featurizer=featurizer)
         return record
 
     if num_workers <= 1:
@@ -1703,12 +1752,14 @@ def create_dataloader(
         dataset.records.populate_metadata(
             hop_length=dataset.featurizer.hop_length,
             num_workers=metadata_workers,
+            featurizer=dataset.featurizer,
         )
     else:
         materialize_record_metadata(
             dataset.records,
             hop_length=dataset.featurizer.hop_length,
             num_workers=metadata_workers,
+            featurizer=dataset.featurizer,
         )
     dataloader_kwargs = {
         "num_workers": num_workers,

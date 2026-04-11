@@ -16,8 +16,10 @@ import torch
 import torch.distributed as dist
 
 from squeezeformer_pytorch.data import (
+    AudioFeaturizer,
     AudioRecord,
     download_dataset,
+    estimate_feature_frames_from_metadata,
     iter_records,
     iter_records_from_source,
     load_audio,
@@ -188,7 +190,26 @@ class DiskBackedRecordStore:
             count=local_count,
         )
 
-    def populate_metadata(self, hop_length: int, num_workers: int = 4) -> None:
+    def populate_metadata(
+        self,
+        hop_length: int,
+        num_workers: int = 4,
+        featurizer: AudioFeaturizer | None = None,
+    ) -> None:
+        if self.num_samples is not None and self.sample_rates is not None:
+            for index in range(len(self)):
+                global_index = self._global_index(index)
+                num_samples = int(self.num_samples[global_index])
+                sample_rate = int(self.sample_rates[global_index])
+                if num_samples <= 0 or sample_rate <= 0:
+                    continue
+                frames = estimate_feature_frames_from_metadata(
+                    num_samples,
+                    sample_rate,
+                    hop_length=hop_length,
+                    featurizer=featurizer,
+                )
+                self.estimated_frames[global_index] = max(0, int(frames))
         global_indices = [
             self._global_index(index)
             for index in range(len(self))
@@ -212,8 +233,11 @@ class DiskBackedRecordStore:
                 handle.close()
             audio_bytes = _load_cached_audio_bytes(payload, records_path=self.records_path)
             num_samples, sample_rate = probe_audio_metadata(payload["audio_path"], audio_bytes)
-            frames = (
-                max(1, int(num_samples / hop_length)) if num_samples > 0 and sample_rate > 0 else 0
+            frames = estimate_feature_frames_from_metadata(
+                num_samples,
+                sample_rate,
+                hop_length=hop_length,
+                featurizer=featurizer,
             )
             return global_index, frames, num_samples, sample_rate
 
@@ -896,6 +920,28 @@ def _record_store_duration_hours(
 ) -> float:
     if sample_rate <= 0:
         return 0.0
+    if (
+        hasattr(records, "num_samples")
+        and getattr(records, "num_samples") is not None
+        and hasattr(records, "sample_rates")
+        and getattr(records, "sample_rates") is not None
+    ):
+        total_seconds = 0.0
+        for num_samples, record_sample_rate in zip(
+            records.num_samples,
+            records.sample_rates,
+            strict=True,
+        ):
+            if int(num_samples) > 0 and int(record_sample_rate) > 0:
+                total_seconds += int(num_samples) / int(record_sample_rate)
+        return total_seconds / 3600.0
+    if not hasattr(records, "estimated_frames") and all(
+        int(record.num_samples) > 0 and int(record.sample_rate) > 0 for record in records
+    ):
+        total_seconds = sum(
+            int(record.num_samples) / int(record.sample_rate) for record in records
+        )
+        return total_seconds / 3600.0
     total_frames = 0
     if hasattr(records, "estimated_frames"):
         total_frames = sum(int(value) for value in records.estimated_frames)
