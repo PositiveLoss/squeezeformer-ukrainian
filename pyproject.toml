@@ -10,22 +10,41 @@ dependencies = [
     "kernels>=0.12.3",
     "safetensors>=0.6.2",
     "sentencepiece>=0.2.0",
-    "torch",
-    "torchaudio",
+    "torch>=2.9.0,<=2.11.0",
+    "torchaudio>=2.9.0,<=2.11.0",
     "torchcodec>=0.11.0",
 ]
 
 [project.scripts]
 squeezeformer-torchrun = "squeezeformer_pytorch.training.torchrun_launcher:main"
 
+[tool.uv]
+conflicts = [
+    [
+        { group = "cu12" },
+        { group = "cu13" },
+    ],
+]
+
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
+torch = [
+    { index = "pytorch-cu128", group = "cu12" },
+    { index = "pytorch-cu130", group = "cu13" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", group = "cu12" },
+    { index = "pytorch-cu130", group = "cu13" },
+]
 
 [project.optional-dependencies]
 jax = [
@@ -43,7 +62,6 @@ fp8 = [
 train = [
     "pytorch-optimizer>=3.10.0",
     "jiwer>=4.0.0",
-    "nvidia-npp>=13.1.0.44",
     "polars[rtcompat]>=1.39.3",
     "torchcodec>=0.11.0",
     "trackio>=0.20.2",
@@ -70,4 +88,14 @@ ignore = ["E501"]
 dev = [
     "pytest>=9.0.2",
     "ruff>=0.15.8",
+]
+cu12 = [
+    "nvidia-npp-cu12>=12.4.1.87",
+    "torch>=2.9.0,<=2.11.0",
+    "torchaudio>=2.9.0,<=2.11.0",
+]
+cu13 = [
+    "nvidia-npp>=13.1.0.44",
+    "torch>=2.9.0,<=2.11.0",
+    "torchaudio>=2.9.0,<=2.11.0",
 ]
