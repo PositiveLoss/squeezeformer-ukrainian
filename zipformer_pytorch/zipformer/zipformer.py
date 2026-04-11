@@ -408,7 +408,6 @@ class Upsample(nn.Module):
         if factor not in {1, 2}:
             raise ValueError(f"Upsample factor must be 1 or 2, got {factor}.")
         self.factor = factor
-        self.register_parameter("bias", None)
 
     def _upsample(
         self,
@@ -423,22 +422,11 @@ class Upsample(nn.Module):
             return x[:, :target_length], None if mask is None else mask[:, :target_length]
 
         if self.factor > 1:
-            bias = self.bias
-            if bias is None or bias.size(1) != x.size(-1):
-                bias = torch.zeros(
-                    self.factor,
-                    x.size(-1),
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-            else:
-                bias = bias.to(device=x.device, dtype=x.dtype)
             y = (
                 x.unsqueeze(2)
                 .expand(x.size(0), x.size(1), self.factor, x.size(2))
                 .reshape(x.size(0), x.size(1) * self.factor, x.size(2))
             )
-            y = y + bias.unsqueeze(0).repeat(1, x.size(1), 1).reshape(1, -1, x.size(2))
         output_mask = None if mask is None else mask.repeat_interleave(self.factor, dim=1)
         if target_length is not None:
             y = y[:, :target_length]
@@ -485,7 +473,7 @@ class PairwiseDownsample(nn.Module):
 
 
 class PairwiseUpsample(nn.Module):
-    def __init__(self, factor: int, num_channels: int) -> None:
+    def __init__(self, factor: int) -> None:
         super().__init__()
         if factor < 1 or factor & (factor - 1):
             raise ValueError(
@@ -494,8 +482,6 @@ class PairwiseUpsample(nn.Module):
         self.factor = factor
         levels = int(math.log2(factor))
         self.stages = nn.ModuleList([Upsample(2) for _ in range(levels)])
-        for stage in self.stages:
-            stage.bias = nn.Parameter(torch.randn(2, num_channels) * 0.01)
 
     def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
@@ -895,7 +881,7 @@ class DownsampledZipformerStack(nn.Module):
         super().__init__()
         self.downsample = PairwiseDownsample(downsample)
         self.stack = stack
-        self.upsample = PairwiseUpsample(downsample, dim)
+        self.upsample = PairwiseUpsample(downsample)
         self.output_bypass = BypassModule(dim)
 
     def forward(self, x: Tensor, mask: Tensor) -> Tensor:

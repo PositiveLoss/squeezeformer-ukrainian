@@ -60,7 +60,8 @@ def test_zipformer_ctc_returns_training_outputs_with_main_log_probs() -> None:
     assert outputs["output_lengths"].tolist() == [3, 3]
     assert outputs["main_log_probs"].shape == (2, 3, 6)
     assert outputs["main_ctc_loss"] is not None
-    assert outputs["intermediate_ctc_losses"] == {}
+    assert "intermediate_ctc_losses" not in outputs
+    assert "intermediate_ctc_diagnostics" not in outputs
 
 
 def test_zipformer_transducer_returns_pruned_loss_and_backward_runs() -> None:
@@ -91,6 +92,8 @@ def test_zipformer_transducer_returns_pruned_loss_and_backward_runs() -> None:
     loss = outputs["pruned_transducer_loss"]
     assert loss is not None
     assert torch.isfinite(loss)
+    assert "intermediate_ctc_losses" not in outputs
+    assert "intermediate_ctc_diagnostics" not in outputs
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
 
@@ -161,15 +164,21 @@ def test_zipformer_variants_match_paper_scale_ladder() -> None:
 
     assert s.encoder_dim == (192, 256, 256, 256, 256, 256)
     assert s.num_encoder_layers == (2, 2, 2, 2, 2, 2)
+    assert s.num_heads == (4, 4, 4, 8, 4, 4)
     assert s.feedforward_dim == (512, 768, 768, 768, 768, 768)
+    assert s.cnn_module_kernel == (31, 31, 15, 15, 15, 31)
 
     assert m.encoder_dim == (192, 256, 384, 512, 384, 256)
     assert m.num_encoder_layers == (2, 2, 3, 4, 3, 2)
+    assert m.num_heads == (4, 4, 4, 8, 4, 4)
     assert m.feedforward_dim == (512, 768, 1024, 1536, 1024, 768)
+    assert m.cnn_module_kernel == (31, 31, 15, 15, 15, 31)
 
     assert large.encoder_dim == (192, 256, 512, 768, 512, 256)
     assert large.num_encoder_layers == (2, 2, 4, 5, 4, 2)
+    assert large.num_heads == (4, 4, 4, 8, 4, 4)
     assert large.feedforward_dim == (512, 768, 1536, 2048, 1536, 768)
+    assert large.cnn_module_kernel == (31, 31, 15, 15, 15, 31)
 
     assert zipformer_variant("sm") == m
     assert zipformer_variant("ml") == large
@@ -204,6 +213,34 @@ def test_zipformer_uses_pairwise_resampling_for_reduced_rate_stacks() -> None:
     assert isinstance(stack8, DownsampledZipformerStack)
     assert len(stack8.downsample.stages) == 3
     assert len(stack8.upsample.stages) == 3
+
+
+def test_zipformer_upsample_repeats_frames_without_trainable_bias() -> None:
+    upsample = PairwiseUpsample(4)
+    x = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    mask = torch.tensor([[True, False]])
+
+    y, y_mask = upsample.apply_masked(x, mask, target_length=7)
+
+    assert sum(parameter.numel() for parameter in upsample.parameters()) == 0
+    assert y.shape == (1, 7, 2)
+    assert y_mask.tolist() == [[True, True, True, True, False, False, False]]
+    assert torch.equal(
+        y,
+        torch.tensor(
+            [
+                [
+                    [1.0, 2.0],
+                    [1.0, 2.0],
+                    [1.0, 2.0],
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [3.0, 4.0],
+                    [3.0, 4.0],
+                ]
+            ]
+        ),
+    )
 
 
 def test_zipformer_blocks_include_balancers_and_whiteners() -> None:

@@ -93,7 +93,7 @@ ZIPFORMER_VARIANTS = {
     "s": ZipformerConfig(
         encoder_dim=(192, 256, 256, 256, 256, 256),
         num_encoder_layers=(2, 2, 2, 2, 2, 2),
-        num_heads=(4, 4, 4, 4, 4, 4),
+        num_heads=(4, 4, 4, 8, 4, 4),
         query_head_dim=(32,),
         value_head_dim=(12,),
         feedforward_dim=(512, 768, 768, 768, 768, 768),
@@ -103,7 +103,7 @@ ZIPFORMER_VARIANTS = {
     "l": ZipformerConfig(
         encoder_dim=(192, 256, 512, 768, 512, 256),
         num_encoder_layers=(2, 2, 4, 5, 4, 2),
-        num_heads=(4, 4, 8, 8, 8, 4),
+        num_heads=(4, 4, 4, 8, 4, 4),
         query_head_dim=(32,),
         value_head_dim=(12,),
         feedforward_dim=(512, 768, 1536, 2048, 1536, 768),
@@ -180,7 +180,6 @@ class ZipformerCTC(nn.Module):
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
-        self.intermediate_ctc_layers: tuple[int, ...] = ()
         self.aed_decoder = None
         self.audio_teacher_target = audio_teacher_target
 
@@ -258,8 +257,6 @@ class ZipformerCTC(nn.Module):
             "encoded": encoded,
             "output_lengths": output_lengths,
             "main_ctc_loss": None,
-            "intermediate_ctc_losses": {},
-            "intermediate_ctc_diagnostics": {},
         }
         main_log_probs = self._ctc_log_softmax(logits)
         if targets is not None and target_lengths is not None and blank_id is not None:
@@ -315,7 +312,6 @@ class ZipformerTransducer(nn.Module):
         self.prune_range = int(prune_range)
         self.joiner_chunk_size = max(1, int(joiner_chunk_size))
         self.audio_teacher_target = audio_teacher_target
-        self.intermediate_ctc_layers: tuple[int, ...] = ()
         self.aed_decoder = None
 
         self.encoder = ZipformerEncoder(encoder_config)
@@ -550,8 +546,6 @@ class ZipformerTransducer(nn.Module):
             "encoded": encoded,
             "output_lengths": output_lengths,
             "main_ctc_loss": None,
-            "intermediate_ctc_losses": {},
-            "intermediate_ctc_diagnostics": {},
             "main_logits": None,
             "main_log_probs": None,
             "pruned_transducer_loss": None,
