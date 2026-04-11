@@ -1223,6 +1223,52 @@ def test_upload_checkpoint_folder_to_hf_uses_cli_options(
     assert calls[0]["token"] == "upload-token"
 
 
+def test_initialize_hf_checkpoint_repository_creates_repo_with_upload_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeHfApi:
+        def create_repo(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(train, "HfApi", lambda: FakeHfApi())
+
+    args = type(
+        "Args",
+        (),
+        {
+            "hf_upload_checkpoints": True,
+            "hf_upload_repo_id": "speech-uk/checkpoints",
+            "hf_upload_repo_type": "model",
+            "hf_upload_path_in_repo": "runs/demo",
+            "hf_upload_checkpoint_format": "all",
+            "hf_upload_create_repo": True,
+            "hf_upload_private": True,
+            "hf_upload_fail_on_error": True,
+            "hf_upload_token": "upload-token",
+            "hf_token": "dataset-token",
+        },
+    )()
+
+    train._initialize_hf_checkpoint_repository(
+        args,
+        output_dir=tmp_path,
+        logger=logging.getLogger("test"),
+    )
+
+    assert calls == [
+        {
+            "repo_id": "speech-uk/checkpoints",
+            "token": "upload-token",
+            "private": True,
+            "repo_type": None,
+            "exist_ok": True,
+        }
+    ]
+
+
 def test_hf_upload_checkpoint_format_pt_ignores_safetensors_artifacts() -> None:
     args = type(
         "Args",

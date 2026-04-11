@@ -305,7 +305,7 @@ def _hf_upload_ignore_patterns(args) -> list[str]:
     return patterns
 
 
-def _prepare_hf_checkpoint_upload(
+def _initialize_hf_checkpoint_repository(
     args,
     *,
     output_dir: Path,
@@ -349,7 +349,7 @@ def _prepare_hf_checkpoint_upload(
         return
 
     logger.info(
-        "hugging face checkpoint upload enabled repo_id=%s repo_type=%s path_in_repo=%s checkpoint_format=%s folder=%s",
+        "hugging face checkpoint repository initialized repo_id=%s repo_type=%s path_in_repo=%s checkpoint_format=%s folder=%s",
         repo_id,
         repo_type or "model",
         _hf_upload_path_in_repo(args) or ".",
@@ -1124,7 +1124,7 @@ def main() -> None:
             project=args.trackio_project,
         )
     if is_main_process:
-        _prepare_hf_checkpoint_upload(args, output_dir=output_dir, logger=logger)
+        _initialize_hf_checkpoint_repository(args, output_dir=output_dir, logger=logger)
     resume_path = _resolve_resume_checkpoint_path(args, output_dir=output_dir, logger=logger)
     logger.info(
         "starting training variant=%s zipformer_requested=%s device=%s distributed=%s world_size=%s output_dir=%s",
