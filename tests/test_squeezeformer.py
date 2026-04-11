@@ -28,7 +28,6 @@ from squeezeformer_pytorch.asr import (
     CharacterTokenizer,
     _logaddexp,
     load_lm_scorer,
-    prune_encoder_frames_by_blank_probability,
 )
 from squeezeformer_pytorch.checkpoints import load_checkpoint, save_checkpoint
 from squeezeformer_pytorch.data import (
@@ -587,32 +586,25 @@ def test_convolution_module_masks_padded_suffix_before_batch_norm_statistics() -
 
 
 @torch.no_grad()
-def test_all_ctc_heads_default_to_zero_blank_bias() -> None:
+def test_ctc_head_defaults_to_zero_blank_bias() -> None:
     model = SqueezeformerCTC(
         encoder_config=squeezeformer_variant("xs"),
         vocab_size=16,
-        intermediate_ctc_layers=(1, 3),
     )
 
     assert torch.isclose(model.classifier.bias[0], torch.tensor(0.0))
     assert torch.count_nonzero(model.classifier.bias[1:]) == 0
-    for classifier in model.intermediate_classifiers.values():
-        assert torch.isclose(classifier.bias[0], torch.tensor(0.0))
-        assert torch.count_nonzero(classifier.bias[1:]) == 0
 
 
 @torch.no_grad()
-def test_initial_ctc_blank_bias_applies_to_all_ctc_heads() -> None:
+def test_initial_ctc_blank_bias_applies_to_ctc_head() -> None:
     model = SqueezeformerCTC(
         encoder_config=squeezeformer_variant("xs"),
         vocab_size=16,
-        intermediate_ctc_layers=(1, 3),
         initial_ctc_blank_bias=-0.5,
     )
 
     assert torch.isclose(model.classifier.bias[0], torch.tensor(-0.5))
-    for classifier in model.intermediate_classifiers.values():
-        assert torch.isclose(classifier.bias[0], torch.tensor(-0.5))
 
 
 def test_ctc_length_diagnostics_count_repeated_adjacent_targets() -> None:
@@ -632,20 +624,6 @@ def test_ctc_length_diagnostics_count_repeated_adjacent_targets() -> None:
     assert torch.equal(minimum_lengths, torch.tensor([4, 4], dtype=torch.long))
     assert diagnostics["impossible_sample_count"] == 1.0
     assert diagnostics["tight_sample_count"] == 2.0
-
-
-@torch.no_grad()
-def test_identical_initial_ctc_heads_copy_main_head_weights_to_auxiliary_heads() -> None:
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=16,
-        intermediate_ctc_layers=(1, 3),
-        identical_initial_ctc_heads=True,
-    )
-
-    for classifier in model.intermediate_classifiers.values():
-        assert torch.equal(model.classifier.weight, classifier.weight)
-        assert torch.equal(model.classifier.bias, classifier.bias)
 
 
 @torch.no_grad()
@@ -808,78 +786,6 @@ def test_encoder_can_return_mid_layer_hidden_state() -> None:
 
 
 @torch.no_grad()
-def test_ctc_model_can_emit_intermediate_log_probs_for_multiple_heads(tmp_path: Path) -> None:
-    tokenizer = SentencePieceTokenizer.train(
-        ["привіт світе", "це короткий тест", "мовна модель"],
-        model_prefix=tmp_path / "test_intermediate_spm",
-        vocab_size=24,
-    )
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=tokenizer.vocab_size,
-        intermediate_ctc_layers=(4, 7),
-    )
-    model.eval()
-    lengths = torch.tensor([160, 123], dtype=torch.int64)
-    features = torch.randn(2, int(lengths.max().item()), 80)
-
-    (
-        log_probs,
-        output_lengths,
-        intermediate_log_probs,
-        intermediate_output_lengths,
-    ) = model.log_probs_with_intermediate(features, lengths)
-
-    assert log_probs.shape[:2] == (2, int(output_lengths.max().item()))
-    assert set(intermediate_log_probs) == {4, 7}
-    assert set(intermediate_output_lengths) == {4, 7}
-    assert intermediate_log_probs[4].shape[:2] == (
-        2,
-        int(intermediate_output_lengths[4].max().item()),
-    )
-    assert intermediate_log_probs[7].shape[:2] == (
-        2,
-        int(intermediate_output_lengths[7].max().item()),
-    )
-    assert intermediate_log_probs[4].shape[-1] == tokenizer.vocab_size
-    assert intermediate_log_probs[7].shape[-1] == tokenizer.vocab_size
-    assert torch.isfinite(log_probs).all()
-    assert torch.isfinite(intermediate_log_probs[4]).all()
-    assert torch.isfinite(intermediate_log_probs[7]).all()
-
-
-def test_training_outputs_include_intermediate_blank_diagnostics() -> None:
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=8,
-        intermediate_ctc_layers=(1, 3),
-    )
-    features = torch.randn(2, 160, 80)
-    feature_lengths = torch.tensor([160, 123], dtype=torch.int64)
-    targets = torch.tensor([1, 2, 3, 1, 2], dtype=torch.long)
-    target_lengths = torch.tensor([3, 2], dtype=torch.long)
-
-    outputs = model(
-        features,
-        feature_lengths,
-        return_training_outputs=True,
-        targets=targets,
-        target_lengths=target_lengths,
-        blank_id=0,
-    )
-
-    layer_diagnostics = outputs["intermediate_ctc_diagnostics"]
-    assert set(layer_diagnostics) == {1, 3}
-    for diagnostics in layer_diagnostics.values():
-        assert "blank_probability_sum" in diagnostics
-        assert "argmax_blank_frames" in diagnostics
-        assert "top_nonblank_probability_sum" in diagnostics
-        assert "blank_logit_sum" in diagnostics
-        assert "blank_nonblank_margin_sum" in diagnostics
-        assert "entropy_sum" in diagnostics
-
-
-@torch.no_grad()
 def test_ctc_model_can_emit_training_only_aed_logits() -> None:
     model = SqueezeformerCTC(
         encoder_config=squeezeformer_variant("xs"),
@@ -913,33 +819,6 @@ def test_ctc_model_can_emit_training_only_aed_logits() -> None:
     assert torch.isfinite(projected).all()
 
 
-def test_blank_probability_pruning_keeps_minimum_frames() -> None:
-    x = torch.arange(2 * 4 * 3, dtype=torch.float32).view(2, 4, 3)
-    lengths = torch.tensor([4, 3], dtype=torch.int64)
-    blank_probabilities = torch.tensor(
-        [
-            [0.99, 0.98, 0.10, 0.97],
-            [0.95, 0.94, 0.93, 0.10],
-        ],
-        dtype=torch.float32,
-    )
-
-    pruned_x, pruned_lengths = prune_encoder_frames_by_blank_probability(
-        x,
-        lengths,
-        blank_probabilities,
-        threshold=0.5,
-        min_keep_frames=2,
-    )
-
-    assert torch.equal(pruned_lengths, torch.tensor([2, 2]))
-    assert pruned_x.shape == (2, 2, 3)
-    assert torch.equal(pruned_x[0, 0], x[0, 0])
-    assert torch.equal(pruned_x[0, 1], x[0, 2])
-    assert torch.equal(pruned_x[1, 0], x[1, 1])
-    assert torch.equal(pruned_x[1, 1], x[1, 2])
-
-
 def test_sequence_mask_helpers_share_consistent_semantics() -> None:
     lengths = torch.tensor([3, 1], dtype=torch.int64)
 
@@ -957,55 +836,6 @@ def test_sequence_mask_helpers_share_consistent_semantics() -> None:
         sequence_mask[0].unsqueeze(0) & sequence_mask[0].unsqueeze(1),
     )
     assert not attention_mask[1, 1, 1]
-
-
-@torch.no_grad()
-def test_ctc_blank_pruning_shortens_reduced_region() -> None:
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=6,
-        blank_prune_layer=7,
-        blank_prune_threshold=0.6,
-        blank_prune_min_keep_frames=1,
-    )
-    model.eval()
-    blank_head = model.intermediate_classifiers["7"]
-    blank_head.weight.zero_()
-    blank_head.bias.fill_(-5.0)
-    blank_head.bias[0] = 5.0
-
-    lengths = torch.tensor([160, 123], dtype=torch.int64)
-    features = torch.randn(2, int(lengths.max().item()), 80)
-    _, _, intermediate_xs, intermediate_lengths = model.encoder.forward_with_intermediates(
-        features,
-        lengths,
-        intermediate_layer_indices=(8,),
-        post_block_transforms=model._post_block_transforms(),
-    )
-
-    assert intermediate_xs[8].shape[1] == 1
-    assert torch.equal(intermediate_lengths[8], torch.tensor([1, 1]))
-
-
-@torch.no_grad()
-def test_ctc_blank_pruning_respects_supervised_target_lengths() -> None:
-    features = torch.randn(2, 10, 4)
-    lengths = torch.tensor([10, 8], dtype=torch.int64)
-    blank_probabilities = torch.full((2, 10), 0.99)
-    blank_probabilities[1, 8:] = 0.0
-    minimum_required_lengths = torch.tensor([4, 3], dtype=torch.int64)
-
-    pruned, pruned_lengths = prune_encoder_frames_by_blank_probability(
-        features,
-        lengths,
-        blank_probabilities,
-        threshold=0.6,
-        min_keep_frames=1,
-        minimum_required_lengths=minimum_required_lengths,
-    )
-
-    assert pruned.shape == (2, 4, 4)
-    assert torch.equal(pruned_lengths, minimum_required_lengths)
 
 
 def test_variant_table_matches_paper() -> None:

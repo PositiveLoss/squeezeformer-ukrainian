@@ -158,7 +158,7 @@ def test_zipformer_encoder_masks_padding_inside_blocks() -> None:
 def test_zipformer_variants_match_paper_scale_ladder() -> None:
     s = zipformer_variant("s")
     m = zipformer_variant("m")
-    l = zipformer_variant("l")
+    large = zipformer_variant("l")
 
     assert s.encoder_dim == (192, 256, 256, 256, 256, 256)
     assert s.num_encoder_layers == (2, 2, 2, 2, 2, 2)
@@ -168,12 +168,12 @@ def test_zipformer_variants_match_paper_scale_ladder() -> None:
     assert m.num_encoder_layers == (2, 2, 3, 4, 3, 2)
     assert m.feedforward_dim == (512, 768, 1024, 1536, 1024, 768)
 
-    assert l.encoder_dim == (192, 256, 512, 768, 512, 256)
-    assert l.num_encoder_layers == (2, 2, 4, 5, 4, 2)
-    assert l.feedforward_dim == (512, 768, 1536, 2048, 1536, 768)
+    assert large.encoder_dim == (192, 256, 512, 768, 512, 256)
+    assert large.num_encoder_layers == (2, 2, 4, 5, 4, 2)
+    assert large.feedforward_dim == (512, 768, 1536, 2048, 1536, 768)
 
     assert zipformer_variant("sm") == m
-    assert zipformer_variant("ml") == l
+    assert zipformer_variant("ml") == large
 
 
 def test_zipformer_uses_pairwise_resampling_for_reduced_rate_stacks() -> None:

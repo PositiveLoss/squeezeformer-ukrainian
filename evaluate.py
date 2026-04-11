@@ -250,12 +250,7 @@ def main() -> None:
         model = SqueezeformerCTC(
             encoder_config=encoder_config,
             vocab_size=tokenizer.vocab_size,
-            intermediate_ctc_layers=checkpoint_settings["resolved_intermediate_ctc_layers"],
-            blank_prune_layer=checkpoint_settings["blank_prune_layer"],
-            blank_prune_threshold=checkpoint_settings["blank_prune_threshold"],
-            blank_prune_min_keep_frames=checkpoint_settings["blank_prune_min_keep_frames"],
             initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-            identical_initial_ctc_heads=checkpoint_settings["identical_initial_ctc_heads"],
             aed_decoder_enabled=checkpoint_settings["aed_decoder_enabled"],
             aed_decoder_layers=checkpoint_settings["aed_decoder_layers"],
             aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
@@ -378,7 +373,6 @@ def main() -> None:
         lm_weight=args.lm_weight,
         beam_length_bonus=beam_length_bonus,
         example_limit=args.example_limit,
-        intermediate_ctc_weight=checkpoint_settings["intermediate_ctc_weight"],
         aed_loss_weight=checkpoint_settings["aed_loss_weight"],
         liberta_teacher=liberta_teacher,
         liberta_distill_weight=checkpoint_settings["liberta_distill_weight"],
@@ -398,8 +392,6 @@ def main() -> None:
             for name in (
                 "loss",
                 "main_ctc_loss",
-                "intermediate_ctc_loss",
-                "combined_ctc_loss",
                 "aed_loss",
                 "liberta_distill_loss",
             )

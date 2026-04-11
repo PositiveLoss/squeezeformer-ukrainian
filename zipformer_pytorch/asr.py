@@ -19,7 +19,6 @@ from zipformer_pytorch.transducer import (
 )
 from zipformer_pytorch.zipformer import Zipformer
 
-
 _DEFAULT_DOWNSAMPLING = (1, 2, 4, 8, 4, 2)
 _DEFAULT_ENCODER_DIM = (192, 256, 384, 512, 384, 256)
 _DEFAULT_NUM_LAYERS = (2, 2, 3, 4, 3, 2)
@@ -185,9 +184,6 @@ class ZipformerCTC(nn.Module):
         super().__init__()
         self.encoder_config = encoder_config
         self.intermediate_ctc_layers: tuple[int, ...] = ()
-        self.blank_prune_layer = None
-        self.blank_prune_threshold = 0.0
-        self.blank_prune_min_keep_frames = 1
         self.aed_decoder = None
         self.audio_teacher_target = audio_teacher_target
         self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
@@ -362,9 +358,6 @@ class ZipformerTransducer(nn.Module):
         self.joiner_chunk_size = max(1, int(joiner_chunk_size))
         self.audio_teacher_target = audio_teacher_target
         self.intermediate_ctc_layers: tuple[int, ...] = ()
-        self.blank_prune_layer = None
-        self.blank_prune_threshold = 0.0
-        self.blank_prune_min_keep_frames = 1
         self.aed_decoder = None
 
         self.encoder = ZipformerEncoder(encoder_config)

@@ -108,8 +108,6 @@ from squeezeformer_pytorch.training.runtime import (
     _read_proc_status_memory_bytes,
     _resolve_aed_settings,
     _resolve_audio_teacher_settings,
-    _resolve_blank_pruning_settings,
-    _resolve_intermediate_ctc_settings,
     _resolve_liberta_settings,
     _resolve_model_load_dtype,
     _resolve_optimizer_learning_rates,
@@ -348,12 +346,6 @@ def _resolve_zipformer_transducer_usage(
 def _validate_zipformer_runtime_args(args) -> None:
     if args.dtype == DTypeChoice.FP8:
         raise ValueError("--zipformer does not support --dtype fp8.")
-    if args.intermediate_ctc is not None or args.intermediate_ctc_layer is not None:
-        raise ValueError("--zipformer does not support intermediate CTC heads.")
-    if args.intermediate_ctc_layers is not None or args.no_intermediate_ctc_layers:
-        raise ValueError("--zipformer does not support intermediate CTC heads.")
-    if args.blank_prune is not None or args.blank_prune_layer is not None:
-        raise ValueError("--zipformer does not support blank pruning.")
     if args.aed_decoder:
         raise ValueError("--zipformer does not support the AED decoder.")
     if args.liberta_distill:
@@ -535,15 +527,20 @@ def _should_warn_on_blank_starvation(
 
 def _decode_train_preview_hypotheses(
     *,
-    decode_source: torch.Tensor,
+    decode_source: torch.Tensor | None = None,
+    log_probs: torch.Tensor | None = None,
     output_lengths: torch.Tensor,
     tokenizer,
     beam_size: int,
     lm_scorer,
     lm_weight: float,
     beam_length_bonus: float,
-    model: nn.Module,
+    model: nn.Module | None = None,
 ) -> tuple[str, str]:
+    if decode_source is None:
+        if log_probs is None:
+            raise ValueError("decode_source is required.")
+        decode_source = log_probs
     preview_source = decode_source[:1]
     preview_output_lengths = output_lengths[:1]
     greedy_hypothesis = decode_batch(
@@ -1223,9 +1220,6 @@ def main() -> None:
             if checkpoint is not None
             else replace(zipformer_variant(args.variant), input_dim=featurizer.n_mels)
         )
-        intermediate_ctc_layers = ()
-        intermediate_ctc_weight = 0.0
-        blank_prune_layer, blank_prune_threshold, blank_prune_min_keep_frames = (None, 0.0, 1)
     else:
         encoder_config = (
             SqueezeformerConfig(**checkpoint["encoder_config"])
@@ -1247,27 +1241,6 @@ def main() -> None:
                 deepcopy(encoder_config),
                 flash_attn2_enabled=False,
             )
-        intermediate_ctc_layers, intermediate_ctc_weight = _resolve_intermediate_ctc_settings(
-            args,
-            encoder_config,
-            checkpoint,
-        )
-        if any(layer == encoder_config.num_layers - 1 for layer in intermediate_ctc_layers):
-            logger.warning(
-                "intermediate CTC layer selection includes the final encoder block %s. "
-                "That auxiliary head will attach to the exact same representation as the main "
-                "CTC head, so it is not true intermediate supervision.",
-                encoder_config.num_layers - 1,
-            )
-        blank_prune_layer, blank_prune_threshold, blank_prune_min_keep_frames = (
-            _resolve_blank_pruning_settings(args, encoder_config, checkpoint)
-        )
-    args.intermediate_ctc_layers = list(intermediate_ctc_layers)
-    args.intermediate_ctc_layer = (
-        intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
-    )
-    args.intermediate_ctc = bool(intermediate_ctc_layers) and intermediate_ctc_weight > 0.0
-    args.intermediate_ctc_weight = intermediate_ctc_weight
     args.aed_decoder = aed_decoder_enabled
     args.aed_decoder_layers = aed_decoder_layers
     args.aed_decoder_heads = aed_decoder_heads
@@ -1287,10 +1260,6 @@ def main() -> None:
     args.audio_teacher_layer = audio_teacher_layer
     args.audio_teacher_sample_rate = audio_teacher_sample_rate
     args.audio_teacher_max_seconds = audio_teacher_max_seconds
-    args.blank_prune = blank_prune_layer is not None and blank_prune_threshold > 0.0
-    args.blank_prune_layer = blank_prune_layer
-    args.blank_prune_threshold = blank_prune_threshold
-    args.blank_prune_min_keep_frames = blank_prune_min_keep_frames
     fp8_recipe = _build_fp8_recipe(args)
     if not use_zipformer and args.dtype == DTypeChoice.FP8:
         _validate_fp8_runtime(device, encoder_config)
@@ -1322,7 +1291,7 @@ def main() -> None:
     )
     stage_start_time = time.perf_counter()
     logger.info(
-        "building model architecture=%s variant=%s dtype=%s compile=%s intermediate_ctc_layers=%s identical_initial_ctc_heads=%s aed=%s liberta=%s audio_teacher=%s blank_prune_layer=%s",
+        "building model architecture=%s variant=%s dtype=%s compile=%s aed=%s liberta=%s audio_teacher=%s",
         (
             "zipformer-transducer"
             if use_zipformer_transducer
@@ -1331,12 +1300,9 @@ def main() -> None:
         args.variant,
         args.dtype,
         args.compile,
-        list(intermediate_ctc_layers),
-        args.identical_initial_ctc_heads,
         aed_decoder_enabled,
         liberta_distill_enabled,
         audio_teacher_enabled,
-        blank_prune_layer,
     )
     if use_zipformer_transducer:
         model = ZipformerTransducer(
@@ -1371,10 +1337,6 @@ def main() -> None:
         model = SqueezeformerCTC(
             encoder_config=encoder_config,
             vocab_size=tokenizer.vocab_size,
-            intermediate_ctc_layers=intermediate_ctc_layers,
-            blank_prune_layer=blank_prune_layer,
-            blank_prune_threshold=blank_prune_threshold,
-            blank_prune_min_keep_frames=blank_prune_min_keep_frames,
             aed_decoder_enabled=aed_decoder_enabled,
             aed_decoder_layers=aed_decoder_layers,
             aed_decoder_heads=aed_decoder_heads,
@@ -1386,7 +1348,6 @@ def main() -> None:
             ),
             audio_teacher_target=audio_teacher_target,
             initial_ctc_blank_bias=args.initial_ctc_blank_bias,
-            identical_initial_ctc_heads=args.identical_initial_ctc_heads,
             blank_logit_offset=args.blank_logit_offset,
             blank_logit_regularization_weight=args.blank_logit_regularization_weight,
             use_transformer_engine=args.dtype == DTypeChoice.FP8,
@@ -1396,12 +1357,7 @@ def main() -> None:
         model.load_state_dict(
             checkpoint.get("resume_model_state_dict", checkpoint["model_state_dict"])
         )
-    ddp_find_unused_parameters = (
-        not use_zipformer
-        and blank_prune_layer is not None
-        and blank_prune_threshold > 0.0
-        and blank_prune_layer not in intermediate_ctc_layers
-    )
+    ddp_find_unused_parameters = False
     if distributed:
         forward_model: nn.Module = DDP(
             model,
@@ -1511,15 +1467,11 @@ def main() -> None:
         global_step = int(checkpoint.get("global_step", 0))
         best_val_wer = float(checkpoint.get("best_val_wer", float("inf")))
         logger.info(
-            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f intermediate_ctc_layers=%s intermediate_ctc_weight=%.3f blank_prune_layer=%s blank_prune_threshold=%.3f",
+            "resumed from %s starting_epoch=%s global_step=%s best_val_wer=%.4f",
             resume_path,
             start_epoch,
             global_step,
             best_val_wer,
-            list(intermediate_ctc_layers),
-            intermediate_ctc_weight,
-            blank_prune_layer,
-            blank_prune_threshold,
         )
 
     if is_main_process:
@@ -1543,14 +1495,6 @@ def main() -> None:
                 "active_optimizers": optimizer_names,
                 "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
                 "featurizer_config": featurizer.config_dict(),
-                "intermediate_ctc_layers": list(intermediate_ctc_layers),
-                "intermediate_ctc_layer": (
-                    intermediate_ctc_layers[0] if len(intermediate_ctc_layers) == 1 else None
-                ),
-                "intermediate_ctc_weight": intermediate_ctc_weight,
-                "blank_prune_layer": blank_prune_layer,
-                "blank_prune_threshold": blank_prune_threshold,
-                "blank_prune_min_keep_frames": blank_prune_min_keep_frames,
                 "split_audit": split_audit,
                 "distributed": distributed,
                 "world_size": world_size,
@@ -1582,7 +1526,6 @@ def main() -> None:
         forward_model.train()
         running_loss = 0.0
         running_main_ctc_loss = 0.0
-        running_intermediate_ctc_loss = 0.0
         running_blank_logit_regularization_loss = 0.0
         running_aed_loss = 0.0
         running_liberta_distill_loss = 0.0
@@ -1681,11 +1624,6 @@ def main() -> None:
                         liberta_lengths=decoder_target_lengths,
                     )
                     main_ctc_loss = forward_outputs["main_ctc_loss"]
-                    intermediate_ctc_losses_map = forward_outputs["intermediate_ctc_losses"]
-                    intermediate_ctc_diagnostics_map = forward_outputs.get(
-                        "intermediate_ctc_diagnostics",
-                        {},
-                    )
                     output_lengths = forward_outputs["output_lengths"]
                     encoded = forward_outputs["encoded"]
                     log_probs = forward_outputs.get("main_log_probs")
@@ -1698,19 +1636,7 @@ def main() -> None:
                     audio_teacher_student_states = forward_outputs.get(
                         "audio_teacher_student_states"
                     )
-                    if intermediate_ctc_losses_map:
-                        intermediate_ctc_loss = torch.stack(
-                            [
-                                intermediate_ctc_losses_map[layer_index]
-                                for layer_index in intermediate_ctc_layers
-                            ]
-                        ).mean()
-                        loss = (
-                            1.0 - intermediate_ctc_weight
-                        ) * main_ctc_loss + intermediate_ctc_weight * intermediate_ctc_loss
-                    else:
-                        intermediate_ctc_loss = None
-                        loss = main_ctc_loss
+                    loss = main_ctc_loss
                     if blank_logit_regularization_loss is not None:
                         loss = loss + (
                             args.blank_logit_regularization_weight * blank_logit_regularization_loss
@@ -1765,12 +1691,6 @@ def main() -> None:
                     audio_teacher_loss = None
                 running_loss += float(loss.item()) * local_batch_size
                 running_main_ctc_loss += float(main_ctc_loss.item()) * local_batch_size
-                running_intermediate_ctc_loss += (
-                    float(
-                        intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
-                    )
-                    * local_batch_size
-                )
                 running_blank_logit_regularization_loss += (
                     float(
                         blank_logit_regularization_loss.item()
@@ -1844,16 +1764,6 @@ def main() -> None:
                     )
                     train_main_ctc_loss_step = _distributed_weighted_mean(
                         float(main_ctc_loss.item()),
-                        weight=local_batch_size,
-                        device=device,
-                        distributed=distributed,
-                    )
-                    train_intermediate_ctc_loss_step = _distributed_weighted_mean(
-                        float(
-                            intermediate_ctc_loss.item()
-                            if intermediate_ctc_loss is not None
-                            else 0.0
-                        ),
                         weight=local_batch_size,
                         device=device,
                         distributed=distributed,
@@ -1973,48 +1883,10 @@ def main() -> None:
                         for name, optimizer in zip(optimizer_names, optimizers, strict=True)
                     }
                     memory_snapshot = _format_memory_snapshot(device)
-                    intermediate_loss_detail = (
-                        " ".join(
-                            f"layer{layer_index}_ctc={float(intermediate_ctc_losses_map[layer_index].item()):.4f}"
-                            for layer_index in sorted(intermediate_ctc_losses_map)
-                        )
-                        if intermediate_ctc_losses_map
-                        else ""
-                    )
-                    intermediate_length_detail = (
-                        " ".join(
-                            (
-                                f"layer{layer_index}_ctc_impossible="
-                                f"{(intermediate_ctc_diagnostics_map[layer_index].get('impossible_sample_count', 0.0) / max(1.0, intermediate_ctc_diagnostics_map[layer_index].get('sample_count', 1.0))):.4f} "
-                                f"layer{layer_index}_ctc_tight="
-                                f"{(intermediate_ctc_diagnostics_map[layer_index].get('tight_sample_count', 0.0) / max(1.0, intermediate_ctc_diagnostics_map[layer_index].get('sample_count', 1.0))):.4f}"
-                            )
-                            for layer_index in sorted(intermediate_ctc_diagnostics_map)
-                        )
-                        if intermediate_ctc_diagnostics_map
-                        else ""
-                    )
-                    intermediate_blank_detail = (
-                        " ".join(
-                            (
-                                f"layer{layer_index}_avg_blank_prob="
-                                f"{summarize_ctc_batch_diagnostics(intermediate_ctc_diagnostics_map[layer_index])['avg_blank_probability']:.4f} "
-                                f"layer{layer_index}_argmax_blank_frac="
-                                f"{summarize_ctc_batch_diagnostics(intermediate_ctc_diagnostics_map[layer_index])['argmax_blank_fraction']:.4f} "
-                                f"layer{layer_index}_avg_top_nonblank_prob="
-                                f"{summarize_ctc_batch_diagnostics(intermediate_ctc_diagnostics_map[layer_index])['avg_top_nonblank_probability']:.4f} "
-                                f"layer{layer_index}_avg_blank_nonblank_margin="
-                                f"{summarize_ctc_logit_diagnostics(intermediate_ctc_diagnostics_map[layer_index])['avg_blank_nonblank_margin']:.4f}"
-                            )
-                            for layer_index in sorted(intermediate_ctc_diagnostics_map)
-                        )
-                        if intermediate_ctc_diagnostics_map
-                        else ""
-                    )
                     logger.info(
                         (
                             "epoch=%s step=%s/%s global_step=%s train_loss=%.4f "
-                            "train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f "
+                            "train_main_ctc_loss=%.4f "
                             "train_blank_logit_regularization_loss=%.4f "
                             "train_aed_loss=%.4f train_liberta_distill_loss=%.4f "
                             "train_audio_teacher_loss=%.4f "
@@ -2032,7 +1904,7 @@ def main() -> None:
                             "train_blank_bias_grad=%.4f train_nonblank_bias_grad_mean=%.4f "
                             "train_encoder_mean=%.4f train_encoder_std=%.4f "
                             "train_encoder_token_l2_norm=%.4f "
-                            "%s %s %s %s %s"
+                            "%s %s"
                         ),
                         epoch,
                         batch_index,
@@ -2040,7 +1912,6 @@ def main() -> None:
                         global_step,
                         train_loss_step,
                         train_main_ctc_loss_step,
-                        train_intermediate_ctc_loss_step,
                         train_blank_logit_regularization_loss_step,
                         train_aed_loss_step,
                         train_liberta_distill_loss_step,
@@ -2069,9 +1940,6 @@ def main() -> None:
                         encoder_stats["avg_mean"],
                         encoder_stats["avg_std"],
                         encoder_stats["avg_token_l2_norm"],
-                        intermediate_loss_detail,
-                        intermediate_length_detail,
-                        intermediate_blank_detail,
                         memory_snapshot,
                         " ".join(f"{name}={value:.6g}" for name, value in learning_rates.items()),
                     )
@@ -2131,7 +1999,6 @@ def main() -> None:
                             "global_step": global_step,
                             "train_loss_step": train_loss_step,
                             "train_main_ctc_loss_step": train_main_ctc_loss_step,
-                            "train_intermediate_ctc_loss_step": train_intermediate_ctc_loss_step,
                             "train_blank_logit_regularization_loss_step": (
                                 train_blank_logit_regularization_loss_step
                             ),
@@ -2214,7 +2081,6 @@ def main() -> None:
                                     "train": {
                                         "loss_step": train_loss_step,
                                         "main_ctc_loss_step": train_main_ctc_loss_step,
-                                        "intermediate_ctc_loss_step": train_intermediate_ctc_loss_step,
                                         "blank_logit_regularization_loss_step": (
                                             train_blank_logit_regularization_loss_step
                                         ),
@@ -2335,12 +2201,6 @@ def main() -> None:
                             device=device,
                             distributed=distributed,
                         ),
-                        "train_intermediate_ctc_loss": _distributed_weighted_mean(
-                            running_intermediate_ctc_loss / max(1.0, running_sample_count),
-                            weight=running_sample_count,
-                            device=device,
-                            distributed=distributed,
-                        ),
                         "train_blank_logit_regularization_loss": _distributed_weighted_mean(
                             running_blank_logit_regularization_loss
                             / max(1.0, running_sample_count),
@@ -2394,7 +2254,6 @@ def main() -> None:
                         lm_weight=args.lm_weight,
                         beam_length_bonus=args.beam_length_bonus,
                         example_limit=args.example_limit,
-                        intermediate_ctc_weight=intermediate_ctc_weight,
                         aed_loss_weight=args.aed_loss_weight,
                         liberta_teacher=liberta_teacher,
                         liberta_distill_weight=args.liberta_distill_weight,
@@ -2432,9 +2291,6 @@ def main() -> None:
 
         local_train_mean = running_loss / max(1.0, running_sample_count)
         local_train_main_ctc_mean = running_main_ctc_loss / max(1.0, running_sample_count)
-        local_train_intermediate_ctc_mean = running_intermediate_ctc_loss / max(
-            1.0, running_sample_count
-        )
         local_train_blank_reg_mean = running_blank_logit_regularization_loss / max(
             1.0, running_sample_count
         )
@@ -2449,12 +2305,6 @@ def main() -> None:
         )
         train_main_ctc_loss = _distributed_weighted_mean(
             local_train_main_ctc_mean,
-            weight=running_sample_count,
-            device=device,
-            distributed=distributed,
-        )
-        train_intermediate_ctc_loss = _distributed_weighted_mean(
-            local_train_intermediate_ctc_mean,
             weight=running_sample_count,
             device=device,
             distributed=distributed,
@@ -2487,11 +2337,10 @@ def main() -> None:
             _distributed_barrier()
         if is_main_process:
             logger.info(
-                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_intermediate_ctc_loss=%.4f train_blank_logit_regularization_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f train_audio_teacher_loss=%.4f elapsed=%s, starting validation",
+                "epoch %s training complete train_loss=%.4f train_main_ctc_loss=%.4f train_blank_logit_regularization_loss=%.4f train_aed_loss=%.4f train_liberta_distill_loss=%.4f train_audio_teacher_loss=%.4f elapsed=%s, starting validation",
                 epoch,
                 train_loss,
                 train_main_ctc_loss,
-                train_intermediate_ctc_loss,
                 train_blank_logit_regularization_loss,
                 train_aed_loss,
                 train_liberta_distill_loss,
@@ -2512,7 +2361,6 @@ def main() -> None:
             lm_weight=args.lm_weight,
             beam_length_bonus=args.beam_length_bonus,
             example_limit=args.example_limit,
-            intermediate_ctc_weight=intermediate_ctc_weight,
             aed_loss_weight=args.aed_loss_weight,
             liberta_teacher=liberta_teacher,
             liberta_distill_weight=args.liberta_distill_weight,
@@ -2524,7 +2372,6 @@ def main() -> None:
             train_metrics={
                 "train_loss": train_loss,
                 "train_main_ctc_loss": train_main_ctc_loss,
-                "train_intermediate_ctc_loss": train_intermediate_ctc_loss,
                 "train_blank_logit_regularization_loss": train_blank_logit_regularization_loss,
                 "train_aed_loss": train_aed_loss,
                 "train_liberta_distill_loss": train_liberta_distill_loss,

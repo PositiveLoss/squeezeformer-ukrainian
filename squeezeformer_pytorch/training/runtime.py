@@ -57,17 +57,32 @@ def _safetensors_path(checkpoint_path: Path) -> Path:
 
 
 def _inference_checkpoint_payload(checkpoint: dict[str, object]) -> dict[str, object]:
+    training_args = dict(checkpoint.get("training_args", {}))
     state_dict = {
         key: value
         for key, value in checkpoint["model_state_dict"].items()
         if not key.startswith("aed_decoder.")
         and not key.startswith("liberta_projection.")
         and not key.startswith("audio_teacher_projection.")
+        and not key.startswith("intermediate_classifier.")
+        and not key.startswith("intermediate_classifiers.")
     }
-    training_args = dict(checkpoint.get("training_args", {}))
     training_args["aed_decoder"] = False
     training_args["liberta_distill"] = False
     training_args["audio_teacher"] = False
+    for key in (
+        "intermediate_ctc",
+        "intermediate_ctc_enabled",
+        "intermediate_ctc_layer",
+        "intermediate_ctc_layers",
+        "intermediate_ctc_weight",
+        "blank_prune",
+        "blank_prune_enabled",
+        "blank_prune_layer",
+        "blank_prune_threshold",
+        "blank_prune_min_keep_frames",
+    ):
+        training_args.pop(key, None)
     return {
         "model_state_dict": state_dict,
         "encoder_config": checkpoint["encoder_config"],
@@ -551,139 +566,6 @@ def _resolve_optimizer_learning_rates(
     else:
         adamw_lr = peak_lr
     return peak_lr, muon_lr, adamw_lr
-
-
-def _parse_intermediate_ctc_layers(value: object) -> tuple[int, ...]:
-    if value is None:
-        return ()
-    if isinstance(value, int):
-        return (value,)
-    if isinstance(value, str):
-        normalized = value.strip()
-        if not normalized:
-            return ()
-        return tuple(int(part.strip()) for part in normalized.split(",") if part.strip())
-    if isinstance(value, (list, tuple)):
-        return tuple(int(item) for item in value)
-    raise TypeError(f"Unsupported intermediate CTC layer specification: {type(value)!r}")
-
-
-def _dedupe_sorted_layers(layers: tuple[int, ...]) -> tuple[int, ...]:
-    return tuple(sorted(set(layers)))
-
-
-def _default_intermediate_ctc_layers(encoder_config: SqueezeformerConfig) -> tuple[int, ...]:
-    if encoder_config.num_layers < 4:
-        return (max(0, encoder_config.num_layers - 1),)
-
-    reduced_time_layers: set[int] = set()
-    for reduce_idx, recover_idx in zip(
-        sorted(encoder_config.time_reduce_idx),
-        sorted(encoder_config.time_recover_idx),
-        strict=False,
-    ):
-        reduced_time_layers.update(range(reduce_idx, recover_idx))
-
-    candidate_layers = tuple(
-        layer_index
-        for layer_index in range(max(1, encoder_config.num_layers))
-        if layer_index not in reduced_time_layers
-    )
-    if not candidate_layers:
-        candidate_layers = tuple(range(max(1, encoder_config.num_layers)))
-
-    if len(candidate_layers) == 1:
-        return candidate_layers
-
-    early_layer = candidate_layers[len(candidate_layers) // 3]
-    late_layer = candidate_layers[-1]
-    if late_layer == encoder_config.num_layers - 1 and len(candidate_layers) > 1:
-        # The main CTC head already supervises the final encoder output. Using
-        # the last block again as an "intermediate" head only adds a duplicate
-        # classifier on the exact same representation, which is not real
-        # intermediate supervision.
-        late_layer = candidate_layers[-2]
-    return _dedupe_sorted_layers((early_layer, late_layer))
-
-
-def _resolve_intermediate_ctc_settings(
-    args: argparse.Namespace,
-    encoder_config: SqueezeformerConfig,
-    checkpoint: dict[str, object] | None,
-) -> tuple[tuple[int, ...], float]:
-    checkpoint_args = checkpoint.get("training_args", {}) if checkpoint is not None else {}
-    checkpoint_enabled = checkpoint_args.get("intermediate_ctc_enabled")
-    checkpoint_weight = checkpoint_args.get("intermediate_ctc_weight")
-    checkpoint_layers = checkpoint_args.get("intermediate_ctc_layers")
-    checkpoint_layer = checkpoint_args.get("intermediate_ctc_layer")
-
-    if getattr(args, "no_intermediate_ctc_layers", False):
-        return (), 0.0
-    if args.intermediate_ctc is False:
-        return (), 0.0
-    if args.intermediate_ctc is None and checkpoint is not None and checkpoint_enabled is False:
-        return (), 0.0
-
-    if checkpoint_weight is not None:
-        weight = float(checkpoint_weight)
-        if checkpoint_layers is not None:
-            layers = _parse_intermediate_ctc_layers(checkpoint_layers)
-        else:
-            layers = _parse_intermediate_ctc_layers(checkpoint_layer)
-    else:
-        weight = float(args.intermediate_ctc_weight)
-        if args.intermediate_ctc_layers is not None:
-            layers = _parse_intermediate_ctc_layers(args.intermediate_ctc_layers)
-        else:
-            layers = _parse_intermediate_ctc_layers(args.intermediate_ctc_layer)
-
-    if weight <= 0.0:
-        return (), 0.0
-    if not layers:
-        layers = _default_intermediate_ctc_layers(encoder_config)
-    layers = _dedupe_sorted_layers(layers)
-    invalid_layers = [layer for layer in layers if not 0 <= layer < encoder_config.num_layers]
-    if invalid_layers:
-        raise ValueError(
-            "--intermediate-ctc-layers must be within encoder block range "
-            f"[0, {encoder_config.num_layers - 1}], got {invalid_layers}."
-        )
-    return layers, weight
-
-
-def _resolve_blank_pruning_settings(
-    args: argparse.Namespace,
-    encoder_config: SqueezeformerConfig,
-    checkpoint: dict[str, object] | None,
-) -> tuple[int | None, float, int]:
-    checkpoint_args = checkpoint.get("training_args", {}) if checkpoint is not None else {}
-    checkpoint_enabled = checkpoint_args.get("blank_prune_enabled")
-    if args.blank_prune is False:
-        return None, 0.0, max(1, int(args.blank_prune_min_keep_frames))
-    if args.blank_prune is None and checkpoint is not None and checkpoint_enabled is False:
-        return None, 0.0, max(1, int(checkpoint_args.get("blank_prune_min_keep_frames", 1)))
-    if "blank_prune_threshold" in checkpoint_args:
-        threshold = float(checkpoint_args.get("blank_prune_threshold", 0.0))
-        layer = checkpoint_args.get("blank_prune_layer")
-        min_keep_frames = int(checkpoint_args.get("blank_prune_min_keep_frames", 1))
-    else:
-        threshold = float(args.blank_prune_threshold)
-        layer = args.blank_prune_layer
-        min_keep_frames = int(args.blank_prune_min_keep_frames)
-
-    if threshold <= 0.0:
-        return None, 0.0, max(1, min_keep_frames)
-    if layer is None:
-        raise ValueError("--blank-prune-layer is required when --blank-prune-threshold > 0.")
-    layer = int(layer)
-    if not 0 <= layer < encoder_config.num_layers:
-        raise ValueError(
-            "--blank-prune-layer must be within encoder block range "
-            f"[0, {encoder_config.num_layers - 1}], got {layer}."
-        )
-    if min_keep_frames < 1:
-        raise ValueError("--blank-prune-min-keep-frames must be at least 1.")
-    return layer, threshold, min_keep_frames
 
 
 def _resolve_aed_settings(

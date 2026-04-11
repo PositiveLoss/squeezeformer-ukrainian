@@ -15,7 +15,7 @@ import trackio
 from torch import nn
 from torch.nn import functional as F
 
-from squeezeformer_pytorch.asr import Tokenizer, ctc_prefix_beam_search
+from squeezeformer_pytorch.asr import SqueezeformerCTC, Tokenizer, ctc_prefix_beam_search
 from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import AudioFeaturizer
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
@@ -451,8 +451,6 @@ def _merge_evaluation_shards(
 ) -> dict[str, object]:
     total_loss = 0.0
     total_main_ctc_loss = 0.0
-    total_intermediate_ctc_loss = 0.0
-    total_combined_ctc_loss = 0.0
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
     total_audio_teacher_loss = 0.0
@@ -466,8 +464,6 @@ def _merge_evaluation_shards(
     total_top_nonblank_probability = 0.0
     total_target_tokens = 0.0
     total_samples = 0.0
-    intermediate_ctc_diagnostics_totals: dict[int, dict[str, float]] = {}
-    intermediate_ctc_diagnostics_totals: dict[int, dict[str, float]] = {}
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -476,8 +472,6 @@ def _merge_evaluation_shards(
     for shard in shards:
         total_loss += float(shard["total_loss"])
         total_main_ctc_loss += float(shard["total_main_ctc_loss"])
-        total_intermediate_ctc_loss += float(shard["total_intermediate_ctc_loss"])
-        total_combined_ctc_loss += float(shard["total_combined_ctc_loss"])
         total_aed_loss += float(shard["total_aed_loss"])
         total_liberta_distill_loss += float(shard["total_liberta_distill_loss"])
         total_audio_teacher_loss += float(shard.get("total_audio_teacher_loss", 0.0))
@@ -491,21 +485,6 @@ def _merge_evaluation_shards(
         total_top_nonblank_probability += float(shard.get("total_top_nonblank_probability", 0.0))
         total_target_tokens += float(shard.get("total_target_tokens", 0.0))
         total_samples += float(shard.get("total_samples", 0.0))
-        for layer_key, diagnostics in shard.get("intermediate_ctc_diagnostics_totals", {}).items():
-            layer_index = int(layer_key)
-            current = intermediate_ctc_diagnostics_totals.setdefault(
-                layer_index,
-                {
-                    "sample_count": 0.0,
-                    "impossible_sample_count": 0.0,
-                    "tight_sample_count": 0.0,
-                },
-            )
-            current["sample_count"] += float(diagnostics.get("sample_count", 0.0))
-            current["impossible_sample_count"] += float(
-                diagnostics.get("impossible_sample_count", 0.0)
-            )
-            current["tight_sample_count"] += float(diagnostics.get("tight_sample_count", 0.0))
         references.extend(shard["references"])
         hypotheses.extend(shard["hypotheses"])
         utterance_ids.extend(shard["utterance_ids"])
@@ -516,8 +495,6 @@ def _merge_evaluation_shards(
     metrics = {
         "loss": total_loss / loss_denominator,
         "main_ctc_loss": total_main_ctc_loss / loss_denominator,
-        "intermediate_ctc_loss": total_intermediate_ctc_loss / loss_denominator,
-        "combined_ctc_loss": total_combined_ctc_loss / loss_denominator,
         "aed_loss": total_aed_loss / loss_denominator,
         "liberta_distill_loss": total_liberta_distill_loss / loss_denominator,
         "audio_teacher_loss": total_audio_teacher_loss / loss_denominator,
@@ -539,14 +516,6 @@ def _merge_evaluation_shards(
     )
     metrics.update(length_bucket_metrics(references, hypotheses))
     metrics.update(decoding_debug_metrics(hypotheses))
-    for layer_index, diagnostics in sorted(intermediate_ctc_diagnostics_totals.items()):
-        sample_count = max(1.0, float(diagnostics.get("sample_count", 0.0)))
-        metrics[f"layer{layer_index}_ctc_impossible_fraction"] = (
-            float(diagnostics.get("impossible_sample_count", 0.0)) / sample_count
-        )
-        metrics[f"layer{layer_index}_ctc_tight_fraction"] = (
-            float(diagnostics.get("tight_sample_count", 0.0)) / sample_count
-        )
     speaker_metrics = speaker_level_metrics(speaker_ids, has_speaker_ids, references, hypotheses)
     metrics["speaker_count"] = float(speaker_metrics["speaker_count"])
     metrics["speaker_macro_wer"] = float(speaker_metrics["speaker_macro_wer"])
@@ -566,7 +535,6 @@ def _merge_evaluation_shards(
             "teacher_seconds": total_teacher_seconds,
             "decode_seconds": total_decode_seconds,
         },
-        "intermediate_ctc_diagnostics_totals": intermediate_ctc_diagnostics_totals,
         "hardest_examples": hardest_examples,
         "random_examples": random_examples,
         "speaker_metrics": speaker_metrics,
@@ -587,7 +555,6 @@ def evaluate(
     lm_weight: float = 0.0,
     beam_length_bonus: float = 0.1,
     example_limit: int = 5,
-    intermediate_ctc_weight: float = 0.0,
     aed_loss_weight: float = 0.0,
     liberta_teacher: FrozenLibertaTeacher | None = None,
     liberta_distill_weight: float = 0.0,
@@ -601,8 +568,6 @@ def evaluate(
     model.eval()
     total_loss = 0.0
     total_main_ctc_loss = 0.0
-    total_intermediate_ctc_loss = 0.0
-    total_combined_ctc_loss = 0.0
     total_aed_loss = 0.0
     total_liberta_distill_loss = 0.0
     total_audio_teacher_loss = 0.0
@@ -616,7 +581,6 @@ def evaluate(
     total_top_nonblank_probability = 0.0
     total_target_tokens = 0.0
     total_samples = 0.0
-    intermediate_ctc_diagnostics_totals: dict[int, dict[str, float]] = {}
     references: list[str] = []
     hypotheses: list[str] = []
     utterance_ids: list[str] = []
@@ -665,24 +629,7 @@ def evaluate(
                     output_lengths = forward_outputs["output_lengths"]
                     log_probs = forward_outputs["main_log_probs"]
                     main_ctc_loss = forward_outputs["main_ctc_loss"]
-                    intermediate_ctc_losses_map = forward_outputs["intermediate_ctc_losses"]
-                    intermediate_ctc_diagnostics_map = forward_outputs.get(
-                        "intermediate_ctc_diagnostics",
-                        {},
-                    )
-                    if intermediate_ctc_losses_map:
-                        intermediate_ctc_loss = torch.stack(
-                            [
-                                intermediate_ctc_losses_map[layer_index]
-                                for layer_index in model.intermediate_ctc_layers
-                            ]
-                        ).mean()
-                        combined_ctc_loss = (
-                            1.0 - intermediate_ctc_weight
-                        ) * main_ctc_loss + intermediate_ctc_weight * intermediate_ctc_loss
-                    else:
-                        intermediate_ctc_loss = None
-                        combined_ctc_loss = main_ctc_loss
+                    encoded = forward_outputs["encoded"]
                     aed_logits = forward_outputs.get("aed_logits")
                     liberta_student_embeddings = forward_outputs.get("liberta_student_embeddings")
                     audio_teacher_student_states = forward_outputs.get(
@@ -694,12 +641,10 @@ def evaluate(
                             decoder_targets,
                             pad_id=model.aed_decoder.pad_id,
                         )
-                        loss = (
-                            1.0 - aed_loss_weight
-                        ) * combined_ctc_loss + aed_loss_weight * aed_loss
+                        loss = (1.0 - aed_loss_weight) * main_ctc_loss + aed_loss_weight * aed_loss
                     else:
                         aed_loss = None
-                        loss = combined_ctc_loss
+                        loss = main_ctc_loss
                 total_forward_seconds += time.perf_counter() - forward_start_time
                 if liberta_teacher is not None and liberta_student_embeddings is not None:
                     teacher_start_time = time.perf_counter()
@@ -747,13 +692,6 @@ def evaluate(
                 local_batch_size = float(features.size(0))
                 total_loss += float(loss.item()) * local_batch_size
                 total_main_ctc_loss += float(main_ctc_loss.item()) * local_batch_size
-                total_intermediate_ctc_loss += (
-                    float(
-                        intermediate_ctc_loss.item() if intermediate_ctc_loss is not None else 0.0
-                    )
-                    * local_batch_size
-                )
-                total_combined_ctc_loss += float(combined_ctc_loss.item()) * local_batch_size
                 total_aed_loss += (
                     float(aed_loss.item() if aed_loss is not None else 0.0) * local_batch_size
                 )
@@ -784,22 +722,6 @@ def evaluate(
                     total_top_nonblank_probability += diagnostics["top_nonblank_probability_sum"]
                     total_target_tokens += diagnostics.get("target_tokens_sum", 0.0)
                     total_samples += diagnostics["sample_count"]
-                for layer_index, layer_diagnostics in intermediate_ctc_diagnostics_map.items():
-                    current = intermediate_ctc_diagnostics_totals.setdefault(
-                        int(layer_index),
-                        {
-                            "sample_count": 0.0,
-                            "impossible_sample_count": 0.0,
-                            "tight_sample_count": 0.0,
-                        },
-                    )
-                    current["sample_count"] += float(layer_diagnostics.get("sample_count", 0.0))
-                    current["impossible_sample_count"] += float(
-                        layer_diagnostics.get("impossible_sample_count", 0.0)
-                    )
-                    current["tight_sample_count"] += float(
-                        layer_diagnostics.get("tight_sample_count", 0.0)
-                    )
                 decode_start_time = time.perf_counter()
                 decoded_hypotheses = decode_batch(
                     encoded if getattr(model, "is_transducer", False) else log_probs,
@@ -820,8 +742,6 @@ def evaluate(
     local_results = {
         "total_loss": total_loss,
         "total_main_ctc_loss": total_main_ctc_loss,
-        "total_intermediate_ctc_loss": total_intermediate_ctc_loss,
-        "total_combined_ctc_loss": total_combined_ctc_loss,
         "total_aed_loss": total_aed_loss,
         "total_liberta_distill_loss": total_liberta_distill_loss,
         "total_audio_teacher_loss": total_audio_teacher_loss,
@@ -835,7 +755,6 @@ def evaluate(
         "total_top_nonblank_probability": total_top_nonblank_probability,
         "total_target_tokens": total_target_tokens,
         "total_samples": total_samples,
-        "intermediate_ctc_diagnostics_totals": intermediate_ctc_diagnostics_totals,
         "references": references,
         "hypotheses": hypotheses,
         "utterance_ids": utterance_ids,
@@ -971,7 +890,6 @@ def _evaluate_and_checkpoint(
     lm_weight: float,
     beam_length_bonus: float,
     example_limit: int,
-    intermediate_ctc_weight: float,
     aed_loss_weight: float,
     liberta_teacher: FrozenLibertaTeacher | None,
     liberta_distill_weight: float,
@@ -1021,7 +939,6 @@ def _evaluate_and_checkpoint(
             lm_weight=lm_weight,
             beam_length_bonus=beam_length_bonus,
             example_limit=example_limit,
-            intermediate_ctc_weight=intermediate_ctc_weight,
             aed_loss_weight=aed_loss_weight,
             liberta_teacher=liberta_teacher,
             liberta_distill_weight=liberta_distill_weight,
@@ -1190,8 +1107,7 @@ def _evaluate_and_checkpoint(
         logger.info(
             (
                 "%s complete train_loss=%.4f val_loss=%.4f "
-                "val_main_ctc_loss=%.4f val_intermediate_ctc_loss=%.4f "
-                "val_combined_ctc_loss=%.4f val_aed_loss=%.4f "
+                "val_main_ctc_loss=%.4f val_aed_loss=%.4f "
                 "val_liberta_distill_loss=%.4f val_audio_teacher_loss=%.4f val_cer=%.4f val_wer=%.4f "
                 "val_avg_blank_prob=%.4f val_argmax_blank_frac=%.4f "
                 "val_avg_top_nonblank_prob=%.4f val_target_tokens_per_frame=%.4f "
@@ -1206,8 +1122,6 @@ def _evaluate_and_checkpoint(
             float(train_metrics["train_loss"]),
             float(val_metrics["loss"]),
             float(val_metrics["main_ctc_loss"]),
-            float(val_metrics["intermediate_ctc_loss"]),
-            float(val_metrics["combined_ctc_loss"]),
             float(val_metrics["aed_loss"]),
             float(val_metrics["liberta_distill_loss"]),
             float(val_metrics["audio_teacher_loss"]),
@@ -1234,21 +1148,6 @@ def _evaluate_and_checkpoint(
             output_dir / "checkpoint_best.pt",
             averaged_path if averaged_path is not None else "n/a",
         )
-        intermediate_layers = tuple(getattr(model, "intermediate_ctc_layers", ()))
-        intermediate_length_detail = " ".join(
-            (
-                f"layer{layer_index}_ctc_impossible="
-                f"{float(val_metrics[f'layer{layer_index}_ctc_impossible_fraction']):.4f} "
-                f"layer{layer_index}_ctc_tight="
-                f"{float(val_metrics[f'layer{layer_index}_ctc_tight_fraction']):.4f}"
-            )
-            for layer_index in intermediate_layers
-            if f"layer{layer_index}_ctc_impossible_fraction" in val_metrics
-        )
-        if intermediate_length_detail:
-            logger.info(
-                "%s intermediate CTC feasibility %s", report_stem, intermediate_length_detail
-            )
         logger.info(
             (
                 "%s timing detail report_write=%.2fs checkpoint_build=%.2fs "

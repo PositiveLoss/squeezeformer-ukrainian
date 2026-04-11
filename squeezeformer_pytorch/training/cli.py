@@ -97,12 +97,6 @@ def _validate_startup_args(
     if args.zipformer:
         if args.dtype == DTypeChoice.FP8:
             raise ValueError("--zipformer does not support --dtype fp8.")
-        if args.intermediate_ctc is not None or args.intermediate_ctc_layer is not None:
-            raise ValueError("--zipformer does not support intermediate CTC heads.")
-        if args.intermediate_ctc_layers is not None or args.no_intermediate_ctc_layers:
-            raise ValueError("--zipformer does not support intermediate CTC heads.")
-        if args.blank_prune is not None or args.blank_prune_layer is not None:
-            raise ValueError("--zipformer does not support blank pruning.")
         if args.aed_decoder:
             raise ValueError("--zipformer does not support the AED decoder.")
         if args.liberta_distill:
@@ -136,7 +130,6 @@ def _validate_startup_args(
         "--spm-vocab-size": args.spm_vocab_size,
         "--warmup-epochs": args.warmup_epochs,
         "--hold-epochs": args.hold_epochs,
-        "--blank-prune-min-keep-frames": args.blank_prune_min_keep_frames,
         "--aed-decoder-layers": args.aed_decoder_layers,
         "--aed-decoder-heads": args.aed_decoder_heads,
         "--liberta-max-length": args.liberta_max_length,
@@ -170,8 +163,6 @@ def _validate_startup_args(
     nonnegative_int_arguments = {
         "--num-workers": args.num_workers,
         "--seed": args.seed,
-        "--intermediate-ctc-layer": args.intermediate_ctc_layer,
-        "--blank-prune-layer": args.blank_prune_layer,
         "--ema-warmup-steps": args.ema_warmup_steps,
     }
     for name, value in nonnegative_int_arguments.items():
@@ -206,11 +197,9 @@ def _validate_startup_args(
         "--noise-prob": args.noise_prob,
         "--reverb-prob": args.reverb_prob,
         "--time-mask-max-ratio": args.time_mask_max_ratio,
-        "--intermediate-ctc-weight": args.intermediate_ctc_weight,
         "--aed-decoder-dropout": args.aed_decoder_dropout,
         "--aed-loss-weight": args.aed_loss_weight,
         "--liberta-distill-weight": args.liberta_distill_weight,
-        "--blank-prune-threshold": args.blank_prune_threshold,
         "--ema-decay": args.ema_decay,
         "--audio-teacher-weight": args.audio_teacher_weight,
     }
@@ -610,19 +599,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup-epochs", type=int, default=20)
     parser.add_argument("--hold-epochs", type=int, default=160)
     parser.add_argument("--decay-exponent", type=float, default=1.0)
-    parser.add_argument("--intermediate-ctc-layer", type=int, default=None)
-    parser.add_argument("--intermediate-ctc-layers", default=None)
-    parser.add_argument(
-        "--no-intermediate-ctc-layers",
-        action="store_true",
-        help="Disable intermediate CTC layers even when defaults or checkpoint metadata exist.",
-    )
-    parser.add_argument(
-        "--intermediate-ctc",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument("--intermediate-ctc-weight", type=float, default=0.0)
     parser.add_argument(
         "--aed-decoder",
         action=argparse.BooleanOptionalAction,
@@ -681,14 +657,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--audio-teacher-layer", type=int, default=-1)
     parser.add_argument("--audio-teacher-sample-rate", type=int, default=16_000)
     parser.add_argument("--audio-teacher-max-seconds", type=float, default=30.0)
-    parser.add_argument("--blank-prune-layer", type=int, default=None)
-    parser.add_argument("--blank-prune-threshold", type=float, default=0.0)
-    parser.add_argument("--blank-prune-min-keep-frames", type=int, default=1)
-    parser.add_argument(
-        "--blank-prune",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
     parser.add_argument(
         "--blank-logit-offset",
         type=float,
@@ -703,16 +671,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "Initial bias assigned to the blank row of every CTC classifier head. Defaults to 0.0."
-        ),
-    )
-    parser.add_argument(
-        "--identical-initial-ctc-heads",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Copy the main CTC head parameters into every auxiliary CTC head at "
-            "initialization so they all start identically."
+            "Initial bias assigned to the blank row of each CTC classifier head. Defaults to 0.0."
         ),
     )
     parser.add_argument(

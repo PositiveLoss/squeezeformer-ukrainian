@@ -52,7 +52,6 @@ Not implemented yet:
 This repo currently supports:
 
 - main CTC loss
-- optional intermediate CTC loss
 - optional AED loss
 - optional LiBERTa transcript embedding distillation
 

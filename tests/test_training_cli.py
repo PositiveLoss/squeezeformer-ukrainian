@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-from argparse import Namespace
-
 import pytest
 
-from squeezeformer_pytorch.model import VARIANT_CONFIGS, SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import OptimizerChoice, ValidationModelSource
 from squeezeformer_pytorch.training.cli import parse_args
 from squeezeformer_pytorch.training.runtime import (
-    _default_intermediate_ctc_layers,
-    _resolve_intermediate_ctc_settings,
     _variant_defaults,
 )
 
@@ -67,18 +62,6 @@ def test_parse_args_rejects_multiple_dynamic_batching_modes() -> None:
     )
 
 
-def test_parse_args_accepts_no_intermediate_ctc_layers_flag() -> None:
-    args = parse_args(
-        [
-            "--device",
-            "cpu",
-            "--no-intermediate-ctc-layers",
-        ]
-    )
-
-    assert args.no_intermediate_ctc_layers is True
-
-
 def test_parse_args_accepts_disable_flash_attn2_kernels_flag() -> None:
     args = parse_args(
         [
@@ -110,7 +93,6 @@ def test_parse_args_accepts_blank_logit_training_controls() -> None:
             "cpu",
             "--initial-ctc-blank-bias",
             "-0.5",
-            "--identical-initial-ctc-heads",
             "--blank-logit-offset",
             "0.25",
             "--blank-logit-regularization-weight",
@@ -119,7 +101,6 @@ def test_parse_args_accepts_blank_logit_training_controls() -> None:
     )
 
     assert args.initial_ctc_blank_bias == -0.5
-    assert args.identical_initial_ctc_heads is True
     assert args.blank_logit_offset == 0.25
     assert args.blank_logit_regularization_weight == 0.01
 
@@ -151,9 +132,7 @@ def test_parse_args_defaults_match_paper_recipe() -> None:
     assert args.spm_vocab_size == 128
     assert args.warmup_epochs == 20
     assert args.hold_epochs == 160
-    assert args.intermediate_ctc_weight == 0.0
     assert args.initial_ctc_blank_bias == 0.0
-    assert args.identical_initial_ctc_heads is False
     assert args.ema_decay == 0.0
     assert args.validation_model_source == ValidationModelSource.RAW
     assert args.attention_backend == "relative"
@@ -188,44 +167,3 @@ def test_parse_args_accepts_zipformer_flag() -> None:
     )
 
     assert args.zipformer is True
-
-
-def test_no_intermediate_ctc_layers_overrides_checkpoint_settings() -> None:
-    args = Namespace(
-        intermediate_ctc=None,
-        intermediate_ctc_weight=0.3,
-        intermediate_ctc_layers=None,
-        intermediate_ctc_layer=None,
-        no_intermediate_ctc_layers=True,
-    )
-    encoder_config = SqueezeformerConfig(num_layers=12)
-    checkpoint = {
-        "training_args": {
-            "intermediate_ctc_enabled": True,
-            "intermediate_ctc_weight": 0.3,
-            "intermediate_ctc_layers": [3, 7],
-        }
-    }
-
-    layers, weight = _resolve_intermediate_ctc_settings(args, encoder_config, checkpoint)
-
-    assert layers == ()
-    assert weight == 0.0
-
-
-def test_default_intermediate_ctc_layers_avoid_reduced_time_segments_for_all_variants() -> None:
-    for config in VARIANT_CONFIGS.values():
-        reduced_layers: set[int] = set()
-        for reduce_idx, recover_idx in zip(
-            sorted(config.time_reduce_idx),
-            sorted(config.time_recover_idx),
-            strict=False,
-        ):
-            reduced_layers.update(range(reduce_idx, recover_idx))
-
-        layers = _default_intermediate_ctc_layers(config)
-
-        assert all(layer not in reduced_layers for layer in layers)
-        assert all(layer < config.num_layers for layer in layers)
-        assert all(layer < config.num_layers - 1 for layer in layers)
-        assert len(layers) >= 1

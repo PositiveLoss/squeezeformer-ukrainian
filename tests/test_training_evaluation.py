@@ -301,7 +301,6 @@ def test_evaluate_restores_model_mode(monkeypatch) -> None:
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
             self.aed_decoder = None
-            self.intermediate_ctc_layers = ()
 
         def forward(self, *_args, **_kwargs):
             return {
@@ -309,7 +308,6 @@ def test_evaluate_restores_model_mode(monkeypatch) -> None:
                 "output_lengths": torch.tensor([2]),
                 "main_log_probs": torch.zeros(1, 2, 2),
                 "main_ctc_loss": torch.tensor(1.25),
-                "intermediate_ctc_losses": {},
             }
 
     monkeypatch.setattr(training_evaluation, "decode_batch", lambda *_args, **_kwargs: ["test"])
@@ -402,8 +400,6 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
             {
                 "total_loss": 2.0,
                 "total_main_ctc_loss": 4.0,
-                "total_intermediate_ctc_loss": 6.0,
-                "total_combined_ctc_loss": 8.0,
                 "total_aed_loss": 10.0,
                 "total_liberta_distill_loss": 12.0,
                 "total_audio_teacher_loss": 14.0,
@@ -418,8 +414,6 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
             {
                 "total_loss": 18.0,
                 "total_main_ctc_loss": 24.0,
-                "total_intermediate_ctc_loss": 30.0,
-                "total_combined_ctc_loss": 36.0,
                 "total_aed_loss": 42.0,
                 "total_liberta_distill_loss": 48.0,
                 "total_audio_teacher_loss": 54.0,
@@ -437,8 +431,6 @@ def test_merge_evaluation_shards_combines_all_examples(monkeypatch) -> None:
 
     assert merged["metrics"]["loss"] == 5.0
     assert merged["metrics"]["main_ctc_loss"] == 7.0
-    assert merged["metrics"]["intermediate_ctc_loss"] == 9.0
-    assert merged["metrics"]["combined_ctc_loss"] == 11.0
     assert merged["metrics"]["aed_loss"] == 13.0
     assert merged["metrics"]["liberta_distill_loss"] == 15.0
     assert merged["metrics"]["audio_teacher_loss"] == 17.0
@@ -487,8 +479,6 @@ def test_evaluate_and_checkpoint_saves_validated_ema_weights_and_resume_raw(
             "metrics": {
                 "loss": 1.0,
                 "main_ctc_loss": 1.0,
-                "intermediate_ctc_loss": 0.0,
-                "combined_ctc_loss": 1.0,
                 "aed_loss": 0.0,
                 "liberta_distill_loss": 0.0,
                 "audio_teacher_loss": 0.0,
@@ -547,7 +537,6 @@ def test_evaluate_and_checkpoint_saves_validated_ema_weights_and_resume_raw(
         lm_weight=0.0,
         beam_length_bonus=0.1,
         example_limit=1,
-        intermediate_ctc_weight=0.0,
         aed_loss_weight=0.0,
         liberta_teacher=None,
         liberta_distill_weight=0.0,
