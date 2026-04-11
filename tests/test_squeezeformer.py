@@ -428,25 +428,6 @@ def test_ctc_length_diagnostics_count_repeated_adjacent_targets() -> None:
 
 
 @torch.no_grad()
-def test_blank_logit_offset_applies_only_during_training() -> None:
-    model = SqueezeformerCTC(
-        encoder_config=squeezeformer_variant("xs"),
-        vocab_size=8,
-        blank_logit_offset=0.25,
-    )
-    logits = torch.tensor([[[1.0, 2.0, 3.0]]], dtype=torch.float32)
-
-    model.train()
-    adjusted_train = model._apply_training_blank_logit_offset(logits)
-    model.eval()
-    adjusted_eval = model._apply_training_blank_logit_offset(logits)
-
-    assert torch.allclose(adjusted_train[..., 0], logits[..., 0] - 0.25)
-    assert torch.allclose(adjusted_train[..., 1:], logits[..., 1:])
-    assert torch.allclose(adjusted_eval, logits)
-
-
-@torch.no_grad()
 def test_ctc_log_probs_promote_bfloat16_inputs_to_float32() -> None:
     model = SqueezeformerCTC(
         encoder_config=squeezeformer_variant("xs"),

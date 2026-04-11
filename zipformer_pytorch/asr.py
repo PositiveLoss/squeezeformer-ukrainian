@@ -178,8 +178,6 @@ class ZipformerCTC(nn.Module):
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
         initial_ctc_blank_bias: float = 0.0,
-        blank_logit_offset: float = 0.0,
-        blank_logit_regularization_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
@@ -187,8 +185,6 @@ class ZipformerCTC(nn.Module):
         self.aed_decoder = None
         self.audio_teacher_target = audio_teacher_target
         self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
-        self.blank_logit_offset = float(blank_logit_offset)
-        self.blank_logit_regularization_weight = float(blank_logit_regularization_weight)
 
         self.encoder = ZipformerEncoder(encoder_config)
         self.classifier = nn.Linear(encoder_config.model_dim, vocab_size)
@@ -207,37 +203,9 @@ class ZipformerCTC(nn.Module):
             self.classifier.bias.zero_()
             self.classifier.bias[0] = float(blank_bias)
 
-    def _apply_training_blank_logit_offset(self, logits: Tensor) -> Tensor:
-        if not self.training or self.blank_logit_offset <= 0.0:
-            return logits
-        adjusted_logits = logits.clone()
-        adjusted_logits[..., 0] = adjusted_logits[..., 0] - self.blank_logit_offset
-        return adjusted_logits
-
     @staticmethod
     def _ctc_log_softmax(logits: Tensor) -> Tensor:
         return F.log_softmax(logits, dim=-1, dtype=torch.float32)
-
-    def _blank_logit_regularization_from_logits(
-        self,
-        logits: Tensor,
-        output_lengths: Tensor,
-        *,
-        blank_id: int,
-    ) -> Tensor:
-        if self.blank_logit_regularization_weight <= 0.0:
-            return logits.new_zeros((), dtype=torch.float32)
-        valid_mask = torch.arange(logits.size(1), device=output_lengths.device).unsqueeze(0) < output_lengths.unsqueeze(1)
-        if not bool(valid_mask.any()):
-            return logits.new_zeros((), dtype=torch.float32)
-        blank_logits = logits[..., blank_id]
-        nonblank_logits = logits.clone()
-        nonblank_logits[..., blank_id] = float("-inf")
-        best_nonblank_logits = nonblank_logits.max(dim=-1).values
-        positive_margin = (blank_logits - best_nonblank_logits).masked_select(valid_mask).relu()
-        if positive_margin.numel() == 0:
-            return logits.new_zeros((), dtype=torch.float32)
-        return positive_margin.float().mean()
 
     def _ctc_loss(
         self,
@@ -293,23 +261,16 @@ class ZipformerCTC(nn.Module):
             "encoded": encoded,
             "output_lengths": output_lengths,
             "main_ctc_loss": None,
-            "blank_logit_regularization_loss": encoded.new_zeros((), dtype=torch.float32),
             "intermediate_ctc_losses": {},
             "intermediate_ctc_diagnostics": {},
         }
-        adjusted_logits = self._apply_training_blank_logit_offset(logits)
-        main_log_probs = self._ctc_log_softmax(adjusted_logits)
+        main_log_probs = self._ctc_log_softmax(logits)
         if targets is not None and target_lengths is not None and blank_id is not None:
             output["main_ctc_loss"] = self._ctc_loss(
                 main_log_probs,
                 output_lengths,
                 targets,
                 target_lengths,
-                blank_id=blank_id,
-            )
-            output["blank_logit_regularization_loss"] = self._blank_logit_regularization_from_logits(
-                logits,
-                output_lengths,
                 blank_id=blank_id,
             )
         if return_main_log_probs:
@@ -592,7 +553,6 @@ class ZipformerTransducer(nn.Module):
             "encoded": encoded,
             "output_lengths": output_lengths,
             "main_ctc_loss": None,
-            "blank_logit_regularization_loss": encoded.new_zeros((), dtype=torch.float32),
             "intermediate_ctc_losses": {},
             "intermediate_ctc_diagnostics": {},
             "main_logits": None,

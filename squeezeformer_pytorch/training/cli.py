@@ -656,28 +656,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--audio-teacher-sample-rate", type=int, default=16_000)
     parser.add_argument("--audio-teacher-max-seconds", type=float, default=30.0)
     parser.add_argument(
-        "--blank-logit-offset",
-        type=float,
-        default=0.0,
-        help=(
-            "Training-only constant subtracted from the blank logit before CTC log_softmax. "
-            "Used to reduce blank dominance without changing inference-time logits."
-        ),
-    )
-    parser.add_argument(
         "--initial-ctc-blank-bias",
         type=float,
         default=0.0,
         help=(
             "Initial bias assigned to the blank row of each CTC classifier head. Defaults to 0.0."
-        ),
-    )
-    parser.add_argument(
-        "--blank-logit-regularization-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Weight for a training-only penalty on positive blank-vs-best-nonblank logit margin."
         ),
     )
     parser.add_argument("--ema-decay", type=float, default=0.0)

@@ -376,8 +376,6 @@ class SqueezeformerCTC(nn.Module):
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
         initial_ctc_blank_bias: float = DEFAULT_INITIAL_CTC_BLANK_BIAS,
-        blank_logit_offset: float = 0.0,
-        blank_logit_regularization_weight: float = 0.0,
         use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
@@ -387,8 +385,6 @@ class SqueezeformerCTC(nn.Module):
         self.audio_teacher_enabled = audio_teacher_enabled
         self.audio_teacher_target = audio_teacher_target
         self.initial_ctc_blank_bias = float(initial_ctc_blank_bias)
-        self.blank_logit_offset = float(blank_logit_offset)
-        self.blank_logit_regularization_weight = float(blank_logit_regularization_weight)
         self.use_transformer_engine = use_transformer_engine
         self.encoder = SqueezeformerEncoder(
             encoder_config,
@@ -556,42 +552,12 @@ class SqueezeformerCTC(nn.Module):
             "entropy_sum": float(entropy.masked_select(valid_mask).sum().item()),
         }
 
-    def _apply_training_blank_logit_offset(self, logits: Tensor) -> Tensor:
-        if not self.training or self.blank_logit_offset <= 0.0:
-            return logits
-        adjusted_logits = logits.clone()
-        adjusted_logits[..., 0] = adjusted_logits[..., 0] - self.blank_logit_offset
-        return adjusted_logits
-
     @staticmethod
     def _ctc_log_softmax(logits: Tensor) -> Tensor:
         # CTC is numerically sensitive under mixed precision. Compute the
         # normalization in float32 instead of autocast bf16/fp16, mirroring the
         # explicit float32 path already used for AED cross-entropy.
         return F.log_softmax(logits, dim=-1, dtype=torch.float32)
-
-    def _blank_logit_regularization_from_logits(
-        self,
-        logits: Tensor,
-        output_lengths: Tensor,
-        *,
-        blank_id: int,
-    ) -> Tensor:
-        if self.blank_logit_regularization_weight <= 0.0:
-            return logits.new_zeros((), dtype=torch.float32)
-        valid_mask = torch.arange(logits.size(1), device=output_lengths.device).unsqueeze(
-            0
-        ) < output_lengths.unsqueeze(1)
-        if not bool(valid_mask.any()):
-            return logits.new_zeros((), dtype=torch.float32)
-        blank_logits = logits[..., blank_id]
-        nonblank_logits = logits.clone()
-        nonblank_logits[..., blank_id] = float("-inf")
-        best_nonblank_logits = nonblank_logits.max(dim=-1).values
-        positive_margin = (blank_logits - best_nonblank_logits).masked_select(valid_mask).relu()
-        if positive_margin.numel() == 0:
-            return logits.new_zeros((), dtype=torch.float32)
-        return positive_margin.float().mean()
 
     def encode_with_intermediates(
         self,
@@ -609,27 +575,19 @@ class SqueezeformerCTC(nn.Module):
         self,
         classifier: nn.Module,
         x: Tensor,
-        *,
-        apply_blank_offset: bool = False,
     ) -> tuple[Tensor, Tensor]:
         batch, time, _ = x.shape
         vocab_size = getattr(classifier, "out_features", None)
         if not isinstance(vocab_size, int) or vocab_size <= 0:
             logits = apply_linear_with_fp8_padding(classifier, x)
-            logits_for_log_probs = (
-                self._apply_training_blank_logit_offset(logits) if apply_blank_offset else logits
-            )
-            return logits, self._ctc_log_softmax(logits_for_log_probs)
+            return logits, self._ctc_log_softmax(logits)
 
         bytes_per_element = max(1, x.element_size())
         target_elements = max(1, _CTC_HEAD_TARGET_BYTES // bytes_per_element)
         chunk_batch = max(1, target_elements // max(1, time * vocab_size))
         if chunk_batch >= batch:
             logits = apply_linear_with_fp8_padding(classifier, x)
-            logits_for_log_probs = (
-                self._apply_training_blank_logit_offset(logits) if apply_blank_offset else logits
-            )
-            return logits, self._ctc_log_softmax(logits_for_log_probs)
+            return logits, self._ctc_log_softmax(logits)
 
         logits = x.new_empty((batch, time, vocab_size))
         log_probs = x.new_empty((batch, time, vocab_size), dtype=torch.float32)
@@ -637,13 +595,8 @@ class SqueezeformerCTC(nn.Module):
         for chunk in x.split(chunk_batch, dim=0):
             stop = start + chunk.size(0)
             chunk_logits = apply_linear_with_fp8_padding(classifier, chunk)
-            chunk_logits_for_log_probs = (
-                self._apply_training_blank_logit_offset(chunk_logits)
-                if apply_blank_offset
-                else chunk_logits
-            )
             logits[start:stop] = chunk_logits
-            log_probs[start:stop] = self._ctc_log_softmax(chunk_logits_for_log_probs)
+            log_probs[start:stop] = self._ctc_log_softmax(chunk_logits)
             start = stop
         return logits, log_probs
 
@@ -661,8 +614,7 @@ class SqueezeformerCTC(nn.Module):
         vocab_size = getattr(classifier, "out_features", None)
         if not isinstance(vocab_size, int) or vocab_size <= 0:
             logits = apply_linear_with_fp8_padding(classifier, x)
-            logits_for_log_probs = self._apply_training_blank_logit_offset(logits)
-            log_probs = self._ctc_log_softmax(logits_for_log_probs)
+            log_probs = self._ctc_log_softmax(logits)
             per_sample_losses = F.ctc_loss(
                 log_probs.transpose(0, 1),
                 targets,
@@ -679,8 +631,7 @@ class SqueezeformerCTC(nn.Module):
         chunk_batch = max(1, target_elements // max(1, time * vocab_size))
         if chunk_batch >= batch:
             logits = apply_linear_with_fp8_padding(classifier, x)
-            logits_for_log_probs = self._apply_training_blank_logit_offset(logits)
-            log_probs = self._ctc_log_softmax(logits_for_log_probs)
+            log_probs = self._ctc_log_softmax(logits)
             per_sample_losses = F.ctc_loss(
                 log_probs.transpose(0, 1),
                 targets,
@@ -701,8 +652,7 @@ class SqueezeformerCTC(nn.Module):
         for start in range(0, batch, chunk_batch):
             stop = min(batch, start + chunk_batch)
             chunk_logits = apply_linear_with_fp8_padding(classifier, x[start:stop])
-            chunk_logits_for_log_probs = self._apply_training_blank_logit_offset(chunk_logits)
-            chunk_log_probs = self._ctc_log_softmax(chunk_logits_for_log_probs)
+            chunk_log_probs = self._ctc_log_softmax(chunk_logits)
             chunk_targets = targets[target_offsets[start] : target_offsets[stop]]
             chunk_output_lengths = output_lengths[start:stop]
             chunk_target_lengths = target_lengths[start:stop]
@@ -754,32 +704,12 @@ class SqueezeformerCTC(nn.Module):
                     "encoded": encoded,
                     "output_lengths": output_lengths,
                     "main_ctc_loss": main_ctc_loss,
-                    "blank_logit_regularization_loss": encoded.new_zeros((), dtype=torch.float32),
                 }
             )
-            if (
-                targets is not None
-                and target_lengths is not None
-                and blank_id is not None
-                and self.blank_logit_regularization_weight > 0.0
-            ):
-                blank_reg_logits, _ = self._chunked_logits_and_log_probs_from_classifier(
-                    self.classifier,
-                    encoded,
-                    apply_blank_offset=False,
-                )
-                output["blank_logit_regularization_loss"] = (
-                    self._blank_logit_regularization_from_logits(
-                        blank_reg_logits,
-                        output_lengths,
-                        blank_id=blank_id,
-                    )
-                )
             if return_main_log_probs:
                 main_logits, main_log_probs = self._chunked_logits_and_log_probs_from_classifier(
                     self.classifier,
                     encoded,
-                    apply_blank_offset=True,
                 )
                 output["main_logits"] = main_logits
                 output["main_log_probs"] = main_log_probs

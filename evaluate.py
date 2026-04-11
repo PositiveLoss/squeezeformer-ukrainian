@@ -235,15 +235,6 @@ def main() -> None:
                 encoder_config=encoder_config,
                 vocab_size=tokenizer.vocab_size,
                 initial_ctc_blank_bias=checkpoint_settings["initial_ctc_blank_bias"],
-                blank_logit_offset=float(
-                    checkpoint.get("training_args", {}).get("blank_logit_offset", 0.0)
-                ),
-                blank_logit_regularization_weight=float(
-                    checkpoint.get("training_args", {}).get(
-                        "blank_logit_regularization_weight",
-                        0.0,
-                    )
-                ),
             )
     else:
         encoder_config = SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])

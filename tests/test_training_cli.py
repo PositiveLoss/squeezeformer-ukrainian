@@ -62,23 +62,17 @@ def test_parse_args_rejects_multiple_dynamic_batching_modes() -> None:
     )
 
 
-def test_parse_args_accepts_blank_logit_training_controls() -> None:
+def test_parse_args_accepts_initial_ctc_blank_bias() -> None:
     args = parse_args(
         [
             "--device",
             "cpu",
             "--initial-ctc-blank-bias",
             "-0.5",
-            "--blank-logit-offset",
-            "0.25",
-            "--blank-logit-regularization-weight",
-            "0.01",
         ]
     )
 
     assert args.initial_ctc_blank_bias == -0.5
-    assert args.blank_logit_offset == 0.25
-    assert args.blank_logit_regularization_weight == 0.01
 
 
 def test_parse_args_accepts_beam_length_bonus() -> None:

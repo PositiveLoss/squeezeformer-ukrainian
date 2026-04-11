@@ -61,7 +61,6 @@ def test_zipformer_ctc_returns_training_outputs_with_main_log_probs() -> None:
     assert outputs["main_log_probs"].shape == (2, 3, 6)
     assert outputs["main_ctc_loss"] is not None
     assert outputs["intermediate_ctc_losses"] == {}
-    assert outputs["blank_logit_regularization_loss"].dtype == torch.float32
 
 
 def test_zipformer_transducer_returns_pruned_loss_and_backward_runs() -> None:
