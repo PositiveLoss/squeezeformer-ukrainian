@@ -6,6 +6,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from zipformer_pytorch.fp8 import apply_linear_with_fp8_padding, make_linear
+
 
 def targets_to_padded(targets: Tensor, target_lengths: Tensor) -> Tensor:
     batch_size = int(target_lengths.numel())
@@ -150,11 +152,31 @@ class TransducerJoiner(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        *,
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
-        self.encoder_proj = nn.Linear(encoder_dim, joiner_dim)
-        self.decoder_proj = nn.Linear(decoder_dim, joiner_dim)
-        self.output_linear = nn.Linear(joiner_dim, vocab_size)
+        self.encoder_proj = make_linear(
+            encoder_dim,
+            joiner_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.decoder_proj = make_linear(
+            decoder_dim,
+            joiner_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.output_linear = make_linear(
+            joiner_dim,
+            vocab_size,
+            use_transformer_engine=use_transformer_engine,
+        )
+
+    def project_encoder(self, encoder_out: Tensor) -> Tensor:
+        return apply_linear_with_fp8_padding(self.encoder_proj, encoder_out)
+
+    def project_decoder(self, decoder_out: Tensor) -> Tensor:
+        return apply_linear_with_fp8_padding(self.decoder_proj, decoder_out)
 
     def forward(
         self,
@@ -164,10 +186,10 @@ class TransducerJoiner(nn.Module):
         project_input: bool = True,
     ) -> Tensor:
         if project_input:
-            combined = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
+            combined = self.project_encoder(encoder_out) + self.project_decoder(decoder_out)
         else:
             combined = encoder_out + decoder_out
-        return self.output_linear(torch.tanh(combined))
+        return apply_linear_with_fp8_padding(self.output_linear, torch.tanh(combined))
 
 
 @dataclass
@@ -219,8 +241,8 @@ def transducer_greedy_search(model: nn.Module, encoder_out: Tensor) -> list[int]
         dtype=torch.int64,
     )
     decoder_out = model.decoder(decoder_input, need_pad=False)
-    decoder_out = model.joiner.decoder_proj(decoder_out)
-    encoder_proj = model.joiner.encoder_proj(encoder_out)
+    decoder_out = model.joiner.project_decoder(decoder_out)
+    encoder_proj = model.joiner.project_encoder(encoder_out)
     hypothesis = [blank_id] * context_size
     for frame_index in range(encoder_proj.size(1)):
         logits = model.joiner(
@@ -238,7 +260,7 @@ def transducer_greedy_search(model: nn.Module, encoder_out: Tensor) -> list[int]
             dtype=torch.int64,
         )
         decoder_out = model.decoder(decoder_input, need_pad=False)
-        decoder_out = model.joiner.decoder_proj(decoder_out)
+        decoder_out = model.joiner.project_decoder(decoder_out)
     return hypothesis[context_size:]
 
 
@@ -273,7 +295,7 @@ def transducer_modified_beam_search(
     blank_id = int(model.decoder.blank_id)
     context_size = int(model.decoder.context_size)
     device = encoder_out.device
-    encoder_proj = model.joiner.encoder_proj(encoder_out)
+    encoder_proj = model.joiner.project_encoder(encoder_out)
     hypotheses = {
         tuple([blank_id] * context_size): Hypothesis(
             tokens=[blank_id] * context_size,
@@ -290,7 +312,7 @@ def transducer_modified_beam_search(
                 dtype=torch.int64,
             )
             decoder_out = model.decoder(decoder_input, need_pad=False)
-            decoder_out = model.joiner.decoder_proj(decoder_out)
+            decoder_out = model.joiner.project_decoder(decoder_out)
             logits = model.joiner(
                 encoder_proj[:, frame_index : frame_index + 1].unsqueeze(2),
                 decoder_out.unsqueeze(1),

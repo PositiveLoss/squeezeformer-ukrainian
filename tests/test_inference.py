@@ -442,3 +442,60 @@ def test_asr_session_uses_zipformer_for_zipformer_checkpoint(
     assert captured["strict"] is True
     assert captured["device"] == torch.device("cpu")
     assert captured["eval_called"] is True
+
+
+def test_asr_session_uses_transformer_engine_for_fp8_zipformer_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class DummyTokenizer:
+        vocab_size = 32
+
+    class DummyFeaturizer:
+        def __init__(self, **_: object) -> None:
+            pass
+
+    class DummyZipformerModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured["model_kwargs"] = kwargs
+
+        def load_state_dict(
+            self,
+            state_dict: dict[str, torch.Tensor],
+            strict: bool = True,
+            **kwargs,
+        ):
+            captured["load_kwargs"] = kwargs
+            captured["strict"] = strict
+
+        def to(self, device: torch.device):
+            captured["device"] = device
+            return self
+
+        def eval(self):
+            captured["eval_called"] = True
+            return self
+
+    checkpoint_data = {
+        "tokenizer": {"type": "character", "symbols": ["а"]},
+        "encoder_config": asdict(zipformer_variant("xs")),
+        "training_args": {"zipformer": True, "dtype": "fp8"},
+        "featurizer_config": {},
+        "model_state_dict": {"weight": torch.zeros(1)},
+    }
+
+    monkeypatch.setattr(inference, "load_checkpoint", lambda *_args, **_kwargs: checkpoint_data)
+    monkeypatch.setattr(
+        inference, "tokenizer_from_dict", lambda *_args, **_kwargs: DummyTokenizer()
+    )
+    monkeypatch.setattr(inference, "AudioFeaturizer", DummyFeaturizer)
+    monkeypatch.setattr(inference, "ZipformerCTC", DummyZipformerModel)
+
+    inference.ASRInferenceSession("checkpoint.pt", torch.device("cpu"), DTypeChoice.FLOAT32)
+
+    assert captured["model_kwargs"]["use_transformer_engine"] is True
+    assert captured["load_kwargs"] == {}
+    assert captured["strict"] is True
+    assert captured["device"] == torch.device("cpu")
+    assert captured["eval_called"] is True

@@ -551,6 +551,9 @@ HF_TOKEN=... uv run squeezeformer-torchrun --nproc_per_node=2 train.py \
   --output-dir artifacts/zipformer-sm-ddp
 ```
 
+FP8 Zipformer training requires CUDA and the `fp8` optional dependency; add `--dtype fp8`
+to the same command.
+
 Local resumable smoke test:
 
 ```bash

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from squeezeformer_pytorch.runtime_types import OptimizerChoice, ValidationModelSource
+from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice, ValidationModelSource
 from squeezeformer_pytorch.training.cli import parse_args
 from squeezeformer_pytorch.training.runtime import (
     _variant_defaults,
@@ -122,6 +122,21 @@ def test_parse_args_accepts_zipformer_flag() -> None:
     )
 
     assert args.zipformer is True
+
+
+def test_parse_args_accepts_zipformer_fp8() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+            "--zipformer",
+            "--dtype",
+            "fp8",
+        ]
+    )
+
+    assert args.zipformer is True
+    assert args.dtype == DTypeChoice.FP8
 
 
 def test_parse_args_accepts_force_audio_metadata_probe_flag() -> None:

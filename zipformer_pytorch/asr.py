@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from zipformer_pytorch.fp8 import apply_linear_with_fp8_padding, make_linear
 from zipformer_pytorch.transducer import (
     StatelessDecoder,
     TransducerJoiner,
@@ -131,7 +132,7 @@ def _make_padding_mask(lengths: Tensor, *, max_length: int) -> Tensor:
 
 
 class ZipformerEncoder(nn.Module):
-    def __init__(self, config: ZipformerConfig) -> None:
+    def __init__(self, config: ZipformerConfig, *, use_transformer_engine: bool = False) -> None:
         super().__init__()
         self.config = config
         self.encoder = Zipformer(
@@ -148,6 +149,7 @@ class ZipformerEncoder(nn.Module):
             cnn_module_kernel=config.cnn_module_kernel,
             pos_dim=config.pos_dim,
             dropout=config.dropout,
+            use_transformer_engine=use_transformer_engine,
         )
 
     def set_batch_count(self, batch_count: int) -> None:
@@ -177,16 +179,28 @@ class ZipformerCTC(nn.Module):
         audio_teacher_enabled: bool = False,
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
         self.aed_decoder = None
         self.audio_teacher_target = audio_teacher_target
 
-        self.encoder = ZipformerEncoder(encoder_config)
-        self.classifier = nn.Linear(encoder_config.model_dim, vocab_size)
+        self.encoder = ZipformerEncoder(
+            encoder_config,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.classifier = make_linear(
+            encoder_config.model_dim,
+            vocab_size,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.audio_teacher_projection = (
-            nn.Linear(encoder_config.model_dim, audio_teacher_hidden_size)
+            make_linear(
+                encoder_config.model_dim,
+                audio_teacher_hidden_size,
+                use_transformer_engine=use_transformer_engine,
+            )
             if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
@@ -229,7 +243,7 @@ class ZipformerCTC(nn.Module):
         mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
         pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
         pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
-        return self.audio_teacher_projection(pooled)
+        return apply_linear_with_fp8_padding(self.audio_teacher_projection, pooled)
 
     def forward(
         self,
@@ -249,7 +263,7 @@ class ZipformerCTC(nn.Module):
             raise RuntimeError("AED decoder is not supported by the Zipformer training path.")
 
         encoded, output_lengths = self.encoder(features, feature_lengths)
-        logits = self.classifier(encoded)
+        logits = apply_linear_with_fp8_padding(self.classifier, encoded)
         if not return_training_outputs:
             return logits, output_lengths
 
@@ -302,6 +316,7 @@ class ZipformerTransducer(nn.Module):
         audio_teacher_enabled: bool = False,
         audio_teacher_hidden_size: int = 1024,
         audio_teacher_target: str = "encoder",
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.encoder_config = encoder_config
@@ -314,7 +329,10 @@ class ZipformerTransducer(nn.Module):
         self.audio_teacher_target = audio_teacher_target
         self.aed_decoder = None
 
-        self.encoder = ZipformerEncoder(encoder_config)
+        self.encoder = ZipformerEncoder(
+            encoder_config,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.decoder = StatelessDecoder(
             vocab_size=vocab_size,
             decoder_dim=self.decoder_dim,
@@ -326,9 +344,14 @@ class ZipformerTransducer(nn.Module):
             decoder_dim=self.decoder_dim,
             joiner_dim=self.joiner_dim,
             vocab_size=vocab_size,
+            use_transformer_engine=use_transformer_engine,
         )
         self.audio_teacher_projection = (
-            nn.Linear(encoder_config.model_dim, audio_teacher_hidden_size)
+            make_linear(
+                encoder_config.model_dim,
+                audio_teacher_hidden_size,
+                use_transformer_engine=use_transformer_engine,
+            )
             if audio_teacher_enabled and audio_teacher_target == "encoder"
             else None
         )
@@ -342,7 +365,7 @@ class ZipformerTransducer(nn.Module):
         mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
         pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
         pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
-        return self.audio_teacher_projection(pooled)
+        return apply_linear_with_fp8_padding(self.audio_teacher_projection, pooled)
 
     def encode(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
         return self.encoder(features, feature_lengths)
@@ -361,8 +384,8 @@ class ZipformerTransducer(nn.Module):
         u_plus_one = max_target_length + 1
         blank_chunks: list[Tensor] = []
         label_chunks: list[Tensor] = []
-        projected_encoder = self.joiner.encoder_proj(encoded)
-        projected_decoder = self.joiner.decoder_proj(decoder_out)
+        projected_encoder = self.joiner.project_encoder(encoded)
+        projected_decoder = self.joiner.project_decoder(decoder_out)
         target_lengths_expanded = target_lengths.view(batch_size, 1, 1)
 
         for start in range(0, max_time, self.joiner_chunk_size):

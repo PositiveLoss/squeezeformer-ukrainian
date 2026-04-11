@@ -95,8 +95,6 @@ def _validate_startup_args(
     if world_size > 1 and args.compile:
         raise ValueError("--compile is not currently supported together with distributed training.")
     if args.zipformer:
-        if args.dtype == DTypeChoice.FP8:
-            raise ValueError("--zipformer does not support --dtype fp8.")
         if args.aed_decoder:
             raise ValueError("--zipformer does not support the AED decoder.")
         if args.liberta_distill:

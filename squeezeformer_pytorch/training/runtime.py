@@ -7,6 +7,7 @@ import logging
 import os
 import resource
 import sys
+from collections.abc import Sequence
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import NamedTuple
@@ -21,7 +22,6 @@ from squeezeformer_pytorch.asr import SqueezeformerCTC
 from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.model import (
     FP8_SHAPE_ALIGNMENT,
-    SqueezeformerConfig,
     transformer_engine_available,
 )
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
@@ -1020,9 +1020,22 @@ def _build_fp8_recipe(args: argparse.Namespace):
     )
 
 
+def _fp8_hidden_dimensions(encoder_config: object) -> tuple[int, ...]:
+    d_model = getattr(encoder_config, "d_model", None)
+    if isinstance(d_model, int):
+        return (d_model,)
+    encoder_dim = getattr(encoder_config, "encoder_dim", None)
+    if isinstance(encoder_dim, Sequence) and not isinstance(encoder_dim, str):
+        return tuple(int(dim) for dim in encoder_dim)
+    model_dim = getattr(encoder_config, "model_dim", None)
+    if isinstance(model_dim, int):
+        return (model_dim,)
+    return ()
+
+
 def _validate_fp8_runtime(
     device: torch.device,
-    encoder_config: SqueezeformerConfig,
+    encoder_config: object,
 ) -> None:
     if device.type != "cuda":
         raise ValueError("FP8 training requires a CUDA device.")
@@ -1030,10 +1043,14 @@ def _validate_fp8_runtime(
         raise RuntimeError(
             "FP8 training requires transformer-engine. Install the package and CUDA extension."
         )
-    if encoder_config.d_model % FP8_SHAPE_ALIGNMENT != 0:
+    incompatible_dimensions = [
+        dim for dim in _fp8_hidden_dimensions(encoder_config) if dim % FP8_SHAPE_ALIGNMENT != 0
+    ]
+    if incompatible_dimensions:
+        dimensions = ", ".join(str(dim) for dim in incompatible_dimensions)
         raise ValueError(
-            "FP8 training requires d_model to be divisible by "
-            f"{FP8_SHAPE_ALIGNMENT}; choose variant xs, sm, ml, or l."
+            "FP8 training requires encoder hidden dimensions to be divisible by "
+            f"{FP8_SHAPE_ALIGNMENT}; incompatible dimensions: {dimensions}."
         )
     if hasattr(te, "is_fp8_available"):
         availability = te.is_fp8_available()

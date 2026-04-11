@@ -536,8 +536,6 @@ def _resolve_zipformer_transducer_usage(
 
 
 def _validate_zipformer_runtime_args(args) -> None:
-    if args.dtype == DTypeChoice.FP8:
-        raise ValueError("--zipformer does not support --dtype fp8.")
     if args.aed_decoder:
         raise ValueError("--zipformer does not support the AED decoder.")
     if args.liberta_distill:
@@ -957,7 +955,7 @@ def _load_train_val_records(
         _training_data_loading._build_disk_backed_record_store = original_build_store
 
 
-def _validate_fp8_runtime(device: torch.device, encoder_config: SqueezeformerConfig) -> None:
+def _validate_fp8_runtime(device: torch.device, encoder_config: object) -> None:
     original_te = _training_runtime.te
     original_transformer_engine_available = _training_runtime.transformer_engine_available
     _training_runtime.te = te
@@ -1535,7 +1533,7 @@ def main() -> None:
     args.audio_teacher_sample_rate = audio_teacher_sample_rate
     args.audio_teacher_max_seconds = audio_teacher_max_seconds
     fp8_recipe = _build_fp8_recipe(args)
-    if not use_zipformer and args.dtype == DTypeChoice.FP8:
+    if args.dtype == DTypeChoice.FP8:
         _validate_fp8_runtime(device, encoder_config)
     requested_audio_teacher_device = resolve_device(args.audio_teacher_device)
     if distributed and requested_audio_teacher_device.type == "cuda":
@@ -1593,6 +1591,7 @@ def main() -> None:
                 audio_teacher.hidden_size if audio_teacher is not None else encoder_config.model_dim
             ),
             audio_teacher_target=audio_teacher_target,
+            use_transformer_engine=args.dtype == DTypeChoice.FP8,
         )
     elif use_zipformer:
         model = ZipformerCTC(
@@ -1603,6 +1602,7 @@ def main() -> None:
                 audio_teacher.hidden_size if audio_teacher is not None else encoder_config.model_dim
             ),
             audio_teacher_target=audio_teacher_target,
+            use_transformer_engine=args.dtype == DTypeChoice.FP8,
         )
     else:
         model = SqueezeformerCTC(

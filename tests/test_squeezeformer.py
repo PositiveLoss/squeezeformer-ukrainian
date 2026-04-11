@@ -96,6 +96,7 @@ from train import (
     resolve_device,
     speaker_level_metrics,
 )
+from zipformer_pytorch.asr import zipformer_variant as zipformer_asr_variant
 
 
 def expected_subsampled_length(length: int) -> int:
@@ -909,6 +910,20 @@ def test_validate_fp8_runtime_rejects_incompatible_hidden_size(
 
     with pytest.raises(ValueError, match="divisible by 16"):
         _validate_fp8_runtime(torch.device("cuda"), squeezeformer_variant("s"))
+
+
+def test_validate_fp8_runtime_accepts_zipformer_variant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeTE:
+        @staticmethod
+        def is_fp8_available() -> tuple[bool, str | None]:
+            return True, None
+
+    monkeypatch.setattr("train.te", _FakeTE())
+    monkeypatch.setattr("train.transformer_engine_available", lambda: True)
+
+    _validate_fp8_runtime(torch.device("cuda"), zipformer_asr_variant("xs"))
 
 
 def test_build_fp8_recipe_uses_requested_recipe_settings(monkeypatch: pytest.MonkeyPatch) -> None:

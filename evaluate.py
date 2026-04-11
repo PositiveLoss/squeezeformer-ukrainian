@@ -210,9 +210,11 @@ def main() -> None:
     checkpoint_tokenizer_type = str(checkpoint["tokenizer"].get("type", ""))
     checkpoint_settings = resolve_evaluation_checkpoint_settings(checkpoint)
     use_zipformer = checkpoint_uses_zipformer(checkpoint)
+    use_transformer_engine = should_use_transformer_engine_for_checkpoint(
+        checkpoint,
+        requested_dtype=args.dtype,
+    )
     if use_zipformer:
-        if args.dtype == DTypeChoice.FP8:
-            raise ValueError("Zipformer checkpoints do not support FP8 evaluation.")
         encoder_config = ZipformerConfig(**checkpoint["encoder_config"])
         training_args = checkpoint.get("training_args", {})
         if checkpoint_uses_zipformer_transducer(checkpoint):
@@ -227,6 +229,7 @@ def main() -> None:
                 joiner_chunk_size=int(
                     training_args.get("zipformer_transducer_joiner_chunk_size", 32)
                 ),
+                use_transformer_engine=use_transformer_engine,
             )
             args.decode_strategy = DecodeStrategy.BEAM
             args.beam_size = 4
@@ -234,6 +237,7 @@ def main() -> None:
             model = ZipformerCTC(
                 encoder_config=encoder_config,
                 vocab_size=tokenizer.vocab_size,
+                use_transformer_engine=use_transformer_engine,
             )
     else:
         encoder_config = SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
@@ -245,10 +249,7 @@ def main() -> None:
             aed_decoder_heads=checkpoint_settings["aed_decoder_heads"],
             aed_decoder_dropout=checkpoint_settings["aed_decoder_dropout"],
             liberta_distill_enabled=checkpoint_settings["liberta_distill_enabled"],
-            use_transformer_engine=should_use_transformer_engine_for_checkpoint(
-                checkpoint,
-                requested_dtype=args.dtype,
-            ),
+            use_transformer_engine=use_transformer_engine,
         )
     selected_validation_model_source = (
         args.validation_model_source

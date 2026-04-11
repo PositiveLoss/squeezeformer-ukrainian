@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 
+import zipformer_pytorch.fp8 as zipformer_fp8
 from zipformer_pytorch.asr import (
     ZipformerConfig,
     ZipformerCTC,
@@ -34,6 +35,79 @@ def _tiny_zipformer_config() -> ZipformerConfig:
         pos_dim=16,
         dropout=0.0,
     )
+
+
+def _fp8_compatible_zipformer_config() -> ZipformerConfig:
+    return ZipformerConfig(
+        input_dim=8,
+        output_downsampling_factor=2,
+        downsampling_factor=(1,),
+        encoder_dim=(32,),
+        num_encoder_layers=(1,),
+        num_heads=(4,),
+        query_head_dim=(8,),
+        value_head_dim=(8,),
+        pos_head_dim=(4,),
+        feedforward_dim=(64,),
+        cnn_module_kernel=(5,),
+        pos_dim=16,
+        dropout=0.0,
+    )
+
+
+def test_zipformer_uses_transformer_engine_linears_with_padded_inputs(
+    monkeypatch,
+) -> None:
+    observed_rows: list[int] = []
+
+    class _FakeLinear(torch.nn.Linear):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            assert x.dim() == 2
+            assert x.size(0) % zipformer_fp8.FP8_SHAPE_ALIGNMENT == 0
+            observed_rows.append(int(x.size(0)))
+            return super().forward(x)
+
+    class _FakeTE:
+        Linear = _FakeLinear
+
+    monkeypatch.setattr(zipformer_fp8, "te", _FakeTE)
+
+    model = ZipformerCTC(
+        encoder_config=_fp8_compatible_zipformer_config(),
+        vocab_size=16,
+        use_transformer_engine=True,
+    )
+    features = torch.randn(2, 12, 8)
+    feature_lengths = torch.tensor([12, 9], dtype=torch.long)
+
+    logits, output_lengths = model(features, feature_lengths)
+
+    assert logits.shape == (2, 3, 16)
+    assert output_lengths.tolist() == [3, 3]
+    assert any(isinstance(module, _FakeLinear) for module in model.modules())
+    assert observed_rows
+
+    transducer = ZipformerTransducer(
+        encoder_config=_fp8_compatible_zipformer_config(),
+        vocab_size=16,
+        blank_id=0,
+        decoder_dim=16,
+        joiner_dim=16,
+        context_size=2,
+        prune_range=3,
+        joiner_chunk_size=2,
+        use_transformer_engine=True,
+    )
+    outputs = transducer(
+        features,
+        feature_lengths,
+        return_training_outputs=True,
+        targets=torch.tensor([1, 2, 3], dtype=torch.long),
+        target_lengths=torch.tensor([2, 1], dtype=torch.long),
+        blank_id=0,
+    )
+
+    assert torch.isfinite(outputs["pruned_transducer_loss"])
 
 
 def test_zipformer_ctc_returns_training_outputs_with_main_log_probs() -> None:

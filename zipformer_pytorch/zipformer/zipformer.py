@@ -8,6 +8,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from zipformer_pytorch.fp8 import apply_linear_with_fp8_padding, make_linear
+
 
 def _make_padding_mask(lengths: Tensor, *, max_length: int) -> Tensor:
     return torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
@@ -503,26 +505,40 @@ class PairwiseUpsample(nn.Module):
 
 
 class ConvNextBlock2d(nn.Module):
-    def __init__(self, channels: int = 128) -> None:
+    def __init__(self, channels: int = 128, *, use_transformer_engine: bool = False) -> None:
         super().__init__()
         self.depthwise = nn.Conv2d(channels, channels, kernel_size=7, padding=3, groups=channels)
-        self.pointwise_in = nn.Linear(channels, 384)
+        self.pointwise_in = make_linear(
+            channels,
+            384,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.activation = SwooshL()
-        self.pointwise_out = nn.Linear(384, channels)
+        self.pointwise_out = make_linear(
+            384,
+            channels,
+            use_transformer_engine=use_transformer_engine,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         residual = x
         x = self.depthwise(x)
         x = x.permute(0, 2, 3, 1)
-        x = self.pointwise_in(x)
+        x = apply_linear_with_fp8_padding(self.pointwise_in, x)
         x = self.activation(x)
-        x = self.pointwise_out(x)
+        x = apply_linear_with_fp8_padding(self.pointwise_out, x)
         x = x.permute(0, 3, 1, 2)
         return residual + x
 
 
 class ConvEmbed(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        *,
+        use_transformer_engine: bool = False,
+    ) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(1, 8, kernel_size=3, stride=(1, 2), padding=1)
         self.conv1_balancer = ActivationBalancer(8, channel_dim=1)
@@ -533,12 +549,19 @@ class ConvEmbed(nn.Module):
         self.conv3 = nn.Conv2d(32, 128, kernel_size=3, stride=(1, 2), padding=1)
         self.conv3_balancer = ActivationBalancer(128, channel_dim=1)
         self.conv3_activation = SwooshR()
-        self.convnext = ConvNextBlock2d(128)
+        self.convnext = ConvNextBlock2d(
+            128,
+            use_transformer_engine=use_transformer_engine,
+        )
 
         freq_dim = input_dim
         for _ in range(3):
             freq_dim = (freq_dim + 1) // 2
-        self.output_projection = nn.Linear(128 * freq_dim, output_dim)
+        self.output_projection = make_linear(
+            128 * freq_dim,
+            output_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.output_norm = BiasNorm(output_dim)
 
     def forward(self, x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
@@ -552,7 +575,7 @@ class ConvEmbed(nn.Module):
 
         batch_size, channels, time_steps, freq_dim = x.shape
         x = x.permute(0, 2, 3, 1).reshape(batch_size, time_steps, freq_dim * channels)
-        x = self.output_projection(x)
+        x = apply_linear_with_fp8_padding(self.output_projection, x)
         x = self.output_norm(x)
 
         output_lengths = _conv_out_length(lengths, kernel_size=3, stride=1, padding=1)
@@ -606,34 +629,65 @@ class MultiHeadAttentionWeights(nn.Module):
         query_head_dim: int,
         pos_head_dim: int,
         dropout: float = 0.0,
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.query_head_dim = query_head_dim
         self.pos_head_dim = pos_head_dim
         self.scale = query_head_dim ** -0.5
-        self.query_proj = nn.Linear(embed_dim, num_heads * query_head_dim, bias=False)
-        self.key_proj = nn.Linear(embed_dim, num_heads * query_head_dim, bias=False)
+        self.query_proj = make_linear(
+            embed_dim,
+            num_heads * query_head_dim,
+            bias=False,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.key_proj = make_linear(
+            embed_dim,
+            num_heads * query_head_dim,
+            bias=False,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.key_whiten = Whiten(
             num_groups=num_heads,
             whitening_limit=2.0,
             prob=(0.025, 0.25),
             grad_scale=0.025,
         )
-        self.pos_query_proj = nn.Linear(embed_dim, num_heads * pos_head_dim, bias=False)
-        self.pos_proj = nn.Linear(pos_dim, num_heads * pos_head_dim, bias=False)
+        self.pos_query_proj = make_linear(
+            embed_dim,
+            num_heads * pos_head_dim,
+            bias=False,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.pos_proj = make_linear(
+            pos_dim,
+            num_heads * pos_head_dim,
+            bias=False,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, pos_emb: Tensor, mask: Tensor | None) -> Tensor:
         batch_size, time_steps, _ = x.shape
-        q = self.query_proj(x).view(batch_size, time_steps, self.num_heads, self.query_head_dim)
-        k = self.key_whiten(self.key_proj(x)).view(
+        q = apply_linear_with_fp8_padding(self.query_proj, x).view(
             batch_size,
             time_steps,
             self.num_heads,
             self.query_head_dim,
         )
-        p = self.pos_query_proj(x).view(batch_size, time_steps, self.num_heads, self.pos_head_dim)
+        k = self.key_whiten(apply_linear_with_fp8_padding(self.key_proj, x)).view(
+            batch_size,
+            time_steps,
+            self.num_heads,
+            self.query_head_dim,
+        )
+        p = apply_linear_with_fp8_padding(self.pos_query_proj, x).view(
+            batch_size,
+            time_steps,
+            self.num_heads,
+            self.pos_head_dim,
+        )
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -641,7 +695,11 @@ class MultiHeadAttentionWeights(nn.Module):
 
         content_scores = torch.einsum("bhtd,bhsd->bhts", q, k) * self.scale
 
-        rel = self.pos_proj(pos_emb).view(2 * time_steps - 1, self.num_heads, self.pos_head_dim)
+        rel = apply_linear_with_fp8_padding(self.pos_proj, pos_emb).view(
+            2 * time_steps - 1,
+            self.num_heads,
+            self.pos_head_dim,
+        )
         rel = rel.permute(1, 0, 2)
         relative_index = (
             torch.arange(time_steps, device=x.device).unsqueeze(1)
@@ -663,66 +721,128 @@ class MultiHeadAttentionWeights(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, value_head_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        value_head_dim: int,
+        dropout: float = 0.0,
+        *,
+        use_transformer_engine: bool = False,
+    ) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.value_proj = nn.Linear(embed_dim, num_heads * value_head_dim, bias=True)
+        self.value_proj = make_linear(
+            embed_dim,
+            num_heads * value_head_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.value_whiten = Whiten(
             num_groups=num_heads,
             whitening_limit=2.0,
             prob=(0.025, 0.25),
             grad_scale=0.025,
         )
-        self.output_proj = nn.Linear(num_heads * value_head_dim, embed_dim, bias=True)
+        self.output_proj = make_linear(
+            num_heads * value_head_dim,
+            embed_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
         batch_size, time_steps, _ = x.shape
-        v = self.value_whiten(self.value_proj(x)).view(batch_size, time_steps, self.num_heads, -1)
+        v = self.value_whiten(apply_linear_with_fp8_padding(self.value_proj, x)).view(
+            batch_size,
+            time_steps,
+            self.num_heads,
+            -1,
+        )
         v = v.permute(0, 2, 1, 3)
         y = torch.einsum("bhts,bhsd->bhtd", attn_weights, v)
         y = y.permute(0, 2, 1, 3).reshape(batch_size, time_steps, -1)
-        return self.dropout(self.output_proj(y))
+        return self.dropout(apply_linear_with_fp8_padding(self.output_proj, y))
 
 
 class NonLinearAttention(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        *,
+        use_transformer_engine: bool = False,
+    ) -> None:
         super().__init__()
-        self.proj = nn.Linear(embed_dim, hidden_dim * 3, bias=True)
-        self.output_proj = nn.Linear(hidden_dim, embed_dim, bias=True)
+        self.proj = make_linear(
+            embed_dim,
+            hidden_dim * 3,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.output_proj = make_linear(
+            hidden_dim,
+            embed_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, attn_weights: Tensor) -> Tensor:
-        a, b, c = self.proj(x).chunk(3, dim=-1)
+        a, b, c = apply_linear_with_fp8_padding(self.proj, x).chunk(3, dim=-1)
         attended = torch.einsum("bij,bjd->bid", attn_weights[:, 0], torch.tanh(b) * c)
-        return self.dropout(self.output_proj(a * attended))
+        return self.dropout(apply_linear_with_fp8_padding(self.output_proj, a * attended))
 
 
 class FeedForwardModule(nn.Module):
-    def __init__(self, embed_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        dropout: float = 0.0,
+        *,
+        use_transformer_engine: bool = False,
+    ) -> None:
         super().__init__()
-        self.in_proj = nn.Linear(embed_dim, hidden_dim, bias=True)
+        self.in_proj = make_linear(
+            embed_dim,
+            hidden_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.balancer = ActivationBalancer(hidden_dim, channel_dim=-1, max_abs=10.0, min_prob=0.25)
         self.activation = SwooshL()
         self.dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(hidden_dim, embed_dim, bias=True)
+        self.out_proj = make_linear(
+            hidden_dim,
+            embed_dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = self.in_proj(x)
+        x = apply_linear_with_fp8_padding(self.in_proj, x)
         x = self.balancer(x)
         x = self.activation(x)
         x = self.dropout(x)
-        x = self.out_proj(x)
+        x = apply_linear_with_fp8_padding(self.out_proj, x)
         return self.out_dropout(x)
 
 
 class ZipformerConvModule(nn.Module):
-    def __init__(self, dim: int, kernel_size: int = 31, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        dim: int,
+        kernel_size: int = 31,
+        dropout: float = 0.0,
+        *,
+        use_transformer_engine: bool = False,
+    ) -> None:
         super().__init__()
         if kernel_size % 2 == 0:
             raise ValueError(f"Zipformer convolution kernel must be odd, got {kernel_size}.")
-        self.input_proj = nn.Linear(dim, dim * 2, bias=True)
+        self.input_proj = make_linear(
+            dim,
+            dim * 2,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.input_balancer = ActivationBalancer(
             dim * 2,
             channel_dim=-1,
@@ -745,11 +865,18 @@ class ZipformerConvModule(nn.Module):
             max_abs=20.0,
         )
         self.activation = SwooshR()
-        self.output_proj = nn.Linear(dim, dim, bias=True)
+        self.output_proj = make_linear(
+            dim,
+            dim,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
-        x, gate = self.input_balancer(self.input_proj(x)).chunk(2, dim=-1)
+        x, gate = self.input_balancer(apply_linear_with_fp8_padding(self.input_proj, x)).chunk(
+            2,
+            dim=-1,
+        )
         x = x * torch.sigmoid(gate)
         x = x.transpose(1, 2)
         if mask is not None:
@@ -758,7 +885,7 @@ class ZipformerConvModule(nn.Module):
         x = x.transpose(1, 2)
         x = self.depthwise_balancer(x)
         x = self.activation(x)
-        x = self.output_proj(x)
+        x = apply_linear_with_fp8_padding(self.output_proj, x)
         x = self.dropout(x)
         return _mask_tensor(x, mask)
 
@@ -777,6 +904,7 @@ class ZipformerBlock(nn.Module):
         value_head_dim: int | None = None,
         dropout: float = 0.0,
         conv_kernel_size: int = 31,
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         ff_dim = dim * mult if feedforward_dim is None else feedforward_dim
@@ -790,16 +918,59 @@ class ZipformerBlock(nn.Module):
             query_head_dim=dim_head,
             pos_head_dim=pos_head_dim,
             dropout=dropout,
+            use_transformer_engine=use_transformer_engine,
         )
-        self.feed_forward1 = FeedForwardModule(dim, (ff_dim * 3) // 4, dropout)
-        self.non_linear_attention = NonLinearAttention(dim, (dim * 3) // 4, dropout)
-        self.self_attention1 = SelfAttention(dim, heads, value_head_dim, dropout)
-        self.conv1 = ZipformerConvModule(dim, kernel_size=conv_kernel_size, dropout=dropout)
-        self.feed_forward2 = FeedForwardModule(dim, ff_dim, dropout)
+        self.feed_forward1 = FeedForwardModule(
+            dim,
+            (ff_dim * 3) // 4,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.non_linear_attention = NonLinearAttention(
+            dim,
+            (dim * 3) // 4,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.self_attention1 = SelfAttention(
+            dim,
+            heads,
+            value_head_dim,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.conv1 = ZipformerConvModule(
+            dim,
+            kernel_size=conv_kernel_size,
+            dropout=dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.feed_forward2 = FeedForwardModule(
+            dim,
+            ff_dim,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.mid_bypass = BypassModule(dim)
-        self.self_attention2 = SelfAttention(dim, heads, value_head_dim, dropout)
-        self.conv2 = ZipformerConvModule(dim, kernel_size=conv_kernel_size, dropout=dropout)
-        self.feed_forward3 = FeedForwardModule(dim, (ff_dim * 5) // 4, dropout)
+        self.self_attention2 = SelfAttention(
+            dim,
+            heads,
+            value_head_dim,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.conv2 = ZipformerConvModule(
+            dim,
+            kernel_size=conv_kernel_size,
+            dropout=dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
+        self.feed_forward3 = FeedForwardModule(
+            dim,
+            (ff_dim * 5) // 4,
+            dropout,
+            use_transformer_engine=use_transformer_engine,
+        )
         self.block_balancer = ActivationBalancer(
             dim,
             channel_dim=-1,
@@ -849,6 +1020,7 @@ class ZipformerStack(nn.Module):
         conv_kernel_size: int,
         pos_dim: int,
         dropout: float,
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         self.positional_encoding = CompactRelPositionalEncoding(pos_dim, dropout=0.0)
@@ -864,6 +1036,7 @@ class ZipformerStack(nn.Module):
                     value_head_dim=value_head_dim,
                     dropout=dropout,
                     conv_kernel_size=conv_kernel_size,
+                    use_transformer_engine=use_transformer_engine,
                 )
                 for _ in range(num_layers)
             ]
@@ -910,6 +1083,7 @@ class Zipformer(nn.Module):
         cnn_module_kernel: Sequence[int],
         pos_dim: int = 48,
         dropout: float = 0.1,
+        use_transformer_engine: bool = False,
     ) -> None:
         super().__init__()
         tuple_lengths = {
@@ -931,7 +1105,11 @@ class Zipformer(nn.Module):
         self.output_downsampling_factor = output_downsampling_factor
         self.output_dim = max(self.encoder_dim)
 
-        self.conv_embed = ConvEmbed(input_dim, self.encoder_dim[0])
+        self.conv_embed = ConvEmbed(
+            input_dim,
+            self.encoder_dim[0],
+            use_transformer_engine=use_transformer_engine,
+        )
         stacks: list[nn.Module] = []
         for stack_index, dim in enumerate(self.encoder_dim):
             stack = ZipformerStack(
@@ -945,6 +1123,7 @@ class Zipformer(nn.Module):
                 conv_kernel_size=cnn_module_kernel[stack_index],
                 pos_dim=pos_dim,
                 dropout=dropout,
+                use_transformer_engine=use_transformer_engine,
             )
             if self.downsampling_factor[stack_index] == 1:
                 stacks.append(stack)

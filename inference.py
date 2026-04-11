@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import tempfile
+from collections.abc import Sequence
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
@@ -121,10 +122,16 @@ class ASRInferenceSession:
         checkpoint_settings = resolve_inference_checkpoint_settings(checkpoint_data)
         is_torchao_quantized = is_torchao_quantized_checkpoint(checkpoint_data)
         use_zipformer = checkpoint_uses_zipformer(checkpoint_data)
+        use_transformer_engine = should_use_transformer_engine_for_checkpoint(
+            checkpoint_data,
+            requested_dtype=dtype,
+        )
         if use_zipformer:
-            if dtype == DTypeChoice.FP8:
-                raise ValueError("Zipformer checkpoints do not support FP8 inference.")
             encoder_config = ZipformerConfig(**checkpoint_data["encoder_config"])
+            if dtype == DTypeChoice.FP8:
+                if is_torchao_quantized:
+                    raise ValueError("TorchAO quantized checkpoints do not support FP8 inference.")
+                validate_fp8_inference_runtime(device, encoder_config)
             training_args = checkpoint_data.get("training_args", {})
             if checkpoint_uses_zipformer_transducer(checkpoint_data):
                 self.model = ZipformerTransducer(
@@ -138,18 +145,16 @@ class ASRInferenceSession:
                     joiner_chunk_size=int(
                         training_args.get("zipformer_transducer_joiner_chunk_size", 32)
                     ),
+                    use_transformer_engine=use_transformer_engine,
                 )
             else:
                 self.model = ZipformerCTC(
                     encoder_config=encoder_config,
                     vocab_size=self.tokenizer.vocab_size,
+                    use_transformer_engine=use_transformer_engine,
                 )
         else:
             encoder_config = SqueezeformerConfig.from_mapping(checkpoint_data["encoder_config"])
-            use_transformer_engine = should_use_transformer_engine_for_checkpoint(
-                checkpoint_data,
-                requested_dtype=dtype,
-            )
             if dtype == DTypeChoice.FP8:
                 if is_torchao_quantized:
                     raise ValueError("TorchAO quantized checkpoints do not support FP8 inference.")
@@ -393,7 +398,7 @@ def build_fp8_recipe(args: argparse.Namespace):
 
 
 def validate_fp8_inference_runtime(
-    device: torch.device, encoder_config: SqueezeformerConfig
+    device: torch.device, encoder_config: object
 ) -> None:
     if device.type != "cuda":
         raise ValueError("FP8 inference requires a CUDA device.")
@@ -401,10 +406,14 @@ def validate_fp8_inference_runtime(
         raise RuntimeError(
             "FP8 inference requires transformer-engine. Install the package and CUDA extension."
         )
-    if encoder_config.d_model % FP8_SHAPE_ALIGNMENT != 0:
+    incompatible_dimensions = [
+        dim for dim in _fp8_hidden_dimensions(encoder_config) if dim % FP8_SHAPE_ALIGNMENT != 0
+    ]
+    if incompatible_dimensions:
+        dimensions = ", ".join(str(dim) for dim in incompatible_dimensions)
         raise ValueError(
-            "FP8 inference requires d_model to be divisible by "
-            f"{FP8_SHAPE_ALIGNMENT}; choose variant xs, sm, ml, or l."
+            "FP8 inference requires encoder hidden dimensions to be divisible by "
+            f"{FP8_SHAPE_ALIGNMENT}; incompatible dimensions: {dimensions}."
         )
     if hasattr(te, "is_fp8_available"):
         availability = te.is_fp8_available()
@@ -417,6 +426,19 @@ def validate_fp8_inference_runtime(
             raise RuntimeError(
                 f"Transformer Engine reports FP8 is unavailable on this runtime.{suffix}"
             )
+
+
+def _fp8_hidden_dimensions(encoder_config: object) -> tuple[int, ...]:
+    d_model = getattr(encoder_config, "d_model", None)
+    if isinstance(d_model, int):
+        return (d_model,)
+    encoder_dim = getattr(encoder_config, "encoder_dim", None)
+    if isinstance(encoder_dim, Sequence) and not isinstance(encoder_dim, str):
+        return tuple(int(dim) for dim in encoder_dim)
+    model_dim = getattr(encoder_config, "model_dim", None)
+    if isinstance(model_dim, int):
+        return (model_dim,)
+    return ()
 
 
 def inference_autocast_context(device: torch.device, dtype: DTypeChoice, *, fp8_recipe=None):
