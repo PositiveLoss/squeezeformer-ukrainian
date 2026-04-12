@@ -1,0 +1,135 @@
+name: Build Rust Feature Cache Warmer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version tag to build and upload to its GitHub Release, for example v0.1.0"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  binary:
+    name: Build Linux binary
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: |
+          cargo build \
+            --release \
+            --locked \
+            --manifest-path rust_feature_cache_warmer/Cargo.toml \
+            --bin feature-cache-warmer
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          tar -C rust_feature_cache_warmer/target/release \
+            -czf dist/feature-cache-warmer-x86_64-unknown-linux-gnu.tar.gz \
+            feature-cache-warmer
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-cache-warmer-x86_64-unknown-linux-gnu
+          path: dist/feature-cache-warmer-x86_64-unknown-linux-gnu.tar.gz
+          if-no-files-found: error
+
+  wheel:
+    name: Build Python 3.10+ wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.version || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install maturin
+        run: python -m pip install --upgrade "maturin>=1.9,<2"
+
+      - name: Build abi3 wheel with Python feature
+        working-directory: rust_feature_cache_warmer
+        run: |
+          python -m maturin build \
+            --release \
+            --locked \
+            --features python \
+            --out ../dist/wheels
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-cache-warmer-rust-python310-plus-wheel
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Upload artifacts to version release
+    needs:
+      - binary
+      - wheel
+    runs-on: ubuntu-latest
+    if: >-
+      github.ref_type == 'tag' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: feature-cache-warmer-x86_64-unknown-linux-gnu
+          path: release-assets
+
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: feature-cache-warmer-rust-python310-plus-wheel
+          path: release-assets
+
+      - name: Resolve release tag
+        id: release
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ -n "$DISPATCH_VERSION" ]; then
+            echo "tag=$DISPATCH_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          files: release-assets/*
+          fail_on_unmatched_files: true

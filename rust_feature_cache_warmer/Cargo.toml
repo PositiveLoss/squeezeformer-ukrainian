@@ -23,7 +23,7 @@ env_logger = "0.11"
 log = "0.4"
 numpy = { version = "0.28", optional = true }
 parquet = { version = "56", features = ["arrow"] }
-pyo3 = { version = "0.28", optional = true, features = ["abi3-py312", "extension-module"] }
+pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "extension-module"] }
 rayon = "1.11"
 rubato = "2.0"
 rustfft = "6.4"
