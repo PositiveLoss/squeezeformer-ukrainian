@@ -651,6 +651,17 @@ wheels = [
 ]
 
 [[package]]
+name = "feature-cache-warmer-rust"
+version = "0.1.0"
+source = { directory = "rust_feature_cache_warmer" }
+dependencies = [
+    { name = "numpy" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy", specifier = ">=1.26" }]
+
+[[package]]
 name = "ffmpy"
 version = "1.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3220,6 +3231,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "audioflux" },
+    { name = "feature-cache-warmer-rust" },
     { name = "gradio" },
     { name = "huggingface-hub" },
     { name = "kernels" },
@@ -3285,6 +3297,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "audioflux", specifier = ">=0.1.9" },
+    { name = "feature-cache-warmer-rust", directory = "rust_feature_cache_warmer" },
     { name = "flax", marker = "extra == 'jax'", specifier = ">=0.11.0" },
     { name = "gradio", specifier = ">=5.38.0" },
     { name = "huggingface-hub", specifier = ">=0.34.0" },

@@ -28,7 +28,13 @@ from squeezeformer_pytorch.evaluation_runtime import (
     resolve_evaluation_checkpoint_settings,
     resolve_lowercase_transcripts,
 )
-from squeezeformer_pytorch.frontend import AudioFeaturizer, resolve_checkpoint_featurizer_config
+from squeezeformer_pytorch.frontend import (
+    AudioFeaturizer as _PythonAudioFeaturizer,
+)
+from squeezeformer_pytorch.frontend import (
+    build_featurizer_from_config,
+    resolve_checkpoint_featurizer_config,
+)
 from squeezeformer_pytorch.model import SqueezeformerConfig
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, ValidationModelSource
 from squeezeformer_pytorch.training.cli import (
@@ -46,8 +52,17 @@ from squeezeformer_pytorch.training.runtime import (
     resolve_device,
 )
 from train import _build_trackio_run_name
-from w2v_bert.asr import W2VBertConfig, W2VBertCTC, W2VBertFeatureExtractor
+from w2v_bert.asr import (
+    W2VBertConfig,
+    W2VBertCTC,
+)
+from w2v_bert.asr import (
+    W2VBertFeatureExtractor as _PythonW2VBertFeatureExtractor,
+)
 from zipformer_pytorch.asr import ZipformerConfig, ZipformerCTC, ZipformerTransducer
+
+AudioFeaturizer = _PythonAudioFeaturizer
+W2VBertFeatureExtractor = _PythonW2VBertFeatureExtractor
 
 
 def checkpoint_uses_zipformer(checkpoint_data: dict[str, object]) -> bool:
@@ -84,8 +99,15 @@ def build_checkpoint_featurizer(
         use_w2v_bert=use_w2v_bert,
     )
     if str(config.get("type", "")) == "w2v_bert":
-        return W2VBertFeatureExtractor.from_config(config)
-    return AudioFeaturizer(**config)
+        if W2VBertFeatureExtractor is not _PythonW2VBertFeatureExtractor:
+            return W2VBertFeatureExtractor.from_config(config)
+    elif AudioFeaturizer is not _PythonAudioFeaturizer:
+        return AudioFeaturizer(**config)
+    return build_featurizer_from_config(
+        config,
+        use_zipformer=use_zipformer,
+        use_w2v_bert=use_w2v_bert,
+    )
 
 
 def checkpoint_uses_zipformer_transducer(checkpoint_data: dict[str, object]) -> bool:

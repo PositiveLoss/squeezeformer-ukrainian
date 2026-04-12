@@ -854,7 +854,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--frontend-backend",
         default="torchaudio",
-        choices=["torchaudio", "audioflux"],
+        choices=["torchaudio"],
+        help="Feature frontend backend. Python training/evaluation/inference use the Rust torchaudio-compatible frontend.",
     )
     parser.add_argument("--n-fft", type=int, default=512)
     parser.add_argument("--hop-length", type=int, default=160)

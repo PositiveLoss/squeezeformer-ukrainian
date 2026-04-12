@@ -85,6 +85,13 @@ features = extract_w2v_bert(waveform, 16_000)
 assert features.shape[1] == 160
 ```
 
+The repository's `build_featurizer_from_config()` factory now returns PyTorch
+modules backed by this extension for Squeezeformer, Zipformer, and W2V-BERT.
+That factory is used by `train.py`, `evaluate.py`, `inference.py`, and the
+Python cache warmers, so actual feature extraction no longer goes through the
+torchaudio/Hugging Face frontend path unless a test deliberately monkeypatches
+the script-local compatibility aliases.
+
 ## Parallelism
 
 Feature extraction runs in a Rayon thread pool. Set `--threads N` to control the

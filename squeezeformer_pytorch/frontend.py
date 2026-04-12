@@ -98,10 +98,192 @@ def build_featurizer_from_config(
         use_w2v_bert=use_w2v_bert,
     )
     if str(config.get("type", "")) == "w2v_bert":
-        from w2v_bert.asr import W2VBertFeatureExtractor
+        return RustW2VBertFeatureExtractor.from_config(config)
+    frontend_type = "zipformer" if use_zipformer else "squeezeformer"
+    return RustAudioFeaturizer(frontend_type=frontend_type, **config)
 
-        return W2VBertFeatureExtractor.from_config(config)
-    return AudioFeaturizer(**config)
+
+def _waveform_to_numpy(waveform: Tensor) -> np.ndarray:
+    return waveform.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+
+
+def _numpy_features_to_tensor(features: object) -> Tensor:
+    return torch.from_numpy(np.asarray(features, dtype=np.float32))
+
+
+class RustAudioFeaturizer(torch.nn.Module):
+    def __init__(
+        self,
+        sample_rate: int = 16_000,
+        n_fft: int = 400,
+        win_length: int | None = None,
+        hop_length: int = 160,
+        n_mels: int = 80,
+        backend: str = "torchaudio",
+        preemphasis: float = 0.97,
+        normalize_signal: bool = True,
+        normalize_feature: bool = True,
+        normalize_per_frame: bool = False,
+        *,
+        frontend_type: str = "squeezeformer",
+    ) -> None:
+        super().__init__()
+        self.sample_rate = int(sample_rate)
+        self.n_fft = int(n_fft)
+        self.win_length = self.n_fft if win_length is None else int(win_length)
+        self.hop_length = int(hop_length)
+        self.n_mels = int(n_mels)
+        self.backend = str(backend)
+        self.preemphasis = float(preemphasis)
+        self.normalize_signal = bool(normalize_signal)
+        self.normalize_feature = bool(normalize_feature)
+        self.normalize_per_frame = bool(normalize_per_frame)
+        self.frontend_type = str(frontend_type)
+        if self.backend != "torchaudio":
+            raise ValueError(
+                "RustAudioFeaturizer supports only backend='torchaudio'. "
+                "Use AudioFeaturizer directly for the legacy audioflux Python path."
+            )
+        if self.frontend_type not in {"squeezeformer", "zipformer"}:
+            raise ValueError(f"Unsupported Rust frontend type: {self.frontend_type}")
+        if self.n_fft <= 0:
+            raise ValueError(f"n_fft must be > 0, got {self.n_fft}.")
+        if self.win_length <= 0:
+            raise ValueError(f"win_length must be > 0, got {self.win_length}.")
+        if self.win_length > self.n_fft:
+            raise ValueError(
+                f"win_length must be <= n_fft, got win_length={self.win_length}, n_fft={self.n_fft}."
+            )
+        if self.hop_length <= 0:
+            raise ValueError(f"hop_length must be > 0, got {self.hop_length}.")
+        if self.n_mels <= 0:
+            raise ValueError(f"n_mels must be > 0, got {self.n_mels}.")
+
+    def forward(self, waveform: Tensor, sample_rate: int) -> Tensor:
+        from feature_cache_warmer.rust_features import extract_squeezeformer, extract_zipformer
+
+        extractor = extract_zipformer if self.frontend_type == "zipformer" else extract_squeezeformer
+        features = extractor(
+            _waveform_to_numpy(waveform),
+            int(sample_rate),
+            target_sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels,
+            preemphasis=self.preemphasis,
+            normalize_signal=self.normalize_signal,
+            normalize_feature=self.normalize_feature,
+            normalize_per_frame=self.normalize_per_frame,
+        )
+        return _numpy_features_to_tensor(features)
+
+    def estimate_num_frames(self, num_samples: int, sample_rate: int) -> int:
+        return estimate_num_feature_frames(
+            num_samples,
+            sample_rate=sample_rate,
+            target_sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            backend=self.backend,
+        )
+
+    def config_dict(self) -> dict[str, object]:
+        return {
+            "sample_rate": self.sample_rate,
+            "n_fft": self.n_fft,
+            "win_length": self.win_length,
+            "n_mels": self.n_mels,
+            "backend": self.backend,
+            "preemphasis": self.preemphasis,
+            "normalize_signal": self.normalize_signal,
+            "normalize_feature": self.normalize_feature,
+            "normalize_per_frame": self.normalize_per_frame,
+            "hop_length": self.hop_length,
+        }
+
+
+class RustW2VBertFeatureExtractor(torch.nn.Module):
+    def __init__(
+        self,
+        model_source: str = "facebook/w2v-bert-2.0",
+        *,
+        sample_rate: int = 16_000,
+        feature_size: int = 80,
+        stride: int = 2,
+        feature_dim: int | None = None,
+        padding_value: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.model_source = str(model_source)
+        self.sample_rate = int(sample_rate)
+        self.feature_size = int(feature_size)
+        self.stride = max(1, int(stride))
+        resolved_feature_dim = self.feature_size * self.stride
+        self.n_mels = int(feature_dim) if feature_dim is not None else resolved_feature_dim
+        self.hop_length = 160 * self.stride
+        self.padding_value = float(padding_value)
+        if self.sample_rate <= 0:
+            raise ValueError(f"sample_rate must be > 0, got {self.sample_rate}.")
+        if self.feature_size <= 0:
+            raise ValueError(f"feature_size must be > 0, got {self.feature_size}.")
+        if self.n_mels != resolved_feature_dim:
+            raise ValueError(
+                "RustW2VBertFeatureExtractor requires feature_dim to equal "
+                f"feature_size * stride ({resolved_feature_dim}), got {self.n_mels}."
+            )
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, object]) -> "RustW2VBertFeatureExtractor":
+        sample_rate = config.get("sample_rate")
+        feature_size = config.get("feature_size")
+        stride = config.get("stride")
+        feature_dim = config.get("feature_dim")
+        padding_value = config.get("padding_value")
+        return cls(
+            model_source=str(config.get("model_source", "facebook/w2v-bert-2.0")),
+            sample_rate=int(sample_rate) if sample_rate is not None else 16_000,
+            feature_size=int(feature_size) if feature_size is not None else 80,
+            stride=int(stride) if stride is not None else 2,
+            feature_dim=int(feature_dim) if feature_dim is not None else None,
+            padding_value=float(padding_value) if padding_value is not None else 1.0,
+        )
+
+    def forward(self, waveform: Tensor, sample_rate: int) -> Tensor:
+        from feature_cache_warmer.rust_features import extract_w2v_bert
+
+        features = extract_w2v_bert(
+            _waveform_to_numpy(waveform),
+            int(sample_rate),
+            target_sample_rate=self.sample_rate,
+            feature_size=self.feature_size,
+            stride=self.stride,
+            padding_value=self.padding_value,
+        )
+        return _numpy_features_to_tensor(features)
+
+    def estimate_num_frames(self, num_samples: int, sample_rate: int) -> int:
+        if num_samples <= 0 or sample_rate <= 0:
+            return 0
+        effective_samples = int(num_samples)
+        if int(sample_rate) != self.sample_rate:
+            effective_samples = max(
+                1,
+                int(math.ceil((effective_samples * self.sample_rate) / int(sample_rate))),
+            )
+        return max(1, int(math.ceil(effective_samples / max(1, self.hop_length))))
+
+    def config_dict(self) -> dict[str, object]:
+        return {
+            "type": "w2v_bert",
+            "model_source": self.model_source,
+            "sample_rate": self.sample_rate,
+            "feature_size": self.feature_size,
+            "stride": self.stride,
+            "feature_dim": self.n_mels,
+            "padding_value": self.padding_value,
+        }
 
 
 class AudioFeaturizer(torch.nn.Module):

@@ -11,7 +11,6 @@ import torch
 from tqdm.auto import tqdm
 
 from squeezeformer_pytorch.data import (
-    AudioFeaturizer,
     SpecAugment,
     WaveformAugment,
     feature_cache_path,
@@ -22,8 +21,9 @@ from squeezeformer_pytorch.data import (
     normalize_feature_tensor,
     prevalidate_records,
 )
+from squeezeformer_pytorch.frontend import RustAudioFeaturizer
 
-_WORKER_FEATURIZER: AudioFeaturizer | None = None
+_WORKER_FEATURIZER: RustAudioFeaturizer | None = None
 _WORKER_SPECAUGMENT: SpecAugment | None = None
 _WORKER_WAVEFORM_AUGMENT: WaveformAugment | None = None
 
@@ -103,7 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--frontend-backend",
         default="torchaudio",
-        choices=["torchaudio", "audioflux"],
+        choices=["torchaudio"],
+        help="Feature frontend backend. The Rust extractor supports the torchaudio-compatible path.",
     )
     parser.add_argument("--n-fft", type=int, default=512)
     parser.add_argument("--hop-length", type=int, default=160)
@@ -284,7 +285,7 @@ def extract_record_features(
     augmentation_config: dict[str, object] | None,
     overwrite: bool,
 ) -> str:
-    featurizer = _WORKER_FEATURIZER or AudioFeaturizer(**featurizer_kwargs)
+    featurizer = _WORKER_FEATURIZER or RustAudioFeaturizer(**featurizer_kwargs)
     specaugment = _WORKER_SPECAUGMENT
     waveform_augment = _WORKER_WAVEFORM_AUGMENT
     cache_path = feature_cache_path(
@@ -326,7 +327,7 @@ def _initialize_process_worker(
 ) -> None:
     global _WORKER_FEATURIZER, _WORKER_SPECAUGMENT, _WORKER_WAVEFORM_AUGMENT
     _configure_torch_threads()
-    _WORKER_FEATURIZER = AudioFeaturizer(**featurizer_kwargs)
+    _WORKER_FEATURIZER = RustAudioFeaturizer(**featurizer_kwargs)
     _WORKER_SPECAUGMENT = SpecAugment(**specaugment_kwargs) if specaugment_kwargs else None
     _WORKER_WAVEFORM_AUGMENT = (
         WaveformAugment(**waveform_augment_kwargs) if waveform_augment_kwargs else None
@@ -391,7 +392,7 @@ def main() -> None:
         _resolve_extraction_sources(args, dataset_sources, validation_dataset_sources)
     )
     specaugment, waveform_augment, augmentation_config = _augmentation_modules(args)
-    featurizer = AudioFeaturizer(
+    featurizer = RustAudioFeaturizer(
         sample_rate=args.sample_rate,
         n_fft=args.n_fft,
         hop_length=args.hop_length,
