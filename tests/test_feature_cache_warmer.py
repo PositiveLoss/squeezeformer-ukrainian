@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import polars as pl
 import torch
 
 from feature_cache_warmer.cli import (
@@ -381,3 +382,34 @@ def test_sharded_parquet_feature_cache_close_flushes_buffered_rows(tmp_path: Pat
     assert not list((tmp_path / "feature_shards").glob("features_*/part_*.parquet"))
     cache.close()
     assert list((tmp_path / "feature_shards").glob("features_*/part_*.parquet"))
+
+
+def test_sharded_parquet_feature_cache_loads_rust_payload(tmp_path: Path) -> None:
+    featurizer = AudioFeaturizer()
+    cache = ShardedParquetFeatureCache(tmp_path)
+    key = cache._key("utt0", featurizer)
+    shard_index = cache._shard_index(key)
+    shard_dir = tmp_path / "feature_shards" / f"features_{shard_index:02d}"
+    shard_dir.mkdir(parents=True)
+    values = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    payload = bytearray(b"SFCF32L1")
+    payload.extend((2).to_bytes(4, "little"))
+    payload.extend((3).to_bytes(4, "little"))
+    payload.extend(values.numpy().astype("<f4", copy=False).tobytes())
+    pl.DataFrame(
+        {
+            "key": [key],
+            "payload": [bytes(payload)],
+            "deleted": [False],
+        },
+        schema={
+            "key": pl.String,
+            "payload": pl.Binary,
+            "deleted": pl.Boolean,
+        },
+    ).write_parquet(shard_dir / "part_rust_test.parquet")
+
+    loaded = cache.load("utt0", featurizer)
+
+    assert loaded is not None
+    assert torch.equal(loaded, values)

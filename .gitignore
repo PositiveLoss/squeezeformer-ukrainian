@@ -5,6 +5,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
+# Rust
+/target/
+/rust_feature_cache_warmer/target/
+**/*.rs.bk
+
 artifacts/
 checkpoints/
 outputs/

@@ -8,6 +8,7 @@ import math
 import multiprocessing as mp
 import os
 import re
+import struct
 import sys
 import time
 import wave
@@ -1223,6 +1224,29 @@ def feature_tensor_is_plausible(
     return 0 < normalized.size(0) <= max_reasonable_feature_frames(record)
 
 
+_RUST_FEATURE_PAYLOAD_MAGIC = b"SFCF32L1"
+_RUST_FEATURE_PAYLOAD_HEADER_SIZE = len(_RUST_FEATURE_PAYLOAD_MAGIC) + 8
+
+
+def _load_feature_cache_payload(payload: bytes) -> Tensor:
+    if not payload.startswith(_RUST_FEATURE_PAYLOAD_MAGIC):
+        return torch.load(io.BytesIO(payload), map_location="cpu")
+    if len(payload) < _RUST_FEATURE_PAYLOAD_HEADER_SIZE:
+        raise ValueError("Rust feature cache payload is shorter than its header.")
+    rows, cols = struct.unpack_from("<II", payload, len(_RUST_FEATURE_PAYLOAD_MAGIC))
+    expected_size = _RUST_FEATURE_PAYLOAD_HEADER_SIZE + int(rows) * int(cols) * 4
+    if len(payload) != expected_size:
+        raise ValueError(
+            "Rust feature cache payload has invalid size: "
+            f"got {len(payload)} bytes, expected {expected_size}."
+        )
+    values = torch.frombuffer(
+        bytearray(payload[_RUST_FEATURE_PAYLOAD_HEADER_SIZE:]),
+        dtype=torch.float32,
+    ).clone()
+    return values.reshape(int(rows), int(cols))
+
+
 class ShardedParquetFeatureCache:
     def __init__(
         self,
@@ -1330,7 +1354,7 @@ class ShardedParquetFeatureCache:
             payload = row["payload"]
             if not isinstance(payload, bytes):
                 return None
-            return torch.load(io.BytesIO(payload), map_location="cpu")
+            return _load_feature_cache_payload(payload)
         part_paths = sorted(
             self._shard_path(shard_index).glob("part_*.parquet"),
             key=lambda path: (path.stat().st_mtime_ns, path.name),
@@ -1350,7 +1374,7 @@ class ShardedParquetFeatureCache:
             payload = row["payload"]
             if payload is None:
                 return None
-            return torch.load(io.BytesIO(payload), map_location="cpu")
+            return _load_feature_cache_payload(payload)
         return None
 
     def store(self, utterance_id: str, featurizer: AudioFeaturizer, features: Tensor) -> None:
