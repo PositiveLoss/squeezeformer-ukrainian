@@ -799,12 +799,13 @@ def build_paper_scheduler(
     eden_start_scale: float = 0.5,
 ):
     if schedule_type == "eden":
+
         def lr_lambda(step: int) -> float:
             batch_index = step + 1
             epoch_index = batch_index / max(1, steps_per_epoch)
-            factor = (
-                ((batch_index**2 + eden_step_scale**2) / (eden_step_scale**2)) ** -0.25
-            ) * (((epoch_index**2 + eden_epoch_scale**2) / (eden_epoch_scale**2)) ** -0.25)
+            factor = (((batch_index**2 + eden_step_scale**2) / (eden_step_scale**2)) ** -0.25) * (
+                ((epoch_index**2 + eden_epoch_scale**2) / (eden_epoch_scale**2)) ** -0.25
+            )
             if batch_index >= eden_warmup_steps:
                 warmup_factor = 1.0
             else:

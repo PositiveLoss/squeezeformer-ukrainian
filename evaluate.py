@@ -94,8 +94,7 @@ def checkpoint_uses_zipformer_transducer(checkpoint_data: dict[str, object]) -> 
         return bool(training_args.get("zipformer_transducer"))
     model_state_dict = checkpoint_data.get("model_state_dict")
     return isinstance(model_state_dict, dict) and any(
-        key.startswith("decoder.") or key.startswith("joiner.")
-        for key in model_state_dict
+        key.startswith("decoder.") or key.startswith("joiner.") for key in model_state_dict
     )
 
 

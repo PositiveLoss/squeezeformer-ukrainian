@@ -242,7 +242,9 @@ class ZipformerCTC(nn.Module):
             raise RuntimeError("Audio teacher projection head is disabled for this model.")
         mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
         pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
-        pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
+        pooled = pooled / lengths.clamp_min(1).to(
+            device=hidden.device, dtype=hidden.dtype
+        ).unsqueeze(1)
         return apply_linear_with_fp8_padding(self.audio_teacher_projection, pooled)
 
     def forward(
@@ -364,7 +366,9 @@ class ZipformerTransducer(nn.Module):
             raise RuntimeError("Audio teacher projection head is disabled for this model.")
         mask = _make_padding_mask(lengths, max_length=hidden.size(1)).unsqueeze(-1)
         pooled = hidden.masked_fill(~mask, 0.0).sum(dim=1)
-        pooled = pooled / lengths.clamp_min(1).to(device=hidden.device, dtype=hidden.dtype).unsqueeze(1)
+        pooled = pooled / lengths.clamp_min(1).to(
+            device=hidden.device, dtype=hidden.dtype
+        ).unsqueeze(1)
         return apply_linear_with_fp8_padding(self.audio_teacher_projection, pooled)
 
     def encode(self, features: Tensor, feature_lengths: Tensor) -> tuple[Tensor, Tensor]:
@@ -468,12 +472,16 @@ class ZipformerTransducer(nn.Module):
             else encoded.new_full((batch_size, max_time, 0), float("-inf"), dtype=torch.float32)
         )
 
-        valid_time = torch.arange(max_time, device=output_lengths.device).view(1, -1, 1) < output_lengths.view(
+        valid_time = torch.arange(max_time, device=output_lengths.device).view(
+            1, -1, 1
+        ) < output_lengths.view(
             batch_size,
             1,
             1,
         )
-        valid_blank_u = torch.arange(u_plus_one, device=target_lengths.device).view(1, 1, -1) <= target_lengths.view(
+        valid_blank_u = torch.arange(u_plus_one, device=target_lengths.device).view(
+            1, 1, -1
+        ) <= target_lengths.view(
             batch_size,
             1,
             1,

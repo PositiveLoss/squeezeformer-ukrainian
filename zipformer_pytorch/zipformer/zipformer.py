@@ -123,9 +123,9 @@ def _compute_sign_factor(
     if min_positive == 0.0:
         factor1 = 0.0
     else:
-        factor1 = (
-            (min_positive - proportion_positive) * (gain_factor / min_positive)
-        ).clamp_(min=0.0, max=max_factor)
+        factor1 = ((min_positive - proportion_positive) * (gain_factor / min_positive)).clamp_(
+            min=0.0, max=max_factor
+        )
 
     if max_positive == 1.0:
         factor2 = 0.0
@@ -273,9 +273,7 @@ class Whiten(nn.Module):
         if num_groups < 1:
             raise ValueError(f"num_groups must be >= 1, got {num_groups}.")
         if whitening_limit < 1.0:
-            raise ValueError(
-                f"whitening_limit must be >= 1.0, got {whitening_limit}."
-            )
+            raise ValueError(f"whitening_limit must be >= 1.0, got {whitening_limit}.")
         self.num_groups = num_groups
         self.whitening_limit = whitening_limit
         self.grad_scale = grad_scale
@@ -322,9 +320,7 @@ class BiasNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if x.size(-1) != self.num_features:
-            raise ValueError(
-                f"BiasNorm expected {self.num_features} channels, got {x.size(-1)}."
-            )
+            raise ValueError(f"BiasNorm expected {self.num_features} channels, got {x.size(-1)}.")
         bias = self.bias.view(*([1] * (x.ndim - 1)), self.num_features)
         rms = (x - bias).pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return x / rms * self.log_scale.exp()
@@ -350,7 +346,11 @@ class BypassModule(nn.Module):
         self.max_value = max_value
 
     def _current_scale(self) -> Tensor:
-        minimum = self.warmup_min if self.training and self.batch_count < self.warmup_batches else self.steady_min
+        minimum = (
+            self.warmup_min
+            if self.training and self.batch_count < self.warmup_batches
+            else self.steady_min
+        )
         return self.scale.clamp(min=minimum, max=self.max_value)
 
     def forward(self, residual: Tensor, update: Tensor) -> Tensor:
@@ -590,7 +590,9 @@ class CompactRelPositionalEncoding(nn.Module):
     def __init__(self, embed_dim: int, dropout: float = 0.0, length_factor: float = 1.0) -> None:
         super().__init__()
         if embed_dim % 2 != 0:
-            raise ValueError(f"CompactRelPositionalEncoding requires an even dimension, got {embed_dim}.")
+            raise ValueError(
+                f"CompactRelPositionalEncoding requires an even dimension, got {embed_dim}."
+            )
         if length_factor < 1.0:
             raise ValueError(f"length_factor must be >= 1.0, got {length_factor}.")
         self.embed_dim = embed_dim
@@ -607,13 +609,17 @@ class CompactRelPositionalEncoding(nn.Module):
         frequencies = 1 + torch.arange(self.embed_dim // 2, device=device, dtype=torch.float32)
 
         compression_length = math.sqrt(self.embed_dim)
-        compressed = compression_length * positions.sign() * (
-            (positions.abs() + compression_length).log() - math.log(compression_length)
+        compressed = (
+            compression_length
+            * positions.sign()
+            * ((positions.abs() + compression_length).log() - math.log(compression_length))
         )
         length_scale = self.length_factor * self.embed_dim / (2.0 * math.pi)
         angles = torch.atan(compressed / length_scale)
 
-        encoding = torch.zeros(positions.size(0), self.embed_dim, device=device, dtype=torch.float32)
+        encoding = torch.zeros(
+            positions.size(0), self.embed_dim, device=device, dtype=torch.float32
+        )
         encoding[:, 0::2] = torch.cos(angles * frequencies)
         encoding[:, 1::2] = torch.sin(angles * frequencies)
         encoding[:, -1] = 1.0
@@ -635,7 +641,7 @@ class MultiHeadAttentionWeights(nn.Module):
         self.num_heads = num_heads
         self.query_head_dim = query_head_dim
         self.pos_head_dim = pos_head_dim
-        self.scale = query_head_dim ** -0.5
+        self.scale = query_head_dim**-0.5
         self.query_proj = make_linear(
             embed_dim,
             num_heads * query_head_dim,

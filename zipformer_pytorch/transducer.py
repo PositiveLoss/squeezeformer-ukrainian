@@ -42,10 +42,16 @@ def linear_prune_ranges(
     effective_range = max(1, min(prune_range, int(target_lengths.max().item()) + 1))
     time_indices = torch.arange(max_time, device=output_lengths.device).unsqueeze(0)
     centers = (
-        ((time_indices.to(torch.float32) + 0.5)
-        * (target_lengths + 1).unsqueeze(1).to(torch.float32))
-        / output_lengths.clamp_min(1).unsqueeze(1).to(torch.float32)
-    ).floor().to(torch.long)
+        (
+            (
+                (time_indices.to(torch.float32) + 0.5)
+                * (target_lengths + 1).unsqueeze(1).to(torch.float32)
+            )
+            / output_lengths.clamp_min(1).unsqueeze(1).to(torch.float32)
+        )
+        .floor()
+        .to(torch.long)
+    )
     half_width = effective_range // 2
     starts = (centers - half_width).clamp_min(0)
     max_start = (target_lengths + 1 - effective_range).clamp_min(0).unsqueeze(1)
@@ -202,7 +208,9 @@ class Hypothesis:
         return tuple(self.tokens)
 
 
-def _update_hypothesis_pool(pool: dict[tuple[int, ...], Hypothesis], hypothesis: Hypothesis) -> None:
+def _update_hypothesis_pool(
+    pool: dict[tuple[int, ...], Hypothesis], hypothesis: Hypothesis
+) -> None:
     existing = pool.get(hypothesis.key)
     if existing is None:
         pool[hypothesis.key] = hypothesis
@@ -313,11 +321,16 @@ def transducer_modified_beam_search(
             )
             decoder_out = model.decoder(decoder_input, need_pad=False)
             decoder_out = model.joiner.project_decoder(decoder_out)
-            logits = model.joiner(
-                encoder_proj[:, frame_index : frame_index + 1].unsqueeze(2),
-                decoder_out.unsqueeze(1),
-                project_input=False,
-            ).squeeze(0).squeeze(0).squeeze(0)
+            logits = (
+                model.joiner(
+                    encoder_proj[:, frame_index : frame_index + 1].unsqueeze(2),
+                    decoder_out.unsqueeze(1),
+                    project_input=False,
+                )
+                .squeeze(0)
+                .squeeze(0)
+                .squeeze(0)
+            )
             log_probs = F.log_softmax(logits.float(), dim=-1)
             topk_values, topk_indices = torch.topk(log_probs, k=min(beam_size, log_probs.numel()))
 
@@ -327,7 +340,9 @@ def transducer_modified_beam_search(
             )
             _update_hypothesis_pool(next_hypotheses, blank_hypothesis)
 
-            for log_prob, token_index in zip(topk_values.tolist(), topk_indices.tolist(), strict=True):
+            for log_prob, token_index in zip(
+                topk_values.tolist(), topk_indices.tolist(), strict=True
+            ):
                 token_id = int(token_index)
                 if token_id == blank_id:
                     continue

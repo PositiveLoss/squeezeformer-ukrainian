@@ -144,9 +144,7 @@ class W2VBertConfig:
         hf_config = AutoConfig.from_pretrained(model_source, trust_remote_code=True)
         hf_config = _disable_hf_internal_specaugment(hf_config)
         hidden_size = int(getattr(hf_config, "hidden_size", 1024))
-        resolved_feature_dim = int(
-            getattr(hf_config, "feature_projection_input_dim", feature_dim)
-        )
+        resolved_feature_dim = int(getattr(hf_config, "feature_projection_input_dim", feature_dim))
         return cls(
             model_name=model_source,
             hidden_size=hidden_size,
@@ -238,7 +236,9 @@ class W2VBertFeatureExtractor(nn.Module):
         if waveform.dim() == 2:
             waveform = waveform.mean(dim=0)
         elif waveform.dim() != 1:
-            raise ValueError(f"Expected waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}.")
+            raise ValueError(
+                f"Expected waveform with shape [time] or [channels, time], got {tuple(waveform.shape)}."
+            )
         if int(sample_rate) != self.sample_rate:
             waveform = torchaudio.functional.resample(
                 waveform.unsqueeze(0),

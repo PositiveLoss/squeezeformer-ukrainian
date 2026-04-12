@@ -224,7 +224,9 @@ def test_parse_args_rejects_hf_checkpoint_upload_without_repo() -> None:
     with pytest.raises(ValueError) as error:
         parse_args(["--device", "cpu", "--hf-upload-checkpoints"])
 
-    assert str(error.value) == "--hf-upload-repo-id is required when --hf-upload-checkpoints is set."
+    assert (
+        str(error.value) == "--hf-upload-repo-id is required when --hf-upload-checkpoints is set."
+    )
 
 
 def test_parse_args_accepts_hf_checkpoint_upload_options() -> None:
