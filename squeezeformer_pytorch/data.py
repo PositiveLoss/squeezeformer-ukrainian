@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import io
 import logging
@@ -1238,6 +1239,7 @@ class ShardedParquetFeatureCache:
         self._pending_rows: dict[int, list[dict[str, object]]] = {}
         self._part_counters: dict[int, int] = {}
         self._pid: int | None = None
+        atexit.register(self.close)
 
     def _key(self, utterance_id: str, featurizer: AudioFeaturizer) -> str:
         cache_config: dict[str, object] = {"featurizer": featurizer.config_dict()}

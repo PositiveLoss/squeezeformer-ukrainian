@@ -58,7 +58,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                 f"got {feature_cache_format!r}"
             )
         self.feature_cache = (
-            ShardedParquetFeatureCache(self.feature_cache_dir)
+            ShardedParquetFeatureCache(self.feature_cache_dir, commit_every=1)
             if self.feature_cache_format == "parquet"
             else None
         )
