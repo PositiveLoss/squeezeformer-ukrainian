@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from types import SimpleNamespace
 
 import torch
 from transformers import Wav2Vec2BertConfig as HFWav2Vec2BertConfig
@@ -74,7 +73,13 @@ def test_w2v_bert_ctc_returns_training_outputs_and_backward_runs() -> None:
 
 def test_w2v_bert_uses_transformer_engine_linears_when_fp8_enabled(monkeypatch) -> None:
     class _FakeLinear(torch.nn.Linear):
-        pass
+        seen_input_shapes: list[tuple[int, ...]] = []
+
+        def forward(self, input):
+            self.seen_input_shapes.append(tuple(input.shape))
+            assert input.dim() == 2
+            assert input.size(0) % 16 == 0
+            return super().forward(input)
 
     class _FakeTE:
         Linear = _FakeLinear
@@ -102,48 +107,30 @@ def test_w2v_bert_uses_transformer_engine_linears_when_fp8_enabled(monkeypatch) 
     assert torch.isfinite(outputs["main_ctc_loss"])
 
 
-def test_w2v_bert_fp8_encoder_pads_time_for_transformer_engine_rows() -> None:
-    class _RecordingEncoder(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.config = SimpleNamespace(add_adapter=False)
-            self.input_shape = None
-            self.attention_mask = None
+def test_converted_w2v_bert_fp8_linear_pads_rows_for_backward_safe_gemm(
+    monkeypatch,
+) -> None:
+    class _FakeLinear(torch.nn.Linear):
+        seen_input_shapes: list[tuple[int, ...]] = []
 
-        def forward(self, *, input_features, attention_mask, return_dict):
-            assert return_dict is True
-            self.input_shape = tuple(input_features.shape)
-            self.attention_mask = attention_mask
-            return SimpleNamespace(
-                last_hidden_state=input_features.new_zeros(
-                    input_features.size(0),
-                    input_features.size(1),
-                    16,
-                )
-            )
+        def forward(self, input):
+            self.seen_input_shapes.append(tuple(input.shape))
+            assert input.dim() == 2
+            assert input.size(0) % 16 == 0
+            return super().forward(input)
 
-    model = W2VBertCTC(
-        encoder_config=_tiny_w2v_bert_config(),
-        vocab_size=6,
-        load_pretrained=False,
-        use_transformer_engine=True,
-    )
-    encoder = _RecordingEncoder()
-    model.encoder = encoder
-    model.encoder_requires_fp8_time_padding = True
+    class _FakeTE:
+        Linear = _FakeLinear
 
-    encoded, output_lengths = model._encode(
-        torch.randn(75, 319, 8),
-        torch.full((75,), 319, dtype=torch.long),
-    )
+    monkeypatch.setattr(squeezeformer_model, "te", _FakeTE)
 
-    assert encoder.input_shape == (75, 320, 8)
-    assert encoder.attention_mask is not None
-    assert encoder.attention_mask.shape == (75, 320)
-    assert encoder.attention_mask[:, :319].all()
-    assert not encoder.attention_mask[:, 319:].any()
-    assert encoded.shape == (75, 320, 16)
-    assert output_lengths.tolist() == [319] * 75
+    replacement = w2v_bert_asr._linear_to_transformer_engine(torch.nn.Linear(16, 32))
+    assert replacement is not None
+
+    output = replacement(torch.randn(75, 319, 16))
+
+    assert output.shape == (75, 319, 32)
+    assert replacement.seen_input_shapes == [(23936, 16)]
 
 
 def test_w2v_bert_feature_extractor_matches_asr_dataset_contract() -> None:
