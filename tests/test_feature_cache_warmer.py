@@ -4,13 +4,13 @@ from pathlib import Path
 
 import torch
 
-from squeezeformer_pytorch.data import AudioFeaturizer, AudioRecord, ShardedParquetFeatureCache
-from squeezeformer_pytorch.runtime_types import FeatureCacheFormat
-from squeezeformer_pytorch.training.feature_cache_warmer import (
+from feature_cache_warmer.cli import (
     FeatureCacheWarmDataset,
     _resolve_cache_warm_splits,
     parse_args,
 )
+from squeezeformer_pytorch.data import AudioFeaturizer, AudioRecord, ShardedParquetFeatureCache
+from squeezeformer_pytorch.runtime_types import FeatureCacheFormat
 
 
 def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: Path) -> None:
@@ -20,6 +20,8 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
             "both",
             "--cache-warm-workers",
             "4",
+            "--cache-warm-timeout",
+            "60",
             "--device",
             "cpu",
             "--feature-cache-dir",
@@ -31,6 +33,7 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
 
     assert args.cache_warm_split == "both"
     assert args.cache_warm_workers == 4
+    assert args.cache_warm_timeout == 60
     assert args.feature_cache_dir == str(tmp_path / "cache")
     assert args.feature_cache_format == FeatureCacheFormat.PARQUET
 
@@ -66,9 +69,7 @@ def test_feature_cache_warmer_writes_file_cache(tmp_path: Path, monkeypatch) -> 
         load_calls += 1
         return torch.ones(1, 320), 16_000
 
-    monkeypatch.setattr(
-        "squeezeformer_pytorch.training.feature_cache_warmer.load_audio", fake_load_audio
-    )
+    monkeypatch.setattr("feature_cache_warmer.cli.load_audio", fake_load_audio)
     dataset = FeatureCacheWarmDataset(
         [AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         featurizer=AudioFeaturizer(),
@@ -96,9 +97,7 @@ def test_feature_cache_warmer_writes_parquet_cache(tmp_path: Path, monkeypatch) 
         load_calls += 1
         return torch.ones(1, 320), 16_000
 
-    monkeypatch.setattr(
-        "squeezeformer_pytorch.training.feature_cache_warmer.load_audio", fake_load_audio
-    )
+    monkeypatch.setattr("feature_cache_warmer.cli.load_audio", fake_load_audio)
     dataset = FeatureCacheWarmDataset(
         [AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
         featurizer=AudioFeaturizer(),
@@ -125,9 +124,7 @@ def test_feature_cache_warmer_can_return_features_for_main_process_write(
     ) -> tuple[torch.Tensor, int]:
         return torch.ones(1, 320), 16_000
 
-    monkeypatch.setattr(
-        "squeezeformer_pytorch.training.feature_cache_warmer.load_audio", fake_load_audio
-    )
+    monkeypatch.setattr("feature_cache_warmer.cli.load_audio", fake_load_audio)
     featurizer = AudioFeaturizer()
     dataset = FeatureCacheWarmDataset(
         [AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
