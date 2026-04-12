@@ -612,6 +612,7 @@ def _build_disk_backed_record_store(
     hf_token: str | None = None,
     cache_dir: str | None = None,
     require_readable_audio: bool = False,
+    require_audio_bytes: bool = False,
 ) -> DiskBackedRecordStore:
     records_path.parent.mkdir(parents=True, exist_ok=True)
     audio_blob_dir = records_path.parent / f"{records_path.stem}_audio_blobs"
@@ -691,6 +692,9 @@ def _build_disk_backed_record_store(
             )
             for record in record_iterator:
                 audio_bytes = record.audio_bytes
+                if require_audio_bytes and audio_bytes is None:
+                    skipped_unreadable_audio += 1
+                    continue
                 if audio_bytes is None and record.audio_path is not None:
                     try:
                         audio_bytes = read_binary_source(
@@ -710,8 +714,9 @@ def _build_disk_backed_record_store(
                     ):
                         skipped_unreadable_audio += 1
                         continue
-                preserve_audio_bytes = audio_bytes is not None and not (
-                    record.audio_path is not None and Path(record.audio_path).exists()
+                preserve_audio_bytes = audio_bytes is not None and (
+                    require_audio_bytes
+                    or not (record.audio_path is not None and Path(record.audio_path).exists())
                 )
                 audio_blob_path: str | None = None
                 if preserve_audio_bytes:
@@ -1105,6 +1110,8 @@ def _load_train_val_records(
             common_record_store_kwargs["max_audio_duration_sec"] = args.max_audio_duration_sec
         if getattr(args, "require_readable_audio", False):
             common_record_store_kwargs["require_readable_audio"] = True
+        if getattr(args, "require_audio_bytes", False):
+            common_record_store_kwargs["require_audio_bytes"] = True
         record_store_dir = (
             Path(args.record_cache_dir)
             if args.record_cache_dir is not None

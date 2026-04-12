@@ -355,6 +355,15 @@ def _add_warmer_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--cache-warm-audio-source",
+        choices=["any", "bytes"],
+        default="any",
+        help=(
+            "Which audio records to warm. 'any' accepts embedded bytes or readable paths. "
+            "'bytes' warms only records whose manifest row provides embedded audio bytes."
+        ),
+    )
+    parser.add_argument(
         "--cache-warm-overwrite",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -684,6 +693,7 @@ def main(argv: list[str] | None = None) -> None:
     lowercase_transcripts = args.tokenizer != "sentencepiece"
     output_dir = Path(args.output_dir)
     args.require_readable_audio = True
+    args.require_audio_bytes = args.cache_warm_audio_source == "bytes"
     logger.info(
         "loading records train_sources=%s validation_sources=%s record_cache=%s",
         train_sources,

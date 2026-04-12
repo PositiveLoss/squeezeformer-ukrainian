@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import squeezeformer_pytorch.training.data_loading as data_loading
+from squeezeformer_pytorch.data import AudioRecord
 from squeezeformer_pytorch.training.data_loading import (
     _build_disk_backed_record_store,
     _shard_records_for_rank,
@@ -60,3 +62,53 @@ def test_build_disk_backed_record_store_can_require_readable_audio(tmp_path: Pat
 
     assert len(store) == 1
     assert store[0].utterance_id == "utt0"
+
+
+def test_build_disk_backed_record_store_can_require_audio_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "present.wav").write_bytes(b"path audio should not be used")
+
+    def fake_iter_records(*args, **kwargs):
+        return iter(
+            [
+                AudioRecord(
+                    "present.wav",
+                    None,
+                    "path only",
+                    "path-only",
+                    estimated_frames=2,
+                ),
+                AudioRecord(
+                    "present.wav",
+                    b"embedded bytes",
+                    "bytes",
+                    "bytes-record",
+                    estimated_frames=2,
+                ),
+            ]
+        )
+
+    monkeypatch.setattr(data_loading, "iter_records", fake_iter_records)
+
+    store = _build_disk_backed_record_store(
+        [dataset_root],
+        split="train",
+        seed=13,
+        val_fraction=0.0,
+        test_fraction=0.0,
+        max_samples=None,
+        min_transcript_chars=1,
+        max_transcript_chars=400,
+        max_symbol_ratio=0.5,
+        lowercase_transcripts=True,
+        records_path=tmp_path / "records" / "train.jsonl",
+        require_audio_bytes=True,
+    )
+
+    assert len(store) == 1
+    record = store[0]
+    assert record.utterance_id == "bytes-record"
+    assert record.audio_bytes == b"embedded bytes"

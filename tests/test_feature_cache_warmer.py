@@ -30,6 +30,8 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
             str(tmp_path / "skip.txt"),
             "--cache-warm-failed-list",
             str(tmp_path / "failed.tsv"),
+            "--cache-warm-audio-source",
+            "bytes",
             "--device",
             "cpu",
             "--feature-cache-dir",
@@ -45,6 +47,7 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
     assert args.cache_warm_record_timeout == 7
     assert args.cache_warm_skip_list == str(tmp_path / "skip.txt")
     assert args.cache_warm_failed_list == str(tmp_path / "failed.tsv")
+    assert args.cache_warm_audio_source == "bytes"
     assert args.feature_cache_dir == str(tmp_path / "cache")
     assert args.feature_cache_format == FeatureCacheFormat.PARQUET
 
