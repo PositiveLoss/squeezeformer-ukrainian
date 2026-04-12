@@ -47,6 +47,7 @@ from squeezeformer_pytorch.data import (
     iter_manifest_rows_from_source,
     iter_records,
     iter_records_from_source,
+    load_audio,
     load_corpus_texts,
     load_records,
     normalize_transcript,
@@ -136,6 +137,27 @@ def test_probe_audio_metadata_falls_back_to_load_when_info_is_unavailable(
     monkeypatch.setattr("squeezeformer_pytorch.data.torchaudio.load", fake_load)
 
     assert probe_audio_metadata(None, b"opus") == (48_000, 48_000)
+
+
+def test_load_audio_prefers_embedded_bytes_over_stale_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale_path = tmp_path / "stale.opus"
+    stale_path.write_bytes(b"path audio")
+    observed_sources = []
+
+    def fake_load(source):
+        observed_sources.append(source)
+        return torch.zeros(1, 16), 16_000
+
+    monkeypatch.setattr("squeezeformer_pytorch.data.torchaudio.load", fake_load)
+
+    waveform, sample_rate = load_audio(str(stale_path), b"blob audio")
+
+    assert waveform.shape == (1, 16)
+    assert sample_rate == 16_000
+    assert len(observed_sources) == 1
+    assert isinstance(observed_sources[0], BytesIO)
 
 
 def test_audio_preview_filename_strips_source_audio_extension() -> None:

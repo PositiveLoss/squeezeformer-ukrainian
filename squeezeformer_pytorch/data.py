@@ -855,17 +855,17 @@ def probe_audio_metadata(audio_path: str | None, audio_bytes: bytes | None) -> t
 
 def load_audio(audio_path: str | None, audio_bytes: bytes | None) -> tuple[Tensor, int]:
     try:
-        if audio_path is not None and Path(audio_path).exists():
-            return torchaudio.load(audio_path)
         if audio_bytes is not None:
             return torchaudio.load(io.BytesIO(audio_bytes))
+        if audio_path is not None and Path(audio_path).exists():
+            return torchaudio.load(audio_path)
     except ImportError:
         pass
 
-    if audio_path is not None and Path(audio_path).exists():
-        return _load_wave_from_stdlib(audio_path)
     if audio_bytes is not None:
         return _load_wave_from_stdlib(io.BytesIO(audio_bytes))
+    if audio_path is not None and Path(audio_path).exists():
+        return _load_wave_from_stdlib(audio_path)
     raise FileNotFoundError("Audio source is not available.")
 
 
