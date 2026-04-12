@@ -51,7 +51,11 @@ pub(crate) fn decode_audio(
         "decoding audio source={} fallback_sample_rate={} ffmpeg_fallback={}",
         source_label, fallback_sample_rate, ffmpeg_fallback
     );
-    if source_looks_like_tagless_ogg_opus(&source)? {
+    if source_looks_like_ogg_opus(&source)? {
+        debug!(
+            "decoding Ogg/Opus source={} with opus-decoder before Symphonia",
+            source_label
+        );
         return decode_audio_with_opus_decoder_or_ffmpeg(
             source,
             fallback_sample_rate,
@@ -290,18 +294,8 @@ fn source_bytes(source: &AudioSource) -> Result<Vec<u8>> {
     }
 }
 
-fn source_looks_like_tagless_ogg_opus(source: &AudioSource) -> Result<bool> {
-    if !source_has_opus_extension(source) {
-        return Ok(false);
-    }
-    let Some(probe) = source_probe_bytes(source)? else {
-        return Ok(false);
-    };
-    Ok(looks_like_tagless_ogg_opus(&probe))
-}
-
 fn source_looks_like_ogg_opus(source: &AudioSource) -> Result<bool> {
-    if !source_has_opus_extension(source) {
+    if !source_may_be_ogg_opus(source) {
         return Ok(false);
     }
     let Some(probe) = source_probe_bytes(source)? else {
@@ -310,17 +304,21 @@ fn source_looks_like_ogg_opus(source: &AudioSource) -> Result<bool> {
     Ok(contains_subsequence(&probe, b"OggS") && contains_subsequence(&probe, b"OpusHead"))
 }
 
-fn source_has_opus_extension(source: &AudioSource) -> bool {
+fn source_may_be_ogg_opus(source: &AudioSource) -> bool {
+    source_extension(source).is_some_and(|extension| {
+        ["opus", "ogg", "oga", "bin"]
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn source_extension(source: &AudioSource) -> Option<&str> {
     match source {
         AudioSource::Path(path, path_hint) => path_hint
             .as_deref()
             .and_then(path_extension)
-            .or_else(|| path.extension().and_then(|value| value.to_str()))
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("opus")),
-        AudioSource::Bytes(_, path_hint) => path_hint
-            .as_deref()
-            .and_then(path_extension)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("opus")),
+            .or_else(|| path.extension().and_then(|value| value.to_str())),
+        AudioSource::Bytes(_, path_hint) => path_hint.as_deref().and_then(path_extension),
     }
 }
 
@@ -346,12 +344,6 @@ fn source_probe_bytes(source: &AudioSource) -> Result<Option<Vec<u8>>> {
 
 fn path_extension(path: &str) -> Option<&str> {
     Path::new(path).extension().and_then(|value| value.to_str())
-}
-
-fn looks_like_tagless_ogg_opus(bytes: &[u8]) -> bool {
-    contains_subsequence(bytes, b"OggS")
-        && contains_subsequence(bytes, b"OpusHead")
-        && !contains_subsequence(bytes, b"OpusTags")
 }
 
 fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
@@ -758,7 +750,7 @@ mod tests {
         let tagless = strip_ogg_pages_containing(&bytes, b"OpusTags");
         let source = AudioSource::Bytes(tagless, Some("audio.opus".to_string()));
 
-        assert!(source_looks_like_tagless_ogg_opus(&source).unwrap());
+        assert!(source_looks_like_ogg_opus(&source).unwrap());
         let (samples, sample_rate) = decode_audio(source, 16_000, false).unwrap();
 
         assert_eq!(sample_rate, 48_000);
@@ -767,23 +759,23 @@ mod tests {
     }
 
     #[test]
-    fn tagless_ogg_opus_byte_source_prefers_opus_decoder() {
+    fn ogg_opus_byte_source_prefers_opus_decoder() {
         let source = AudioSource::Bytes(
             b"OggS..........OpusHead..........audio-packet".to_vec(),
             Some("audio.opus".to_string()),
         );
 
-        assert!(source_looks_like_tagless_ogg_opus(&source).unwrap());
+        assert!(source_looks_like_ogg_opus(&source).unwrap());
     }
 
     #[test]
-    fn tagged_ogg_opus_byte_source_can_use_symphonia() {
+    fn tagged_ogg_opus_byte_source_prefers_opus_decoder() {
         let source = AudioSource::Bytes(
             b"OggS..........OpusHead..........OpusTags..........audio-packet".to_vec(),
             Some("audio.opus".to_string()),
         );
 
-        assert!(!source_looks_like_tagless_ogg_opus(&source).unwrap());
+        assert!(source_looks_like_ogg_opus(&source).unwrap());
     }
 
     fn generate_test_ogg_opus() -> Option<(tempfile::TempDir, PathBuf)> {
