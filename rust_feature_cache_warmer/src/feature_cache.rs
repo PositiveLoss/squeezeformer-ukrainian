@@ -85,7 +85,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = 0)]
     pub(crate) threads: usize,
 
-    /// Disable ffmpeg fallback when Symphonia cannot decode a codec such as Opus.
+    /// Disable FFmpeg library fallback when Symphonia cannot decode a codec such as Opus.
     #[arg(long, default_value_t = false)]
     pub(crate) no_ffmpeg_fallback: bool,
 

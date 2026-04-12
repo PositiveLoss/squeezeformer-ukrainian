@@ -11,6 +11,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
+bundled-ffmpeg = ["ffmpeg-next/build"]
 python = ["dep:numpy", "dep:pyo3"]
 
 [dependencies]
@@ -20,6 +21,7 @@ arrow = "56"
 clap = { version = "4.5", features = ["derive"] }
 csv = "1.4"
 env_logger = "0.11"
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-resampling"] }
 log = "0.4"
 numpy = { version = "0.28", optional = true }
 parquet = { version = "56", features = ["arrow"] }
@@ -30,6 +32,7 @@ rustfft = "6.4"
 serde_json = "1.0"
 sha2 = "0.10"
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+tempfile = "3.23"
 
 [profile.release]
 codegen-units = 1

@@ -94,6 +94,11 @@ cd rust_feature_cache_warmer
 maturin develop --features python --release
 ```
 
+Use `maturin develop --features python,bundled-ffmpeg --release` to link the
+native feature extractor against the bundled FFmpeg 8.x build instead of system
+FFmpeg development libraries. On Debian/Ubuntu, install `clang`, `nasm`, and
+`pkg-config` first.
+
 CUDA setup:
 
 ```bash

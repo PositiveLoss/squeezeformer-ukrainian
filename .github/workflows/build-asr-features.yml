@@ -32,13 +32,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install bundled FFmpeg build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang nasm pkg-config
+
       - name: Build release binary
         run: |
           cargo build \
             --release \
             --locked \
             --manifest-path rust_feature_cache_warmer/Cargo.toml \
-            --bin asr-features
+            --bin asr-features \
+            --features bundled-ffmpeg
 
       - name: Package binary
         run: |
@@ -67,6 +73,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install bundled FFmpeg build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang nasm pkg-config
+
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -81,7 +92,7 @@ jobs:
           python -m maturin build \
             --release \
             --locked \
-            --features python \
+            --features python,bundled-ffmpeg \
             --out ../dist/wheels
 
       - name: Upload wheel artifact

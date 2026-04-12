@@ -4,8 +4,24 @@ This crate reads dataset parquet manifest files, decodes audio with Symphonia, c
 log-mel features with RustFFT, resamples non-16 kHz audio with Rubato, and writes
 the sharded parquet cache layout consumed by `ShardedParquetFeatureCache`.
 Ogg/Vorbis is enabled through Symphonia's Ogg demuxer support. If Symphonia
-cannot decode a codec such as Opus, the CLI falls back to `ffmpeg`; pass
-`--no-ffmpeg-fallback` to disable that.
+cannot decode a codec such as Opus, the CLI falls back to FFmpeg through
+`ffmpeg-next`/libavcodec; pass `--no-ffmpeg-fallback` to disable that. No
+external `ffmpeg` executable is spawned.
+
+Build against the system FFmpeg development libraries with the default feature
+set:
+
+```bash
+cargo build --release --manifest-path rust_feature_cache_warmer/Cargo.toml --bin asr-features
+```
+
+To build and statically link the FFmpeg 8.x release used by `ffmpeg-sys-next`
+instead of system-installed FFmpeg libraries, enable `bundled-ffmpeg`:
+
+```bash
+sudo apt-get install -y clang nasm pkg-config
+cargo build --release --manifest-path rust_feature_cache_warmer/Cargo.toml --bin asr-features --features bundled-ffmpeg
+```
 
 Example:
 
@@ -106,6 +122,9 @@ and install it into the active Python environment with:
 cd rust_feature_cache_warmer
 maturin develop --features python --release
 ```
+
+Use `maturin develop --features python,bundled-ffmpeg --release` when the Python
+extension should also link the bundled FFmpeg 8.x build.
 
 The extension module is `asr_features`:
 
