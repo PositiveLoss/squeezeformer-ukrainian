@@ -53,8 +53,10 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         write_cache: bool = True,
         record_timeout_seconds: float = 0.0,
         skipped_audio_sources: set[str] | None = None,
+        indices: list[int] | None = None,
     ) -> None:
         self.records = records
+        self.indices = indices
         self.featurizer = featurizer
         self.feature_cache_dir = Path(feature_cache_dir)
         self.feature_cache_format = str(feature_cache_format)
@@ -75,7 +77,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         self.skipped_audio_sources = skipped_audio_sources or set()
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.indices) if self.indices is not None else len(self.records)
 
     def close(self) -> None:
         if self.feature_cache is not None:
@@ -117,12 +119,14 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         return False
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
+        record_index = self.indices[index] if self.indices is not None else index
+        record = self.records[record_index]
         started_at = time.perf_counter()
         try:
             if _record_matches_skip_list(record, self.skipped_audio_sources):
                 return {
                     "status": "skipped",
+                    "index": record_index,
                     "utterance_id": record.utterance_id,
                     "audio_path": record.audio_path,
                     "frames": int(record.estimated_frames),
@@ -132,6 +136,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                 if not self.overwrite and self._cache_hit(record):
                     return {
                         "status": "hit",
+                        "index": record_index,
                         "utterance_id": record.utterance_id,
                         "frames": int(record.estimated_frames),
                         "elapsed": time.perf_counter() - started_at,
@@ -146,6 +151,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                 ):
                     return {
                         "status": "invalid",
+                        "index": record_index,
                         "utterance_id": record.utterance_id,
                         "frames": int(getattr(features, "shape", [0])[0]),
                         "elapsed": time.perf_counter() - started_at,
@@ -156,6 +162,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                 elif self.feature_cache is not None:
                     return {
                         "status": "written",
+                        "index": record_index,
                         "utterance_id": record.utterance_id,
                         "features": features,
                         "frames": int(features.size(0)),
@@ -170,6 +177,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                     torch.save(features, path)
                 return {
                     "status": "written",
+                    "index": record_index,
                     "utterance_id": record.utterance_id,
                     "frames": int(features.size(0)),
                     "elapsed": time.perf_counter() - started_at,
@@ -177,6 +185,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         except Exception as error:
             return {
                 "status": "failed",
+                "index": record_index,
                 "utterance_id": record.utterance_id,
                 "audio_path": record.audio_path,
                 "error": str(error),
@@ -230,6 +239,17 @@ def _append_failed_record(path: str | Path | None, item: dict[str, Any]) -> None
         handle.write(
             f"{audio_path}\t{utterance_id}\t{error.replace(chr(9), ' ').replace(chr(10), ' ')}\n"
         )
+
+
+def _append_skipped_record(path: str | Path | None, record: AudioRecord, error: str) -> None:
+    _append_failed_record(
+        path,
+        {
+            "audio_path": record.audio_path,
+            "utterance_id": record.utterance_id,
+            "error": error,
+        },
+    )
 
 
 @contextmanager
@@ -327,6 +347,16 @@ def _add_warmer_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "DataLoader timeout in seconds while waiting for worker output. "
             "The default 0 disables timeout and only logs waits."
+        ),
+    )
+    parser.add_argument(
+        "--cache-warm-skip-on-timeout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When the DataLoader times out, mark the next pending record as skipped, rebuild "
+            "the loader, and continue. With --no-dataloader-in-order the skipped record is a "
+            "best-effort candidate because workers can finish out of order."
         ),
     )
     parser.add_argument(
@@ -536,17 +566,6 @@ def _warm_split(
         if workers > 0 and str(args.feature_cache_format) == "parquet"
         else None
     )
-    dataset = FeatureCacheWarmDataset(
-        records,
-        featurizer=featurizer,
-        feature_cache_dir=cache_dir,
-        feature_cache_format=args.feature_cache_format,
-        overwrite=args.cache_warm_overwrite,
-        validate_existing=args.cache_warm_validate_existing,
-        write_cache=main_feature_cache is None,
-        record_timeout_seconds=args.cache_warm_record_timeout,
-        skipped_audio_sources=skipped_audio_sources,
-    )
     dataloader_kwargs: dict[str, object] = {}
     if workers > 0:
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -556,14 +575,39 @@ def _warm_split(
             dataloader_kwargs["timeout"] = args.cache_warm_timeout
         if args.dataloader_mp_context != "auto":
             dataloader_kwargs["multiprocessing_context"] = args.dataloader_mp_context
-    loader = DataLoader(
-        dataset,
-        batch_size=args.cache_warm_batch_size,
-        shuffle=False,
-        num_workers=workers,
-        collate_fn=_collate_statuses,
-        **dataloader_kwargs,
-    )
+
+    pending_indices = list(range(len(records)))
+    dataset: FeatureCacheWarmDataset | None = None
+    loader: DataLoader | None = None
+    iterator = None
+
+    def rebuild_loader() -> None:
+        nonlocal dataset, loader, iterator
+        if dataset is not None:
+            dataset.close()
+        dataset = FeatureCacheWarmDataset(
+            records,
+            featurizer=featurizer,
+            feature_cache_dir=cache_dir,
+            feature_cache_format=args.feature_cache_format,
+            overwrite=args.cache_warm_overwrite,
+            validate_existing=args.cache_warm_validate_existing,
+            write_cache=main_feature_cache is None,
+            record_timeout_seconds=args.cache_warm_record_timeout,
+            skipped_audio_sources=skipped_audio_sources,
+            indices=pending_indices,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=args.cache_warm_batch_size,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=_collate_statuses,
+            **dataloader_kwargs,
+        )
+        iterator = iter(loader)
+
+    rebuild_loader()
     logger.info(
         "%s feature cache warm started records=%s hours=%.2f cache_dir=%s format=%s "
         "workers=%s batch_size=%s prefetch_factor=%s in_order=%s timeout=%s "
@@ -593,11 +637,10 @@ def _warm_split(
     frames = 0
     processed = 0
     log_interval = max(1, int(args.cache_warm_log_interval))
-    iterator = iter(loader)
-    while processed < len(records):
-        next_index = processed
+    while pending_indices:
+        next_index = pending_indices[0]
         description = (
-            f"{split} feature cache warm waiting for item {next_index + 1}/{len(records)} "
+            f"{split} feature cache warm waiting for item {processed + 1}/{len(records)} "
             f"workers={workers} prefetch_factor={args.prefetch_factor if workers > 0 else 'none'} "
             f"in_order={args.dataloader_in_order if workers > 0 else 'none'} "
             f"next={_record_wait_label(records, next_index)}"
@@ -609,6 +652,40 @@ def _warm_split(
                 log_after_seconds=args.cache_warm_wait_log_after,
                 log_every_seconds=args.cache_warm_wait_log_every,
             )
+        except RuntimeError as error:
+            if (
+                not args.cache_warm_skip_on_timeout
+                or args.cache_warm_timeout <= 0
+                or "DataLoader timed out" not in str(error)
+            ):
+                raise
+            skipped_index = pending_indices.pop(0)
+            skipped_record = records[skipped_index]
+            counts["skipped"] = counts.get("skipped", 0) + 1
+            processed += 1
+            reason = f"DataLoader timed out after {args.cache_warm_timeout:g}s"
+            logger.warning(
+                "%s feature cache warm skipped after dataloader timeout index=%s "
+                "utterance_id=%s audio=%s in_order=%s reason=%s",
+                split,
+                skipped_index,
+                skipped_record.utterance_id,
+                skipped_record.audio_path,
+                args.dataloader_in_order if workers > 0 else "none",
+                reason,
+            )
+            _append_skipped_record(args.cache_warm_failed_list, skipped_record, reason)
+            rebuild_loader()
+            if processed % log_interval == 0 or processed >= len(records):
+                _log_progress(
+                    split=split,
+                    processed=processed,
+                    total=len(records),
+                    counts=counts,
+                    frames=frames,
+                    started_at=started_at,
+                )
+            continue
         except StopIteration:
             break
         if wait_seconds >= args.cache_warm_wait_log_after > 0:
@@ -620,6 +697,11 @@ def _warm_split(
                 _format_elapsed_seconds(wait_seconds),
             )
         for item in batch:
+            record_index = int(item.get("index", pending_indices[0] if pending_indices else -1))
+            try:
+                pending_indices.remove(record_index)
+            except ValueError:
+                pass
             status = str(item["status"])
             counts[status] = counts.get(status, 0) + 1
             frames += int(item.get("frames", 0))
@@ -654,7 +736,8 @@ def _warm_split(
                 frames=frames,
                 started_at=started_at,
             )
-    dataset.close()
+    if dataset is not None:
+        dataset.close()
     if main_feature_cache is not None:
         main_feature_cache.close()
     logger.info(
