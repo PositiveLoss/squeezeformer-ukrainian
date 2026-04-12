@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import torch
 
 from feature_cache_warmer.cli import (
     FeatureCacheWarmDataset,
+    _load_skip_list,
     _resolve_cache_warm_splits,
     parse_args,
 )
@@ -22,6 +24,12 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
             "4",
             "--cache-warm-timeout",
             "60",
+            "--cache-warm-record-timeout",
+            "7",
+            "--cache-warm-skip-list",
+            str(tmp_path / "skip.txt"),
+            "--cache-warm-failed-list",
+            str(tmp_path / "failed.tsv"),
             "--device",
             "cpu",
             "--feature-cache-dir",
@@ -34,6 +42,9 @@ def test_parse_feature_cache_warmer_accepts_training_and_warmer_args(tmp_path: P
     assert args.cache_warm_split == "both"
     assert args.cache_warm_workers == 4
     assert args.cache_warm_timeout == 60
+    assert args.cache_warm_record_timeout == 7
+    assert args.cache_warm_skip_list == str(tmp_path / "skip.txt")
+    assert args.cache_warm_failed_list == str(tmp_path / "failed.tsv")
     assert args.feature_cache_dir == str(tmp_path / "cache")
     assert args.feature_cache_format == FeatureCacheFormat.PARQUET
 
@@ -139,6 +150,77 @@ def test_feature_cache_warmer_can_return_features_for_main_process_write(
     assert item["status"] == "written"
     assert item["features"].shape == (3, featurizer.n_mels)
     assert not list((tmp_path / "feature_shards").glob("features_*/part_*.parquet"))
+
+
+def test_feature_cache_warmer_record_timeout_marks_record_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def slow_load_audio(
+        audio_path: str | None, audio_bytes: bytes | None
+    ) -> tuple[torch.Tensor, int]:
+        time.sleep(1.0)
+        return torch.ones(1, 320), 16_000
+
+    monkeypatch.setattr("feature_cache_warmer.cli.load_audio", slow_load_audio)
+    dataset = FeatureCacheWarmDataset(
+        [AudioRecord("dummy.wav", None, "це тест", "utt0", estimated_frames=2)],
+        featurizer=AudioFeaturizer(),
+        feature_cache_dir=tmp_path,
+        feature_cache_format="file",
+        record_timeout_seconds=0.01,
+    )
+
+    item = dataset[0]
+
+    assert item["status"] == "failed"
+    assert "timed out" in item["error"]
+    assert not list(tmp_path.glob("*.pt"))
+
+
+def test_feature_cache_warmer_skip_list_skips_before_loading_audio(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def fake_load_audio(
+        audio_path: str | None, audio_bytes: bytes | None
+    ) -> tuple[torch.Tensor, int]:
+        raise AssertionError("skip list should avoid audio load")
+
+    monkeypatch.setattr("feature_cache_warmer.cli.load_audio", fake_load_audio)
+    dataset = FeatureCacheWarmDataset(
+        [
+            AudioRecord(
+                "/data/common_voice_uk_24203951.opus",
+                None,
+                "це тест",
+                "/data/common_voice_uk_24203951.opus",
+                estimated_frames=2,
+            )
+        ],
+        featurizer=AudioFeaturizer(),
+        feature_cache_dir=tmp_path,
+        feature_cache_format="file",
+        skipped_audio_sources={"common_voice_uk_24203951.opus"},
+    )
+
+    item = dataset[0]
+
+    assert item["status"] == "skipped"
+    assert item["utterance_id"] == "/data/common_voice_uk_24203951.opus"
+    assert not list(tmp_path.glob("*.pt"))
+
+
+def test_load_skip_list_accepts_paths_and_basenames(tmp_path: Path) -> None:
+    skip_path = tmp_path / "skip.txt"
+    skip_path.write_text(
+        "# comment\n/data/common_voice_uk_24203951.opus\nutt0\n",
+        encoding="utf-8",
+    )
+
+    values = _load_skip_list(skip_path)
+
+    assert "/data/common_voice_uk_24203951.opus" in values
+    assert "common_voice_uk_24203951.opus" in values
+    assert "utt0" in values
 
 
 def test_sharded_parquet_feature_cache_close_flushes_buffered_rows(tmp_path: Path) -> None:

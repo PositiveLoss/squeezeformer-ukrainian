@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,8 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         overwrite: bool = False,
         validate_existing: bool = False,
         write_cache: bool = True,
+        record_timeout_seconds: float = 0.0,
+        skipped_audio_sources: set[str] | None = None,
     ) -> None:
         self.records = records
         self.featurizer = featurizer
@@ -67,6 +71,8 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         self.overwrite = overwrite
         self.validate_existing = validate_existing
         self.write_cache = write_cache
+        self.record_timeout_seconds = max(0.0, float(record_timeout_seconds))
+        self.skipped_audio_sources = skipped_audio_sources or set()
 
     def __len__(self) -> int:
         return len(self.records)
@@ -114,55 +120,65 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         record = self.records[index]
         started_at = time.perf_counter()
         try:
-            if not self.overwrite and self._cache_hit(record):
+            if _record_matches_skip_list(record, self.skipped_audio_sources):
                 return {
-                    "status": "hit",
+                    "status": "skipped",
                     "utterance_id": record.utterance_id,
+                    "audio_path": record.audio_path,
                     "frames": int(record.estimated_frames),
                     "elapsed": time.perf_counter() - started_at,
                 }
+            with _record_timeout(self.record_timeout_seconds):
+                if not self.overwrite and self._cache_hit(record):
+                    return {
+                        "status": "hit",
+                        "utterance_id": record.utterance_id,
+                        "frames": int(record.estimated_frames),
+                        "elapsed": time.perf_counter() - started_at,
+                    }
 
-            waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
-            features = self.featurizer(waveform, sample_rate)
-            if not feature_tensor_is_plausible(
-                record,
-                features,
-                expected_feature_bins=self.featurizer.n_mels,
-            ):
-                return {
-                    "status": "invalid",
-                    "utterance_id": record.utterance_id,
-                    "frames": int(getattr(features, "shape", [0])[0]),
-                    "elapsed": time.perf_counter() - started_at,
-                }
+                waveform, sample_rate = load_audio(record.audio_path, record.audio_bytes)
+                features = self.featurizer(waveform, sample_rate)
+                if not feature_tensor_is_plausible(
+                    record,
+                    features,
+                    expected_feature_bins=self.featurizer.n_mels,
+                ):
+                    return {
+                        "status": "invalid",
+                        "utterance_id": record.utterance_id,
+                        "frames": int(getattr(features, "shape", [0])[0]),
+                        "elapsed": time.perf_counter() - started_at,
+                    }
 
-            if self.feature_cache is not None and self.write_cache:
-                self.feature_cache.store(record.utterance_id, self.featurizer, features)
-            elif self.feature_cache is not None:
+                if self.feature_cache is not None and self.write_cache:
+                    self.feature_cache.store(record.utterance_id, self.featurizer, features)
+                elif self.feature_cache is not None:
+                    return {
+                        "status": "written",
+                        "utterance_id": record.utterance_id,
+                        "features": features,
+                        "frames": int(features.size(0)),
+                        "elapsed": time.perf_counter() - started_at,
+                    }
+                else:
+                    path = feature_cache_path(
+                        self.feature_cache_dir, record.utterance_id, self.featurizer
+                    )
+                    if path is None:
+                        raise RuntimeError("feature_cache_dir unexpectedly resolved to None")
+                    torch.save(features, path)
                 return {
                     "status": "written",
                     "utterance_id": record.utterance_id,
-                    "features": features,
                     "frames": int(features.size(0)),
                     "elapsed": time.perf_counter() - started_at,
                 }
-            else:
-                path = feature_cache_path(
-                    self.feature_cache_dir, record.utterance_id, self.featurizer
-                )
-                if path is None:
-                    raise RuntimeError("feature_cache_dir unexpectedly resolved to None")
-                torch.save(features, path)
-            return {
-                "status": "written",
-                "utterance_id": record.utterance_id,
-                "frames": int(features.size(0)),
-                "elapsed": time.perf_counter() - started_at,
-            }
         except Exception as error:
             return {
                 "status": "failed",
                 "utterance_id": record.utterance_id,
+                "audio_path": record.audio_path,
                 "error": str(error),
                 "frames": 0,
                 "elapsed": time.perf_counter() - started_at,
@@ -171,6 +187,74 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
 
 def _collate_statuses(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
+
+
+def _record_skip_keys(record: AudioRecord) -> set[str]:
+    keys = {str(record.utterance_id)}
+    if record.audio_path:
+        audio_path = str(record.audio_path)
+        keys.add(audio_path)
+        keys.add(Path(audio_path).name)
+    return keys
+
+
+def _record_matches_skip_list(record: AudioRecord, skipped_audio_sources: set[str]) -> bool:
+    return bool(_record_skip_keys(record) & skipped_audio_sources)
+
+
+def _load_skip_list(path: str | Path | None) -> set[str]:
+    if path is None:
+        return set()
+    skip_path = Path(path)
+    if not skip_path.exists():
+        raise FileNotFoundError(f"cache warm skip list does not exist: {skip_path}")
+    values: set[str] = set()
+    for line in skip_path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if not value or value.startswith("#"):
+            continue
+        values.add(value)
+        values.add(Path(value).name)
+    return values
+
+
+def _append_failed_record(path: str | Path | None, item: dict[str, Any]) -> None:
+    if path is None:
+        return
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    audio_path = str(item.get("audio_path") or "")
+    utterance_id = str(item.get("utterance_id") or "")
+    error = str(item.get("error") or "")
+    with output_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"{audio_path}\t{utterance_id}\t{error.replace(chr(9), ' ').replace(chr(10), ' ')}\n"
+        )
+
+
+@contextmanager
+def _record_timeout(seconds: float):
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise_timeout(signum, frame) -> None:
+        raise TimeoutError(f"feature cache warm record timed out after {seconds:g}s")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            remaining = max(0.0, previous_timer[0] - seconds)
+            signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
 
 
 def _resolve_w2v_bert_model_source(args: argparse.Namespace) -> str:
@@ -246,6 +330,31 @@ def _add_warmer_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--cache-warm-record-timeout",
+        type=float,
+        default=30.0,
+        help=(
+            "Per-record timeout in seconds inside each warmer worker. Timed-out records are "
+            "logged as failed and skipped. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--cache-warm-skip-list",
+        default=None,
+        help=(
+            "Optional text file of audio paths, basenames, or utterance ids to skip before "
+            "audio decode. One entry per line; lines starting with # are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--cache-warm-failed-list",
+        default=None,
+        help=(
+            "Optional TSV file to append failed warm records to. Its first column can be reused "
+            "as --cache-warm-skip-list on later runs."
+        ),
+    )
+    parser.add_argument(
         "--cache-warm-overwrite",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -303,6 +412,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError(
             f"--cache-warm-timeout must be >= 0, got {training_args.cache_warm_timeout}."
         )
+    if training_args.cache_warm_record_timeout < 0:
+        raise ValueError(
+            "--cache-warm-record-timeout must be >= 0, "
+            f"got {training_args.cache_warm_record_timeout}."
+        )
     return training_args
 
 
@@ -336,7 +450,7 @@ def _log_progress(
     percent = (processed / total * 100.0) if total else 100.0
     logger.info(
         "%s feature cache warm progress=%s/%s %.1f%% rate=%.1f/s written=%s hit=%s "
-        "invalid=%s failed=%s frames=%s elapsed=%s",
+        "invalid=%s skipped=%s failed=%s frames=%s elapsed=%s",
         split,
         processed,
         total,
@@ -345,6 +459,7 @@ def _log_progress(
         counts.get("written", 0),
         counts.get("hit", 0),
         counts.get("invalid", 0),
+        counts.get("skipped", 0),
         counts.get("failed", 0),
         frames,
         _format_elapsed_seconds(elapsed),
@@ -404,6 +519,7 @@ def _warm_split(
     args: argparse.Namespace,
     featurizer,
     cache_dir: Path,
+    skipped_audio_sources: set[str],
 ) -> dict[str, int]:
     workers = args.num_workers if args.cache_warm_workers is None else args.cache_warm_workers
     main_feature_cache = (
@@ -419,6 +535,8 @@ def _warm_split(
         overwrite=args.cache_warm_overwrite,
         validate_existing=args.cache_warm_validate_existing,
         write_cache=main_feature_cache is None,
+        record_timeout_seconds=args.cache_warm_record_timeout,
+        skipped_audio_sources=skipped_audio_sources,
     )
     dataloader_kwargs: dict[str, object] = {}
     if workers > 0:
@@ -440,7 +558,7 @@ def _warm_split(
     logger.info(
         "%s feature cache warm started records=%s hours=%.2f cache_dir=%s format=%s "
         "workers=%s batch_size=%s prefetch_factor=%s in_order=%s timeout=%s "
-        "overwrite=%s validate_existing=%s",
+        "record_timeout=%s overwrite=%s validate_existing=%s",
         split,
         len(records),
         _record_store_duration_hours(records, hop_length=featurizer.hop_length),
@@ -451,11 +569,18 @@ def _warm_split(
         args.prefetch_factor if workers > 0 else "none",
         args.dataloader_in_order if workers > 0 else "none",
         args.cache_warm_timeout if workers > 0 else "none",
+        args.cache_warm_record_timeout,
         args.cache_warm_overwrite,
         args.cache_warm_validate_existing,
     )
     started_at = time.perf_counter()
-    counts: dict[str, int] = {"written": 0, "hit": 0, "invalid": 0, "failed": 0}
+    counts: dict[str, int] = {
+        "written": 0,
+        "hit": 0,
+        "invalid": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
     frames = 0
     processed = 0
     log_interval = max(1, int(args.cache_warm_log_interval))
@@ -496,6 +621,13 @@ def _warm_split(
                     featurizer,
                     item["features"],
                 )
+            if status == "skipped":
+                logger.info(
+                    "%s feature cache warm skipped utterance_id=%s audio=%s",
+                    split,
+                    item.get("utterance_id"),
+                    item.get("audio_path"),
+                )
             if status == "failed":
                 logger.warning(
                     "%s feature cache warm failed utterance_id=%s error=%s",
@@ -503,6 +635,7 @@ def _warm_split(
                     item.get("utterance_id"),
                     item.get("error"),
                 )
+                _append_failed_record(args.cache_warm_failed_list, item)
         if processed % log_interval == 0 or processed >= len(records):
             _log_progress(
                 split=split,
@@ -516,13 +649,14 @@ def _warm_split(
     if main_feature_cache is not None:
         main_feature_cache.close()
     logger.info(
-        "%s feature cache warm complete records=%s written=%s hit=%s invalid=%s failed=%s "
-        "elapsed=%s",
+        "%s feature cache warm complete records=%s written=%s hit=%s invalid=%s skipped=%s "
+        "failed=%s elapsed=%s",
         split,
         processed,
         counts.get("written", 0),
         counts.get("hit", 0),
         counts.get("invalid", 0),
+        counts.get("skipped", 0),
         counts.get("failed", 0),
         _format_elapsed_seconds(time.perf_counter() - started_at),
     )
@@ -574,13 +708,21 @@ def main(argv: list[str] | None = None) -> None:
         use_w2v_bert=args.w2v_bert,
     )
     cache_root = Path(args.feature_cache_dir)
-    total_counts: dict[str, int] = {"written": 0, "hit": 0, "invalid": 0, "failed": 0}
+    skipped_audio_sources = _load_skip_list(args.cache_warm_skip_list)
+    total_counts: dict[str, int] = {
+        "written": 0,
+        "hit": 0,
+        "invalid": 0,
+        "skipped": 0,
+        "failed": 0,
+    }
     logger.info(
-        "feature cache warm plan splits=%s total_splits=%s cache_root=%s format=%s",
+        "feature cache warm plan splits=%s total_splits=%s cache_root=%s format=%s skip_list=%s",
         ",".join(ordered_splits),
         len(ordered_splits),
         cache_root,
         args.feature_cache_format,
+        len(skipped_audio_sources),
     )
     for split_index, split in enumerate(ordered_splits, start=1):
         split_records = train_records if split == "train" else val_records
@@ -597,24 +739,29 @@ def main(argv: list[str] | None = None) -> None:
             args=args,
             featurizer=featurizer,
             cache_dir=cache_root / split,
+            skipped_audio_sources=skipped_audio_sources,
         )
         _accumulate_counts(total_counts, counts)
         logger.info(
-            "feature cache warm split %s/%s complete split=%s written=%s hit=%s invalid=%s failed=%s",
+            "feature cache warm split %s/%s complete split=%s written=%s hit=%s "
+            "invalid=%s skipped=%s failed=%s",
             split_index,
             len(ordered_splits),
             split,
             counts.get("written", 0),
             counts.get("hit", 0),
             counts.get("invalid", 0),
+            counts.get("skipped", 0),
             counts.get("failed", 0),
         )
     logger.info(
-        "feature cache warm all requested splits complete splits=%s written=%s hit=%s invalid=%s failed=%s",
+        "feature cache warm all requested splits complete splits=%s written=%s hit=%s "
+        "invalid=%s skipped=%s failed=%s",
         ",".join(ordered_splits),
         total_counts.get("written", 0),
         total_counts.get("hit", 0),
         total_counts.get("invalid", 0),
+        total_counts.get("skipped", 0),
         total_counts.get("failed", 0),
     )
     if args.cache_warm_fail_on_error and total_counts.get("failed", 0) > 0:
