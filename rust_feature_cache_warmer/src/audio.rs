@@ -17,14 +17,17 @@ use symphonia::default::{get_codecs, get_probe};
 
 #[derive(Debug, Clone)]
 pub(crate) enum AudioSource {
-    Path(PathBuf),
+    Path(PathBuf, Option<String>),
     Bytes(Vec<u8>, Option<String>),
 }
 
 impl AudioSource {
     pub(crate) fn log_label(&self) -> String {
         match self {
-            Self::Path(path) => format!("path={}", path.display()),
+            Self::Path(path, Some(path_hint)) => {
+                format!("path={} path_hint={path_hint}", path.display())
+            }
+            Self::Path(path, None) => format!("path={}", path.display()),
             Self::Bytes(bytes, Some(path_hint)) => {
                 format!("bytes={} path_hint={path_hint}", bytes.len())
             }
@@ -68,10 +71,12 @@ pub(crate) fn decode_audio(
 
 fn decode_audio_symphonia(source: AudioSource) -> Result<(Vec<f32>, u32)> {
     let (mss, extension) = match source {
-        AudioSource::Path(path) => {
+        AudioSource::Path(path, path_hint) => {
             trace!("opening audio file with symphonia path={}", path.display());
-            let extension = path
-                .extension()
+            let extension = path_hint
+                .as_deref()
+                .and_then(|path| Path::new(path).extension())
+                .or_else(|| path.extension())
                 .and_then(|value| value.to_str())
                 .map(str::to_owned);
             let file = File::open(&path)
@@ -163,7 +168,7 @@ fn decode_audio_ffmpeg(source: AudioSource, sample_rate: u32) -> Result<(Vec<f32
         sample_rate
     );
     match source {
-        AudioSource::Path(path) => decode_audio_ffmpeg_path(&path, sample_rate),
+        AudioSource::Path(path, _) => decode_audio_ffmpeg_path(&path, sample_rate),
         AudioSource::Bytes(bytes, path_hint) => {
             decode_audio_ffmpeg_bytes(bytes, path_hint, sample_rate)
         }

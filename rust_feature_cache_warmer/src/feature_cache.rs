@@ -451,14 +451,18 @@ fn process_record_cache_feature_line(
         .filter(|value| !value.is_empty());
     let source = if let Some(blob_path) = audio_blob_path {
         let blob_path = resolve_record_cache_blob_path(record_cache_path, blob_path);
-        let bytes = fs::read(&blob_path)
-            .with_context(|| format!("failed to read audio blob {}", blob_path.display()))?;
-        Some(AudioSource::Bytes(bytes, audio_path.clone()))
+        if blob_path.is_file() {
+            Some(AudioSource::Path(blob_path, audio_path.clone()))
+        } else {
+            let bytes = fs::read(&blob_path)
+                .with_context(|| format!("failed to read audio blob {}", blob_path.display()))?;
+            Some(AudioSource::Bytes(bytes, audio_path.clone()))
+        }
     } else if let Some(path) = audio_path {
         if path.starts_with("http://") || path.starts_with("https://") {
             bail!("remote audio URLs are not supported by the Rust warmer: {path}");
         }
-        Some(AudioSource::Path(PathBuf::from(path)))
+        Some(AudioSource::Path(PathBuf::from(&path), Some(path)))
     } else {
         None
     };
@@ -718,7 +722,7 @@ fn manifest_audio_row(
         }
         return Ok(Some((
             utterance_id,
-            AudioSource::Path(resolve_path(source_base, &path)),
+            AudioSource::Path(resolve_path(source_base, &path), Some(path)),
         )));
     }
     Ok(None)
