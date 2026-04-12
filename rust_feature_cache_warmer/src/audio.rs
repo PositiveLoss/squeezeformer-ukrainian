@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -16,6 +16,8 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use symphonia::default::{get_probe, register_enabled_codecs};
 use symphonia_adapter_libopus::OpusDecoder;
+
+const OGG_OPUS_PROBE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) enum AudioSource {
@@ -48,6 +50,16 @@ pub(crate) fn decode_audio(
         "decoding audio source={} fallback_sample_rate={} ffmpeg_fallback={}",
         source_label, fallback_sample_rate, ffmpeg_fallback
     );
+    if source_needs_ffmpeg_for_tagless_opus(&source)? {
+        if ffmpeg_fallback {
+            debug!(
+                "decoding tagless Ogg/Opus source={} directly with FFmpeg libraries",
+                source_label
+            );
+            return decode_audio_ffmpeg(source, fallback_sample_rate);
+        }
+        bail!("tagless Ogg/Opus audio requires FFmpeg fallback; remove --no-ffmpeg-fallback");
+    }
     match decode_audio_symphonia(source.clone()) {
         Ok(decoded) => {
             debug!(
@@ -171,6 +183,67 @@ fn audio_codecs() -> &'static CodecRegistry {
         registry.register_all::<OpusDecoder>();
         registry
     })
+}
+
+fn source_needs_ffmpeg_for_tagless_opus(source: &AudioSource) -> Result<bool> {
+    if !source_has_opus_extension(source) {
+        return Ok(false);
+    }
+    let Some(probe) = source_probe_bytes(source)? else {
+        return Ok(false);
+    };
+    Ok(looks_like_tagless_ogg_opus(&probe))
+}
+
+fn source_has_opus_extension(source: &AudioSource) -> bool {
+    match source {
+        AudioSource::Path(path, path_hint) => path_hint
+            .as_deref()
+            .and_then(path_extension)
+            .or_else(|| path.extension().and_then(|value| value.to_str()))
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("opus")),
+        AudioSource::Bytes(_, path_hint) => path_hint
+            .as_deref()
+            .and_then(path_extension)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("opus")),
+    }
+}
+
+fn source_probe_bytes(source: &AudioSource) -> Result<Option<Vec<u8>>> {
+    match source {
+        AudioSource::Path(path, _) => {
+            let mut file = match File::open(path) {
+                Ok(file) => file,
+                Err(_) => return Ok(None),
+            };
+            let mut bytes = vec![0; OGG_OPUS_PROBE_BYTES];
+            let len = file
+                .read(&mut bytes)
+                .with_context(|| format!("failed to probe audio file {}", path.display()))?;
+            bytes.truncate(len);
+            Ok(Some(bytes))
+        }
+        AudioSource::Bytes(bytes, _) => Ok(Some(
+            bytes.iter().take(OGG_OPUS_PROBE_BYTES).copied().collect(),
+        )),
+    }
+}
+
+fn path_extension(path: &str) -> Option<&str> {
+    Path::new(path).extension().and_then(|value| value.to_str())
+}
+
+fn looks_like_tagless_ogg_opus(bytes: &[u8]) -> bool {
+    contains_subsequence(bytes, b"OggS")
+        && contains_subsequence(bytes, b"OpusHead")
+        && !contains_subsequence(bytes, b"OpusTags")
+}
+
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn decode_audio_ffmpeg(source: AudioSource, sample_rate: u32) -> Result<(Vec<f32>, u32)> {
@@ -440,6 +513,26 @@ mod tests {
         assert_eq!(sample_rate, 48_000);
         assert!(!samples.is_empty());
         assert!(samples.iter().any(|sample| sample.abs() > 1e-4));
+    }
+
+    #[test]
+    fn tagless_ogg_opus_byte_source_prefers_ffmpeg() {
+        let source = AudioSource::Bytes(
+            b"OggS..........OpusHead..........audio-packet".to_vec(),
+            Some("audio.opus".to_string()),
+        );
+
+        assert!(source_needs_ffmpeg_for_tagless_opus(&source).unwrap());
+    }
+
+    #[test]
+    fn tagged_ogg_opus_byte_source_can_use_symphonia() {
+        let source = AudioSource::Bytes(
+            b"OggS..........OpusHead..........OpusTags..........audio-packet".to_vec(),
+            Some("audio.opus".to_string()),
+        );
+
+        assert!(!source_needs_ffmpeg_for_tagless_opus(&source).unwrap());
     }
 
     fn command_succeeds(command: &mut Command) -> bool {
