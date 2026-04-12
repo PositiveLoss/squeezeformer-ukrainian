@@ -47,6 +47,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         feature_cache_format: str | FeatureCacheFormat,
         overwrite: bool = False,
         validate_existing: bool = False,
+        write_cache: bool = True,
     ) -> None:
         self.records = records
         self.featurizer = featurizer
@@ -64,6 +65,7 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
         )
         self.overwrite = overwrite
         self.validate_existing = validate_existing
+        self.write_cache = write_cache
 
     def __len__(self) -> int:
         return len(self.records)
@@ -133,8 +135,16 @@ class FeatureCacheWarmDataset(Dataset[dict[str, Any]]):
                     "elapsed": time.perf_counter() - started_at,
                 }
 
-            if self.feature_cache is not None:
+            if self.feature_cache is not None and self.write_cache:
                 self.feature_cache.store(record.utterance_id, self.featurizer, features)
+            elif self.feature_cache is not None:
+                return {
+                    "status": "written",
+                    "utterance_id": record.utterance_id,
+                    "features": features,
+                    "frames": int(features.size(0)),
+                    "elapsed": time.perf_counter() - started_at,
+                }
             else:
                 path = feature_cache_path(
                     self.feature_cache_dir, record.utterance_id, self.featurizer
@@ -295,6 +305,12 @@ def _warm_split(
     featurizer,
     cache_dir: Path,
 ) -> dict[str, int]:
+    workers = args.num_workers if args.cache_warm_workers is None else args.cache_warm_workers
+    main_feature_cache = (
+        ShardedParquetFeatureCache(cache_dir)
+        if workers > 0 and str(args.feature_cache_format) == "parquet"
+        else None
+    )
     dataset = FeatureCacheWarmDataset(
         records,
         featurizer=featurizer,
@@ -302,8 +318,8 @@ def _warm_split(
         feature_cache_format=args.feature_cache_format,
         overwrite=args.cache_warm_overwrite,
         validate_existing=args.cache_warm_validate_existing,
+        write_cache=main_feature_cache is None,
     )
-    workers = args.num_workers if args.cache_warm_workers is None else args.cache_warm_workers
     dataloader_kwargs: dict[str, object] = {}
     if workers > 0:
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -342,6 +358,12 @@ def _warm_split(
             counts[status] = counts.get(status, 0) + 1
             frames += int(item.get("frames", 0))
             processed += 1
+            if status == "written" and main_feature_cache is not None:
+                main_feature_cache.store(
+                    str(item["utterance_id"]),
+                    featurizer,
+                    item["features"],
+                )
             if status == "failed":
                 logger.warning(
                     "%s feature cache warm failed utterance_id=%s error=%s",
@@ -359,6 +381,8 @@ def _warm_split(
                 started_at=started_at,
             )
     dataset.close()
+    if main_feature_cache is not None:
+        main_feature_cache.close()
     logger.info(
         "%s feature cache warm complete records=%s written=%s hit=%s invalid=%s failed=%s "
         "elapsed=%s",
