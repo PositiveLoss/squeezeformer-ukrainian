@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from types import SimpleNamespace
 
 import torch
 from transformers import Wav2Vec2BertConfig as HFWav2Vec2BertConfig
@@ -99,6 +100,50 @@ def test_w2v_bert_uses_transformer_engine_linears_when_fp8_enabled(monkeypatch) 
     )
 
     assert torch.isfinite(outputs["main_ctc_loss"])
+
+
+def test_w2v_bert_fp8_encoder_pads_time_for_transformer_engine_rows() -> None:
+    class _RecordingEncoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(add_adapter=False)
+            self.input_shape = None
+            self.attention_mask = None
+
+        def forward(self, *, input_features, attention_mask, return_dict):
+            assert return_dict is True
+            self.input_shape = tuple(input_features.shape)
+            self.attention_mask = attention_mask
+            return SimpleNamespace(
+                last_hidden_state=input_features.new_zeros(
+                    input_features.size(0),
+                    input_features.size(1),
+                    16,
+                )
+            )
+
+    model = W2VBertCTC(
+        encoder_config=_tiny_w2v_bert_config(),
+        vocab_size=6,
+        load_pretrained=False,
+        use_transformer_engine=True,
+    )
+    encoder = _RecordingEncoder()
+    model.encoder = encoder
+    model.encoder_requires_fp8_time_padding = True
+
+    encoded, output_lengths = model._encode(
+        torch.randn(75, 319, 8),
+        torch.full((75,), 319, dtype=torch.long),
+    )
+
+    assert encoder.input_shape == (75, 320, 8)
+    assert encoder.attention_mask is not None
+    assert encoder.attention_mask.shape == (75, 320)
+    assert encoder.attention_mask[:, :319].all()
+    assert not encoder.attention_mask[:, 319:].any()
+    assert encoded.shape == (75, 320, 16)
+    assert output_lengths.tolist() == [319] * 75
 
 
 def test_w2v_bert_feature_extractor_matches_asr_dataset_contract() -> None:

@@ -29,6 +29,7 @@ except ImportError:
 
 
 DEFAULT_W2V_BERT_MODEL = "facebook/w2v-bert-2.0"
+_FP8_ROW_ALIGNMENT = 8
 
 
 def _require_transformers() -> None:
@@ -96,6 +97,22 @@ def _attention_mask_from_lengths(lengths: Tensor, max_length: int) -> Tensor:
         torch.arange(max_length, device=lengths.device).unsqueeze(0)
         < lengths.to(dtype=torch.long).unsqueeze(1)
     ).to(dtype=torch.long)
+
+
+def _fp8_padded_time_length(batch_size: int, num_frames: int) -> int:
+    if batch_size <= 0 or num_frames <= 0:
+        return num_frames
+    required_frame_multiple = _FP8_ROW_ALIGNMENT // math.gcd(batch_size, _FP8_ROW_ALIGNMENT)
+    return int(math.ceil(num_frames / required_frame_multiple) * required_frame_multiple)
+
+
+def _pad_features_for_fp8_rows(features: Tensor) -> Tensor:
+    target_length = _fp8_padded_time_length(features.size(0), features.size(1))
+    if target_length <= features.size(1):
+        return features
+    pad_shape = list(features.shape)
+    pad_shape[1] = target_length - features.size(1)
+    return torch.cat([features, features.new_zeros(pad_shape)], dim=1)
 
 
 @dataclass(frozen=True)
@@ -286,8 +303,11 @@ class W2VBertCTC(SqueezeformerCTC):
             )
         else:
             self.encoder = Wav2Vec2BertModel(hf_config)
+        self.encoder_requires_fp8_time_padding = False
         if use_transformer_engine:
-            _convert_linear_modules_to_transformer_engine(self.encoder)
+            self.encoder_requires_fp8_time_padding = (
+                _convert_linear_modules_to_transformer_engine(self.encoder) > 0
+            )
         self.classifier = make_linear(
             encoder_config.hidden_size,
             vocab_size,
@@ -321,6 +341,8 @@ class W2VBertCTC(SqueezeformerCTC):
             min=1,
             max=features.size(1),
         )
+        if self.encoder_requires_fp8_time_padding:
+            features = _pad_features_for_fp8_rows(features)
         attention_mask = _attention_mask_from_lengths(feature_lengths, features.size(1))
         outputs = self.encoder(
             input_features=features,
