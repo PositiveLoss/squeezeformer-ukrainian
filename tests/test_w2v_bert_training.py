@@ -7,7 +7,7 @@ from transformers import Wav2Vec2BertConfig as HFWav2Vec2BertConfig
 
 import squeezeformer_pytorch.model as squeezeformer_model
 import w2v_bert.asr as w2v_bert_asr
-from train import _resolve_w2v_bert_model_source
+from train import _ddp_find_unused_parameters_required, _resolve_w2v_bert_model_source
 from w2v_bert.asr import (
     DEFAULT_W2V_BERT_MODEL,
     W2VBertConfig,
@@ -213,3 +213,8 @@ def test_resolve_w2v_bert_model_source_reuses_checkpoint_source_by_default() -> 
     }
 
     assert _resolve_w2v_bert_model_source(args, checkpoint) == "/models/w2v-bert-2.0"
+
+
+def test_w2v_bert_distributed_training_enables_unused_parameter_detection() -> None:
+    assert _ddp_find_unused_parameters_required(use_w2v_bert=True) is True
+    assert _ddp_find_unused_parameters_required(use_w2v_bert=False) is False

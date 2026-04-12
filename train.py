@@ -587,6 +587,10 @@ def _resolve_w2v_bert_usage(
     return bool(args.w2v_bert)
 
 
+def _ddp_find_unused_parameters_required(*, use_w2v_bert: bool) -> bool:
+    return bool(use_w2v_bert)
+
+
 def _resolve_zipformer_transducer_usage(
     *,
     args,
@@ -1799,8 +1803,14 @@ def main() -> None:
         model.load_state_dict(
             checkpoint.get("resume_model_state_dict", checkpoint["model_state_dict"])
         )
-    ddp_find_unused_parameters = False
+    ddp_find_unused_parameters = _ddp_find_unused_parameters_required(
+        use_w2v_bert=use_w2v_bert
+    )
     if distributed:
+        logger.info(
+            "wrapping model with DistributedDataParallel find_unused_parameters=%s",
+            ddp_find_unused_parameters,
+        )
         forward_model: nn.Module = DDP(
             model,
             device_ids=[local_rank] if device.type == "cuda" else None,
