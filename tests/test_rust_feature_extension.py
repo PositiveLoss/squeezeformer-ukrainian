@@ -124,6 +124,8 @@ def test_rust_record_cache_subcommand_matches_python_store(tmp_path) -> None:
             "--validation-dataset-source",
             str(val_dir),
             "--require-readable-audio",
+            "--threads",
+            "2",
             "--progress-interval",
             "0",
         ],

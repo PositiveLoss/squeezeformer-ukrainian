@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use clap::{ArgAction, Parser, ValueEnum};
 use log::{info, warn};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -112,6 +114,10 @@ pub(crate) struct RecordCacheCli {
     /// Emit progress every N scanned rows per split/source. Set 0 to disable.
     #[arg(long, default_value_t = 1000)]
     pub(crate) progress_interval: usize,
+
+    /// Parallel record filtering threads. Use 0 for Rayon's default.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) threads: usize,
 }
 
 #[derive(Debug, Default)]
@@ -374,18 +380,27 @@ pub(crate) fn run_record_cache_cli(cli: RecordCacheCli) -> Result<()> {
             cli.record_cache_dir.display()
         )
     })?;
+    let mut pool_builder = ThreadPoolBuilder::new();
+    if cli.threads > 0 {
+        pool_builder = pool_builder.num_threads(cli.threads);
+    }
+    let pool = pool_builder
+        .build()
+        .context("failed to build Rayon record-cache thread pool")?;
 
     info!(
-        "building record cache dir={} train_sources={} validation_sources={} external_validation={} lowercase_transcripts={}",
+        "building record cache dir={} train_sources={} validation_sources={} external_validation={} lowercase_transcripts={} threads={}",
         cli.record_cache_dir.display(),
         train_sources.len(),
         validation_sources.len(),
         use_external_validation,
-        lowercase_transcripts
+        lowercase_transcripts,
+        pool.current_num_threads()
     );
     build_record_store(
         &train_sources,
         &cli.record_cache_dir.join("train.jsonl"),
+        &pool,
         &RecordCacheOptions {
             split: "train".to_string(),
             seed: cli.seed,
@@ -418,6 +433,7 @@ pub(crate) fn run_record_cache_cli(cli: RecordCacheCli) -> Result<()> {
             &train_sources
         },
         &cli.record_cache_dir.join("validation.jsonl"),
+        &pool,
         &RecordCacheOptions {
             split: validation_split.to_string(),
             seed: cli.seed,
@@ -501,6 +517,7 @@ fn dedupe_existing_sources(sources: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn build_record_store(
     sources: &[PathBuf],
     records_path: &Path,
+    pool: &rayon::ThreadPool,
     options: &RecordCacheOptions,
 ) -> Result<()> {
     let mut writer = RecordCacheWriter::new(records_path)?;
@@ -513,7 +530,8 @@ fn build_record_store(
             }
         }
         let remaining = options.max_samples.map(|max_samples| max_samples - written);
-        let counters = build_record_store_from_source(source, &mut writer, options, remaining)?;
+        let counters =
+            build_record_store_from_source(source, &mut writer, pool, options, remaining)?;
         written += counters.selected;
         merge_record_counters(&mut aggregate, &counters);
     }
@@ -548,6 +566,7 @@ fn build_record_store(
 fn build_record_store_from_source(
     source: &Path,
     writer: &mut RecordCacheWriter,
+    pool: &rayon::ThreadPool,
     options: &RecordCacheOptions,
     remaining: Option<usize>,
 ) -> Result<RecordCacheCounters> {
@@ -572,6 +591,7 @@ fn build_record_store_from_source(
                 &manifest_path,
                 &source_base,
                 writer,
+                pool,
                 options,
                 remaining,
                 &mut counters,
@@ -580,6 +600,7 @@ fn build_record_store_from_source(
                 &manifest_path,
                 &source_base,
                 writer,
+                pool,
                 options,
                 remaining,
                 &mut counters,
@@ -622,6 +643,7 @@ fn read_record_cache_parquet(
     manifest_path: &Path,
     source_base: &Path,
     writer: &mut RecordCacheWriter,
+    pool: &rayon::ThreadPool,
     options: &RecordCacheOptions,
     remaining: Option<usize>,
     counters: &mut RecordCacheCounters,
@@ -638,14 +660,20 @@ fn read_record_cache_parquet(
         .build()?;
     for batch_result in reader {
         let batch = batch_result?;
-        for row_index in 0..batch.num_rows() {
-            if remaining.is_some_and(|remaining| counters.selected >= remaining) {
-                return Ok(());
-            }
-            counters.scanned += 1;
-            let row = RawManifestRow::from_batch(&batch, row_index);
-            maybe_write_record(row, source_base, writer, options, counters)?;
+        if remaining.is_some_and(|remaining| counters.selected >= remaining) {
+            return Ok(());
         }
+        let starting_scanned = counters.scanned;
+        let rows: Vec<(usize, RawManifestRow)> = (0..batch.num_rows())
+            .map(|row_index| {
+                (
+                    starting_scanned + row_index + 1,
+                    RawManifestRow::from_batch(&batch, row_index),
+                )
+            })
+            .collect();
+        let results = process_record_rows(rows, source_base, pool, options);
+        write_processed_record_rows(results, writer, options, remaining, counters)?;
     }
     Ok(())
 }
@@ -654,6 +682,7 @@ fn read_record_cache_tsv(
     manifest_path: &Path,
     source_base: &Path,
     writer: &mut RecordCacheWriter,
+    pool: &rayon::ThreadPool,
     options: &RecordCacheOptions,
     remaining: Option<usize>,
     counters: &mut RecordCacheCounters,
@@ -668,7 +697,7 @@ fn read_record_cache_tsv(
         if remaining.is_some_and(|remaining| counters.selected >= remaining) {
             return Ok(());
         }
-        counters.scanned += 1;
+        let scanned_row = counters.scanned + 1;
         let row = row_result?;
         let get = |name: &str| {
             headers
@@ -684,21 +713,24 @@ fn read_record_cache_tsv(
             .iter()
             .find_map(|column| get(column).and_then(|value| value.parse::<f64>().ok()));
         let speaker_id = SPEAKER_COLUMNS.iter().find_map(|column| get(column));
-        maybe_write_record(
-            RawManifestRow {
-                id: get("id"),
-                path: get("path"),
-                audio_path: None,
-                audio_bytes: None,
-                transcript,
-                duration_seconds,
-                speaker_id,
-            },
+        let results = process_record_rows(
+            vec![(
+                scanned_row,
+                RawManifestRow {
+                    id: get("id"),
+                    path: get("path"),
+                    audio_path: None,
+                    audio_bytes: None,
+                    transcript,
+                    duration_seconds,
+                    speaker_id,
+                },
+            )],
             source_base,
-            writer,
+            pool,
             options,
-            counters,
-        )?;
+        );
+        write_processed_record_rows(results, writer, options, remaining, counters)?;
     }
     Ok(())
 }
@@ -756,13 +788,66 @@ impl RawManifestRow {
     }
 }
 
-fn maybe_write_record(
-    row: RawManifestRow,
+type ProcessedRecordRow = (
+    usize,
+    Result<(RecordCacheCounters, Option<RecordCacheRecord>)>,
+);
+
+fn process_record_rows(
+    rows: Vec<(usize, RawManifestRow)>,
     source_base: &Path,
+    pool: &rayon::ThreadPool,
+    options: &RecordCacheOptions,
+) -> Vec<ProcessedRecordRow> {
+    pool.install(|| {
+        rows.into_par_iter()
+            .map(|(scanned_row, row)| {
+                (
+                    scanned_row,
+                    process_record(row, source_base, options, scanned_row),
+                )
+            })
+            .collect()
+    })
+}
+
+fn write_processed_record_rows(
+    results: Vec<ProcessedRecordRow>,
     writer: &mut RecordCacheWriter,
     options: &RecordCacheOptions,
+    remaining: Option<usize>,
     counters: &mut RecordCacheCounters,
 ) -> Result<()> {
+    for (scanned_row, result) in results {
+        if remaining.is_some_and(|remaining| counters.selected >= remaining) {
+            return Ok(());
+        }
+        counters.scanned = scanned_row;
+        let (row_counters, record) = result?;
+        merge_record_counters(counters, &row_counters);
+        if let Some(record) = record {
+            writer.push(record)?;
+            counters.selected += 1;
+        }
+        if options.progress_interval > 0
+            && counters.scanned.is_multiple_of(options.progress_interval)
+        {
+            info!(
+                "record cache progress split={} scanned={} selected={} skipped_split={}",
+                options.split, counters.scanned, counters.selected, counters.skipped_split
+            );
+        }
+    }
+    Ok(())
+}
+
+fn process_record(
+    row: RawManifestRow,
+    source_base: &Path,
+    options: &RecordCacheOptions,
+    scanned_row: usize,
+) -> Result<(RecordCacheCounters, Option<RecordCacheRecord>)> {
+    let mut counters = RecordCacheCounters::default();
     let Some(transcript) = row
         .transcript
         .as_deref()
@@ -770,27 +855,27 @@ fn maybe_write_record(
         .filter(|text| !text.is_empty())
     else {
         counters.skipped_missing_transcript += 1;
-        return Ok(());
+        return Ok((counters, None));
     };
     let (audio_path, audio_bytes) =
         match resolve_record_audio(row.path, row.audio_path, row.audio_bytes, source_base) {
             Some(source) => source,
             None => {
                 counters.skipped_missing_audio += 1;
-                return Ok(());
+                return Ok((counters, None));
             }
         };
     let Some(duration_seconds) = row.duration_seconds else {
         counters.skipped_missing_duration += 1;
-        return Ok(());
+        return Ok((counters, None));
     };
     if duration_seconds < options.min_audio_duration_sec {
         counters.skipped_audio_too_short += 1;
-        return Ok(());
+        return Ok((counters, None));
     }
     if duration_seconds > options.max_audio_duration_sec {
         counters.skipped_audio_too_long += 1;
-        return Ok(());
+        return Ok((counters, None));
     }
     if let Some(reason) = transcript_rejection_reason(
         &transcript,
@@ -805,7 +890,7 @@ fn maybe_write_record(
             "no_alnum" => counters.skipped_no_alnum += 1,
             _ => {}
         }
-        return Ok(());
+        return Ok((counters, None));
     }
     if let Some(reason) = alignment_rejection_reason(&transcript, duration_seconds, options) {
         match reason {
@@ -819,13 +904,13 @@ fn maybe_write_record(
             "duration_per_word_too_high" => counters.skipped_duration_per_word_too_high += 1,
             _ => {}
         }
-        return Ok(());
+        return Ok((counters, None));
     }
     let utterance_id = row
         .id
         .filter(|value| !value.is_empty())
         .or_else(|| audio_path.clone())
-        .unwrap_or_else(|| counters.scanned.to_string());
+        .unwrap_or_else(|| scanned_row.to_string());
     let speaker_id = row.speaker_id.filter(|value| !value.is_empty());
     let split_key = speaker_id.as_deref().unwrap_or(&utterance_id);
     if !record_split_matches(
@@ -836,11 +921,11 @@ fn maybe_write_record(
         options.test_fraction,
     )? {
         counters.skipped_split += 1;
-        return Ok(());
+        return Ok((counters, None));
     }
     if options.require_audio_bytes && audio_bytes.is_none() {
         counters.skipped_unreadable_audio += 1;
-        return Ok(());
+        return Ok((counters, None));
     }
     if options.require_readable_audio && audio_bytes.is_none() {
         match audio_path.as_deref() {
@@ -848,7 +933,7 @@ fn maybe_write_record(
             Some(path) if Path::new(path).exists() => {}
             _ => {
                 counters.skipped_unreadable_audio += 1;
-                return Ok(());
+                return Ok((counters, None));
             }
         }
     }
@@ -867,25 +952,20 @@ fn maybe_write_record(
     let num_samples =
         python_round_half_even(duration_seconds * DEFAULT_FEATURE_SAMPLE_RATE as f64).max(1) as u64;
     let estimated_frames = estimate_default_feature_frames(num_samples as usize);
-    writer.push(RecordCacheRecord {
-        audio_path,
-        audio_bytes: record_audio_bytes,
-        transcript,
-        utterance_id,
-        speaker_id: speaker_id.clone(),
-        has_speaker_id: speaker_id.is_some(),
-        estimated_frames,
-        num_samples,
-        sample_rate: DEFAULT_FEATURE_SAMPLE_RATE,
-    })?;
-    counters.selected += 1;
-    if options.progress_interval > 0 && counters.scanned.is_multiple_of(options.progress_interval) {
-        info!(
-            "record cache progress split={} scanned={} selected={} skipped_split={}",
-            options.split, counters.scanned, counters.selected, counters.skipped_split
-        );
-    }
-    Ok(())
+    Ok((
+        counters,
+        Some(RecordCacheRecord {
+            audio_path,
+            audio_bytes: record_audio_bytes,
+            transcript,
+            utterance_id,
+            speaker_id: speaker_id.clone(),
+            has_speaker_id: speaker_id.is_some(),
+            estimated_frames,
+            num_samples,
+            sample_rate: DEFAULT_FEATURE_SAMPLE_RATE,
+        }),
+    ))
 }
 
 fn collect_manifest_paths_for_records(source: &Path) -> Result<Vec<PathBuf>> {
