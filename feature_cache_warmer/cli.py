@@ -424,6 +424,7 @@ def _warm_split(
     if workers > 0:
         dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
         dataloader_kwargs["persistent_workers"] = False
+        dataloader_kwargs["in_order"] = args.dataloader_in_order
         if args.cache_warm_timeout > 0:
             dataloader_kwargs["timeout"] = args.cache_warm_timeout
         if args.dataloader_mp_context != "auto":
@@ -438,8 +439,8 @@ def _warm_split(
     )
     logger.info(
         "%s feature cache warm started records=%s hours=%.2f cache_dir=%s format=%s "
-        "workers=%s batch_size=%s prefetch_factor=%s timeout=%s overwrite=%s "
-        "validate_existing=%s",
+        "workers=%s batch_size=%s prefetch_factor=%s in_order=%s timeout=%s "
+        "overwrite=%s validate_existing=%s",
         split,
         len(records),
         _record_store_duration_hours(records, hop_length=featurizer.hop_length),
@@ -448,6 +449,7 @@ def _warm_split(
         workers,
         args.cache_warm_batch_size,
         args.prefetch_factor if workers > 0 else "none",
+        args.dataloader_in_order if workers > 0 else "none",
         args.cache_warm_timeout if workers > 0 else "none",
         args.cache_warm_overwrite,
         args.cache_warm_validate_existing,
@@ -463,6 +465,7 @@ def _warm_split(
         description = (
             f"{split} feature cache warm waiting for item {next_index + 1}/{len(records)} "
             f"workers={workers} prefetch_factor={args.prefetch_factor if workers > 0 else 'none'} "
+            f"in_order={args.dataloader_in_order if workers > 0 else 'none'} "
             f"next={_record_wait_label(records, next_index)}"
         )
         try:
