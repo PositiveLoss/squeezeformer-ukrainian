@@ -191,6 +191,7 @@ struct RecordCacheRecord {
 
 struct RecordCacheWriter {
     records_path: PathBuf,
+    temp_records_path: PathBuf,
     records: BufWriter<File>,
     offsets: BufWriter<File>,
     estimated_frames: BufWriter<File>,
@@ -207,33 +208,38 @@ impl RecordCacheWriter {
                 format!("failed to create record cache dir {}", parent.display())
             })?;
         }
+        let temp_records_path = temporary_record_cache_path(records_path);
         Ok(Self {
             records_path: records_path.to_path_buf(),
-            records: BufWriter::new(File::create(records_path).with_context(|| {
-                format!("failed to create record cache {}", records_path.display())
+            temp_records_path: temp_records_path.clone(),
+            records: BufWriter::new(File::create(&temp_records_path).with_context(|| {
+                format!(
+                    "failed to create temporary record cache {}",
+                    temp_records_path.display()
+                )
             })?),
             offsets: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".offsets.u64",
             ))?),
             estimated_frames: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".estimated_frames.u32",
             ))?),
             num_samples: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".num_samples.u64",
             ))?),
             sample_rates: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".sample_rates.u32",
             ))?),
             transcript_lengths: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".transcript_lengths.u32",
             ))?),
             token_lengths: BufWriter::new(File::create(record_index_path(
-                records_path,
+                &temp_records_path,
                 ".token_lengths.u32",
             ))?),
         })
@@ -302,6 +308,28 @@ impl RecordCacheWriter {
         self.sample_rates.flush()?;
         self.transcript_lengths.flush()?;
         self.token_lengths.flush()?;
+        self.records.get_ref().sync_all()?;
+        self.offsets.get_ref().sync_all()?;
+        self.estimated_frames.get_ref().sync_all()?;
+        self.num_samples.get_ref().sync_all()?;
+        self.sample_rates.get_ref().sync_all()?;
+        self.transcript_lengths.get_ref().sync_all()?;
+        self.token_lengths.get_ref().sync_all()?;
+
+        for suffix in [
+            ".offsets.u64",
+            ".estimated_frames.u32",
+            ".num_samples.u64",
+            ".sample_rates.u32",
+            ".transcript_lengths.u32",
+            ".token_lengths.u32",
+        ] {
+            publish_temp_file(
+                &record_index_path(&self.temp_records_path, suffix),
+                &record_index_path(&self.records_path, suffix),
+            )?;
+        }
+        publish_temp_file(&self.temp_records_path, &self.records_path)?;
         Ok(())
     }
 }
@@ -1092,6 +1120,40 @@ fn record_index_path(records_path: &Path, suffix: &str) -> PathBuf {
     let mut path = records_path.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+fn temporary_record_cache_path(records_path: &Path) -> PathBuf {
+    let temp_name = format!(
+        "{}.tmp.{}",
+        records_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("records.jsonl"),
+        std::process::id()
+    );
+    records_path
+        .parent()
+        .map(|parent| parent.join(&temp_name))
+        .unwrap_or_else(|| PathBuf::from(temp_name))
+}
+
+fn publish_temp_file(temp_path: &Path, final_path: &Path) -> Result<()> {
+    if final_path.exists() {
+        fs::remove_file(final_path).with_context(|| {
+            format!(
+                "failed to remove previous record cache file {}",
+                final_path.display()
+            )
+        })?;
+    }
+    fs::rename(temp_path, final_path).with_context(|| {
+        format!(
+            "failed to publish record cache file {} to {}",
+            temp_path.display(),
+            final_path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn relative_blob_path(blob_path: &Path, base: Option<&Path>) -> String {
