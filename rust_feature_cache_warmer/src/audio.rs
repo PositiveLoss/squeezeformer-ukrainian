@@ -7,13 +7,15 @@ use anyhow::{anyhow, bail, Context, Result};
 use ffmpeg_next as ffmpeg;
 use log::{debug, trace, warn};
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
+use symphonia::core::codecs::CodecRegistry;
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use symphonia::default::{get_codecs, get_probe};
+use symphonia::default::{get_probe, register_enabled_codecs};
+use symphonia_adapter_libopus::OpusDecoder;
 
 #[derive(Debug, Clone)]
 pub(crate) enum AudioSource {
@@ -124,7 +126,7 @@ fn decode_audio_symphonia(source: AudioSource) -> Result<(Vec<f32>, u32)> {
         "symphonia selected track id={} codec={:?} sample_rate={:?}",
         track_id, track.codec_params.codec, track.codec_params.sample_rate
     );
-    let mut decoder = get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let mut decoder = audio_codecs().make(&track.codec_params, &DecoderOptions::default())?;
     let mut mono = Vec::new();
     let mut sample_rate = track.codec_params.sample_rate.unwrap_or(16_000);
 
@@ -159,6 +161,16 @@ fn decode_audio_symphonia(source: AudioSource) -> Result<(Vec<f32>, u32)> {
         bail!("decoded audio stream is empty");
     }
     Ok((mono, sample_rate))
+}
+
+fn audio_codecs() -> &'static CodecRegistry {
+    static CODECS: OnceLock<CodecRegistry> = OnceLock::new();
+    CODECS.get_or_init(|| {
+        let mut registry = CodecRegistry::new();
+        register_enabled_codecs(&mut registry);
+        registry.register_all::<OpusDecoder>();
+        registry
+    })
 }
 
 fn decode_audio_ffmpeg(source: AudioSource, sample_rate: u32) -> Result<(Vec<f32>, u32)> {
@@ -387,6 +399,7 @@ fn append_mono_samples(decoded: AudioBufferRef<'_>, output: &mut Vec<f32>, sampl
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn ffmpeg_library_decoder_reads_wav_file() {
@@ -398,6 +411,43 @@ mod tests {
         assert_eq!(sample_rate, 16_000);
         assert_eq!(samples.len(), 1_600);
         assert!(samples.iter().any(|sample| sample.abs() > 1e-4));
+    }
+
+    #[test]
+    fn symphonia_libopus_adapter_reads_generated_ogg_opus() {
+        if !command_succeeds(Command::new("ffmpeg").arg("-version")) {
+            return;
+        }
+        let mut wav = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+        write_test_wav(&mut wav, 48_000, 4_800).unwrap();
+        let output_dir = tempfile::tempdir().unwrap();
+        let opus_path = output_dir.path().join("audio.opus");
+        let status = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(wav.path())
+            .args(["-c:a", "libopus", "-ar", "48000", "-ac", "1"])
+            .arg(&opus_path)
+            .status()
+            .unwrap();
+        if !status.success() {
+            return;
+        }
+
+        let (samples, sample_rate) =
+            decode_audio_symphonia(AudioSource::Path(opus_path, Some("audio.opus".to_string())))
+                .unwrap();
+
+        assert_eq!(sample_rate, 48_000);
+        assert!(!samples.is_empty());
+        assert!(samples.iter().any(|sample| sample.abs() > 1e-4));
+    }
+
+    fn command_succeeds(command: &mut Command) -> bool {
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     fn write_test_wav(
