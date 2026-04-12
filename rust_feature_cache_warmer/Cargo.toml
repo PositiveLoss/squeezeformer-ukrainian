@@ -24,6 +24,7 @@ env_logger = "0.11"
 ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-resampling"] }
 log = "0.4"
 numpy = { version = "0.28", optional = true }
+opus-decoder = "0.1.1"
 parquet = { version = "56", features = ["arrow"] }
 pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "extension-module"] }
 rayon = "1.11"

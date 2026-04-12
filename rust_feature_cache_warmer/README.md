@@ -5,11 +5,13 @@ log-mel features with RustFFT, resamples non-16 kHz audio with Rubato, and write
 the sharded parquet cache layout consumed by `ShardedParquetFeatureCache`.
 Ogg/Vorbis is enabled through Symphonia's Ogg demuxer support. Opus decoding is
 provided by the `symphonia-adapter-libopus` adapter, which bundles libopus by
-default. Tagless Ogg/Opus files are routed directly to FFmpeg because Symphonia's
-Ogg mapper requires the `OpusTags` header packet before yielding audio packets.
-For other unsupported or malformed audio streams, the CLI falls back to FFmpeg
-through `ffmpeg-next`/libavcodec; pass `--no-ffmpeg-fallback` to disable that.
-No external `ffmpeg` executable is spawned.
+default. Tagless Ogg/Opus files skip Symphonia because its Ogg mapper requires
+the `OpusTags` header packet before yielding audio packets; those files are
+decoded with the pure Rust `opus-decoder` packet fallback before the CLI tries
+FFmpeg. For other unsupported or malformed audio streams, the CLI
+falls back to FFmpeg through `ffmpeg-next`/libavcodec; pass
+`--no-ffmpeg-fallback` to disable that final FFmpeg fallback. No external
+`ffmpeg` executable is spawned.
 
 Build against the system FFmpeg development libraries with the default feature
 set. CMake is required because the libopus adapter bundles libopus by default:
