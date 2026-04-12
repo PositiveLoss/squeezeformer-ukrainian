@@ -7,7 +7,9 @@ import squeezeformer_pytorch.training.data_loading as data_loading
 from squeezeformer_pytorch.data import AudioRecord
 from squeezeformer_pytorch.training.data_loading import (
     _build_disk_backed_record_store,
+    _disk_backed_record_store_exists,
     _load_train_val_records,
+    _record_index_path,
     _shard_records_for_rank,
 )
 
@@ -200,3 +202,32 @@ def test_load_train_val_records_reuses_existing_record_cache(
 
     assert train_records[0].utterance_id == "train-utt"
     assert validation_records[0].utterance_id == "validation-utt"
+
+
+def test_record_cache_reuse_rejects_mismatched_index_lengths(tmp_path: Path) -> None:
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    (dataset_root / "train.tsv").write_text(
+        "path\tsentence\tid\tduration\n"
+        "a.wav\tfirst sample\tutt0\t0.3\n"
+        "b.wav\tsecond sample\tutt1\t0.3\n",
+        encoding="utf-8",
+    )
+    records_path = tmp_path / "cached-metadata" / "train.jsonl"
+    _build_disk_backed_record_store(
+        [dataset_root],
+        split="train",
+        seed=13,
+        val_fraction=0.0,
+        test_fraction=0.0,
+        max_samples=None,
+        min_transcript_chars=1,
+        max_transcript_chars=400,
+        max_symbol_ratio=0.5,
+        lowercase_transcripts=True,
+        records_path=records_path,
+    )
+    estimated_frames_path = _record_index_path(records_path, ".estimated_frames.u32")
+    estimated_frames_path.write_bytes(estimated_frames_path.read_bytes()[:4])
+
+    assert not _disk_backed_record_store_exists(records_path)

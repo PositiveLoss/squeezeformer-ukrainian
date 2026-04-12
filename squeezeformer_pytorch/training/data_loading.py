@@ -582,13 +582,46 @@ def _record_index_path(records_path: Path, suffix: str) -> Path:
     return records_path.with_suffix(records_path.suffix + suffix)
 
 
+def _binary_index_length(path: Path, *, item_size: int) -> int | None:
+    if not path.is_file():
+        return None
+    size = path.stat().st_size
+    if size == 0 or size % item_size != 0:
+        return None
+    return size // item_size
+
+
 def _disk_backed_record_store_exists(records_path: Path) -> bool:
-    required_paths = (
-        records_path,
+    if not records_path.is_file() or records_path.stat().st_size == 0:
+        return False
+
+    offsets_length = _binary_index_length(
         _record_index_path(records_path, ".offsets.u64"),
-        _record_index_path(records_path, ".estimated_frames.u32"),
+        item_size=8,
     )
-    return all(path.is_file() and path.stat().st_size > 0 for path in required_paths)
+    estimated_frames_length = _binary_index_length(
+        _record_index_path(records_path, ".estimated_frames.u32"),
+        item_size=4,
+    )
+    if offsets_length is None or estimated_frames_length is None or offsets_length == 0:
+        return False
+    if estimated_frames_length != offsets_length:
+        return False
+
+    optional_indexes = (
+        (".num_samples.u64", 8),
+        (".sample_rates.u32", 4),
+        (".transcript_lengths.u32", 4),
+        (".token_lengths.u32", 4),
+    )
+    for suffix, item_size in optional_indexes:
+        path = _record_index_path(records_path, suffix)
+        if not path.exists():
+            continue
+        index_length = _binary_index_length(path, item_size=item_size)
+        if index_length != offsets_length:
+            return False
+    return True
 
 
 def _is_remote_audio_source(audio_path: str) -> bool:
