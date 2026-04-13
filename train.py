@@ -462,12 +462,101 @@ def _upload_checkpoint_folder_to_hf(
     return upload_info
 
 
+def _hf_upload_sync_paths(output_dir: Path, sync_name: str) -> tuple[Path, Path, Path]:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", sync_name).strip("._") or "upload"
+    sync_dir = output_dir / ".hf_upload_sync"
+    return (
+        sync_dir / f"{safe_name}.started",
+        sync_dir / f"{safe_name}.done",
+        sync_dir / f"{safe_name}.failed",
+    )
+
+
+def _wait_for_hf_upload_marker(
+    *,
+    started_path: Path,
+    done_path: Path,
+    failed_path: Path,
+    logger: logging.Logger,
+    sync_name: str,
+) -> None:
+    last_log_time = 0.0
+    while not started_path.exists() and not done_path.exists() and not failed_path.exists():
+        time.sleep(2.0)
+
+    while not done_path.exists():
+        if failed_path.exists():
+            message = failed_path.read_text(encoding="utf-8").strip()
+            raise RuntimeError(
+                f"Hugging Face checkpoint upload failed on the main rank during {sync_name}: "
+                f"{message or 'unknown error'}"
+            )
+        now = time.perf_counter()
+        if now - last_log_time >= 60.0:
+            logger.info("waiting for main-rank hugging face upload to finish sync=%s", sync_name)
+            last_log_time = now
+        time.sleep(5.0)
+
+
+def _upload_checkpoint_folder_to_hf_synchronized(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    logger: logging.Logger,
+    commit_message: str,
+    commit_description: str,
+    sync_name: str,
+    distributed: bool,
+    is_main_process: bool,
+) -> None:
+    if not getattr(args, "hf_upload_checkpoints", False):
+        return
+    if not distributed or not dist.is_initialized():
+        if is_main_process:
+            _upload_checkpoint_folder_to_hf(
+                args=args,
+                output_dir=output_dir,
+                logger=logger,
+                commit_message=commit_message,
+                commit_description=commit_description,
+            )
+        return
+
+    started_path, done_path, failed_path = _hf_upload_sync_paths(output_dir, sync_name)
+    if is_main_process:
+        started_path.parent.mkdir(parents=True, exist_ok=True)
+        for marker_path in (started_path, done_path, failed_path):
+            marker_path.unlink(missing_ok=True)
+        started_path.write_text(str(time.time()), encoding="utf-8")
+        try:
+            _upload_checkpoint_folder_to_hf(
+                args=args,
+                output_dir=output_dir,
+                logger=logger,
+                commit_message=commit_message,
+                commit_description=commit_description,
+            )
+        except Exception as error:
+            failed_path.write_text(str(error), encoding="utf-8")
+            raise
+        done_path.write_text(str(time.time()), encoding="utf-8")
+        return
+
+    _wait_for_hf_upload_marker(
+        started_path=started_path,
+        done_path=done_path,
+        failed_path=failed_path,
+        logger=logger,
+        sync_name=sync_name,
+    )
+
+
 def _evaluate_and_checkpoint_with_hf_upload(**kwargs) -> float:
     best_val_wer = _evaluate_and_checkpoint(**kwargs)
     args = kwargs["args"]
-    if kwargs.get("is_main_process", True) and getattr(args, "hf_upload_checkpoints", False):
+    if getattr(args, "hf_upload_checkpoints", False):
         report_stem = str(kwargs.get("report_stem") or "checkpoint")
-        _upload_checkpoint_folder_to_hf(
+        _upload_checkpoint_folder_to_hf_synchronized(
             args=args,
             output_dir=kwargs["output_dir"],
             logger=kwargs["logger"],
@@ -478,6 +567,9 @@ def _evaluate_and_checkpoint_with_hf_upload(**kwargs) -> float:
                 f"Epoch: {kwargs.get('epoch')}\n"
                 f"Global step: {kwargs.get('global_step')}"
             ),
+            sync_name=f"validation_{report_stem}",
+            distributed=bool(kwargs.get("distributed", False)),
+            is_main_process=bool(kwargs.get("is_main_process", True)),
         )
     return best_val_wer
 
@@ -2871,17 +2963,20 @@ def main() -> None:
             output_dir / "train_summary.json",
         )
         trackio.finish()
-        _upload_checkpoint_folder_to_hf(
-            args=args,
-            output_dir=output_dir,
-            logger=logger,
-            commit_message="Upload final training checkpoint artifacts",
-            commit_description=(
-                "Automatic final checkpoint upload from train.py.\n\n"
-                f"Epochs: {args.epochs}\n"
-                f"Best validation WER: {best_val_wer:.6f}"
-            ),
-        )
+    _upload_checkpoint_folder_to_hf_synchronized(
+        args=args,
+        output_dir=output_dir,
+        logger=logger,
+        commit_message="Upload final training checkpoint artifacts",
+        commit_description=(
+            "Automatic final checkpoint upload from train.py.\n\n"
+            f"Epochs: {args.epochs}\n"
+            f"Best validation WER: {best_val_wer:.6f}"
+        ),
+        sync_name="final",
+        distributed=distributed,
+        is_main_process=is_main_process,
+    )
     if hasattr(train_records, "close"):
         train_records.close()
     if hasattr(val_records, "close"):
