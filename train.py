@@ -2096,13 +2096,21 @@ def main() -> None:
         while True:
             next_batch_index = batch_index + 1
             try:
+                loader_wait_details = (
+                    f"backend=yomikomi num_workers={args.num_workers} "
+                    f"prefetch_buffer_size={args.yomikomi_prefetch_buffer_size}"
+                    if args.dataloader_backend == "yomikomi"
+                    else (
+                        f"backend=torch num_workers={args.num_workers} "
+                        f"prefetch_factor={args.prefetch_factor}"
+                    )
+                )
                 batch, data_wait_seconds = _next_with_wait_logging(
                     train_iterator,
                     logger=logger if is_main_process else None,
                     description=(
                         f"epoch={epoch} waiting for training batch "
-                        f"{next_batch_index}/{train_batches} num_workers={args.num_workers} "
-                        f"prefetch_factor={args.prefetch_factor}"
+                        f"{next_batch_index}/{train_batches} {loader_wait_details}"
                     ),
                     log_after_seconds=10.0 if next_batch_index == 1 else 5.0,
                     log_every_seconds=30.0,
