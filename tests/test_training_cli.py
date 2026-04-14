@@ -129,6 +129,30 @@ def test_parse_args_accepts_zipformer_flag() -> None:
     assert args.zipformer is True
 
 
+def test_parse_args_defaults_to_single_threaded_dataloader_workers() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+        ]
+    )
+
+    assert args.dataloader_worker_threads == 1
+
+
+def test_parse_args_allows_disabling_dataloader_worker_thread_limit() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+            "--dataloader-worker-threads",
+            "0",
+        ]
+    )
+
+    assert args.dataloader_worker_threads == 0
+
+
 def test_parse_args_accepts_zipformer_fp8() -> None:
     args = parse_args(
         [

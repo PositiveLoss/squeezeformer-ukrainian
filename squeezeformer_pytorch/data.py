@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import functools
 import hashlib
 import io
 import logging
@@ -66,6 +67,36 @@ def _dataloader_multiprocessing_context(
         # Avoid forking a process that already owns distributed/CUDA runtime state.
         return mp.get_context("spawn")
     return mp.get_context("fork")
+
+
+def _limit_dataloader_worker_threads(worker_id: int, *, num_threads: int) -> None:
+    del worker_id
+    worker_threads = max(1, int(num_threads))
+    for variable in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[variable] = str(worker_threads)
+    try:
+        torch.set_num_threads(worker_threads)
+    except Exception:
+        logger.debug("failed to set torch DataLoader worker threads", exc_info=True)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        logger.debug("failed to set torch DataLoader worker interop threads", exc_info=True)
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        return
+    try:
+        threadpool_limits(limits=worker_threads)
+    except Exception:
+        logger.debug("failed to limit native DataLoader worker thread pools", exc_info=True)
 
 
 def _progress_log_interval(total: int) -> int:
@@ -2217,18 +2248,21 @@ def create_dataloader(
     seed: int = 0,
     pad_distributed_batches: bool = False,
     in_order: bool = True,
+    worker_threads: int | None = 1,
     progress_logger: logging.Logger | None = None,
     progress_label: str = "dataloader",
 ) -> DataLoader[dict[str, Any]]:
     stage_start_time = time.perf_counter()
     if progress_logger is not None:
         progress_logger.info(
-            "%s create_dataloader started samples=%s batch_size=%s shuffle=%s num_workers=%s",
+            "%s create_dataloader started samples=%s batch_size=%s shuffle=%s "
+            "num_workers=%s worker_threads=%s",
             progress_label,
             len(dataset),
             batch_size,
             shuffle,
             num_workers,
+            worker_threads if num_workers > 0 else "none",
         )
     if hasattr(dataset.records, "populate_metadata"):
         dataset.records.populate_metadata(
@@ -2270,6 +2304,11 @@ def create_dataloader(
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = prefetch_factor
         dataloader_kwargs["in_order"] = in_order
+        if worker_threads is not None and worker_threads > 0:
+            dataloader_kwargs["worker_init_fn"] = functools.partial(
+                _limit_dataloader_worker_threads,
+                num_threads=int(worker_threads),
+            )
         resolved_multiprocessing_context = _dataloader_multiprocessing_context(
             num_workers,
             multiprocessing_context=multiprocessing_context,

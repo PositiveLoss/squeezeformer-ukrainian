@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -1666,7 +1667,7 @@ def main() -> None:
     )
     stage_start_time = time.perf_counter()
     logger.info(
-        "building dataloaders train_samples=%s val_samples=%s distributed=%s world_size=%s train_hours=%.2f val_hours=%.2f num_workers=%s metadata_workers=%s force_audio_metadata_probe=%s persistent_workers=%s prefetch_factor=%s train_in_order=%s feature_cache_format=%s",
+        "building dataloaders train_samples=%s val_samples=%s distributed=%s world_size=%s train_hours=%.2f val_hours=%.2f num_workers=%s dataloader_worker_threads=%s metadata_workers=%s force_audio_metadata_probe=%s persistent_workers=%s prefetch_factor=%s train_in_order=%s feature_cache_format=%s",
         len(train_records),
         len(val_records),
         distributed,
@@ -1674,6 +1675,7 @@ def main() -> None:
         _record_store_duration_hours(train_records, hop_length=featurizer.hop_length),
         _record_store_duration_hours(val_records, hop_length=featurizer.hop_length),
         args.num_workers,
+        args.dataloader_worker_threads if args.num_workers > 0 else "none",
         args.metadata_workers,
         args.force_audio_metadata_probe,
         args.persistent_workers,
@@ -1704,6 +1706,7 @@ def main() -> None:
         seed=args.seed,
         pad_distributed_batches=distributed,
         in_order=args.dataloader_in_order,
+        worker_threads=args.dataloader_worker_threads,
         progress_logger=logger if is_main_process else None,
         progress_label="train dataloader",
     )
@@ -1730,6 +1733,7 @@ def main() -> None:
         seed=args.seed,
         pad_distributed_batches=False,
         in_order=True,
+        worker_threads=args.dataloader_worker_threads,
         progress_logger=logger if is_main_process else None,
         progress_label="validation dataloader",
     )

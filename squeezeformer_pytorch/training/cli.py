@@ -172,6 +172,7 @@ def _validate_startup_args(
 
     nonnegative_int_arguments = {
         "--num-workers": args.num_workers,
+        "--dataloader-worker-threads": args.dataloader_worker_threads,
         "--seed": args.seed,
         "--ema-warmup-steps": args.ema_warmup_steps,
         "--save-audio-preview-samples": args.save_audio_preview_samples,
@@ -524,6 +525,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=0.0)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--dataloader-worker-threads",
+        type=int,
+        default=1,
+        help=(
+            "CPU threads allowed inside each DataLoader worker process. The default keeps "
+            "multi-worker loading from multiplying PyTorch/OpenMP/BLAS thread pools. Set 0 "
+            "to leave worker thread pools unchanged."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)

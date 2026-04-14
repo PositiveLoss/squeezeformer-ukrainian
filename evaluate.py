@@ -152,6 +152,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--dataloader-worker-threads",
+        type=int,
+        default=1,
+        help=(
+            "CPU threads allowed inside each DataLoader worker process. Set 0 to leave "
+            "worker thread pools unchanged."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--test-fraction", type=float, default=0.1)
@@ -245,6 +254,10 @@ def parse_args() -> argparse.Namespace:
         _validate_existing_local_path_argument("--dataset-source", source)
     for source in args.validation_dataset_source or []:
         _validate_existing_local_path_argument("--validation-dataset-source", source)
+    if args.dataloader_worker_threads < 0:
+        raise ValueError(
+            f"--dataloader-worker-threads must be >= 0, got {args.dataloader_worker_threads}."
+        )
     if args.beam_length_bonus < 0:
         raise ValueError(f"--beam-length-bonus must be >= 0, got {args.beam_length_bonus}.")
     return args
@@ -394,6 +407,7 @@ def main() -> None:
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
         multiprocessing_context=getattr(args, "dataloader_mp_context", "auto"),
+        worker_threads=args.dataloader_worker_threads,
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
     lm_scorer = load_lm_scorer(args.lm_scorer)
