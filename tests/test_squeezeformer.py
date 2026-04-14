@@ -2855,6 +2855,7 @@ def test_create_dataloader_can_use_yomikomi_backend(
     batch = next(iter(loader))
     assert batch["features"].shape == (2, 2, 80)
     assert captured["stream"].field == "indices"
+    assert captured["stream"].mapper is None
     assert captured["stream"].prefetch_kwargs == {"num_threads": 3, "buffer_size": 7}
 
 
