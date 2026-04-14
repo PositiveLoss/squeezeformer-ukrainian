@@ -39,36 +39,42 @@ impl RustParquetFeatureCacheReader {
     }
 
     fn fetch_many<'py>(&self, py: Python<'py>, keys: Vec<String>) -> PyResult<Bound<'py, PyList>> {
-        let mut output: Vec<Option<FeatureMatrixPayload>> = vec![None; keys.len()];
-        let mut positions_by_path: HashMap<&Path, Vec<(usize, usize)>> = HashMap::new();
+        let mut positions_by_path: HashMap<PathBuf, Vec<(usize, usize)>> = HashMap::new();
         for (position, key) in keys.iter().enumerate() {
             if let Some(location) = self.index.get(key) {
                 positions_by_path
-                    .entry(location.path.as_path())
+                    .entry(location.path.clone())
                     .or_default()
                     .push((position, location.row_index));
             }
         }
-        for (path, positions) in positions_by_path {
-            let requested: HashMap<usize, Vec<usize>> =
-                positions
-                    .into_iter()
-                    .fold(HashMap::new(), |mut acc, (position, row_index)| {
-                        acc.entry(row_index).or_default().push(position);
-                        acc
-                    });
-            let payloads =
-                read_payloads_from_part(path, requested.keys().copied()).map_err(py_error)?;
-            for (row_index, positions) in requested {
-                let Some(payload) = payloads.get(&row_index) else {
-                    continue;
-                };
-                let decoded = decode_feature_payload(payload).map_err(py_error)?;
-                for position in positions {
-                    output[position] = Some(decoded.clone());
+        let output = py
+            .detach(|| -> Result<Vec<Option<FeatureMatrixPayload>>> {
+                let mut output: Vec<Option<FeatureMatrixPayload>> = vec![None; keys.len()];
+                for (path, positions) in positions_by_path {
+                    let requested: HashMap<usize, Vec<usize>> = positions.into_iter().fold(
+                        HashMap::new(),
+                        |mut acc, (position, row_index)| {
+                            acc.entry(row_index).or_default().push(position);
+                            acc
+                        },
+                    );
+                    let payloads = read_payloads_from_part(&path, requested.keys().copied())?;
+                    for (row_index, positions) in requested {
+                        let Some(payload) = payloads.get(&row_index) else {
+                            continue;
+                        };
+                        let Ok(decoded) = decode_feature_payload(payload) else {
+                            continue;
+                        };
+                        for position in positions {
+                            output[position] = Some(decoded.clone());
+                        }
+                    }
                 }
-            }
-        }
+                Ok(output)
+            })
+            .map_err(py_error)?;
 
         let py_items = PyList::empty(py);
         for item in output {
