@@ -1295,6 +1295,7 @@ class ShardedParquetFeatureCache:
         self._pending_rows: dict[int, list[dict[str, object]]] = {}
         self._part_counters: dict[int, int] = {}
         self._pid: int | None = None
+        self._lock = threading.RLock()
         atexit.register(self.close)
 
     def _key(self, utterance_id: str, featurizer: AudioFeaturizer) -> str:
@@ -1325,14 +1326,16 @@ class ShardedParquetFeatureCache:
         )
 
     def close(self) -> None:
-        self.flush()
-        self._pid = None
+        with self._lock:
+            self.flush()
+            self._pid = None
 
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state["_pending_rows"] = {}
         state["_part_counters"] = {}
         state["_pid"] = None
+        state.pop("_lock", None)
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -1340,6 +1343,7 @@ class ShardedParquetFeatureCache:
         self._pending_rows = {}
         self._part_counters = {}
         self._pid = None
+        self._lock = threading.RLock()
 
     def _append_row(
         self,
@@ -1375,55 +1379,58 @@ class ShardedParquetFeatureCache:
         self._pending_rows[shard_index] = []
 
     def load(self, utterance_id: str, featurizer: AudioFeaturizer) -> Tensor | None:
-        key = self._key(utterance_id, featurizer)
-        shard_index = self._shard_index(key)
-        self._ensure_process_state()
-        for row in reversed(self._pending_rows.get(shard_index, [])):
-            if row["key"] != key:
-                continue
-            if row["deleted"]:
-                return None
-            payload = row["payload"]
-            if not isinstance(payload, bytes):
-                return None
-            return _load_feature_cache_payload(payload)
-        part_paths = sorted(
-            self._shard_path(shard_index).glob("part_*.parquet"),
-            key=lambda path: (path.stat().st_mtime_ns, path.name),
-            reverse=True,
-        )
-        for path in part_paths:
-            matches = (
-                pl.read_parquet(path, columns=["key", "payload", "deleted"])
-                .filter(pl.col("key") == key)
-                .tail(1)
+        with self._lock:
+            key = self._key(utterance_id, featurizer)
+            shard_index = self._shard_index(key)
+            self._ensure_process_state()
+            for row in reversed(self._pending_rows.get(shard_index, [])):
+                if row["key"] != key:
+                    continue
+                if row["deleted"]:
+                    return None
+                payload = row["payload"]
+                if not isinstance(payload, bytes):
+                    return None
+                return _load_feature_cache_payload(payload)
+            part_paths = sorted(
+                self._shard_path(shard_index).glob("part_*.parquet"),
+                key=lambda path: (path.stat().st_mtime_ns, path.name),
+                reverse=True,
             )
-            if matches.is_empty():
-                continue
-            row = matches.row(0, named=True)
-            if row["deleted"]:
-                return None
-            payload = row["payload"]
-            if payload is None:
-                return None
-            return _load_feature_cache_payload(payload)
-        return None
+            for path in part_paths:
+                matches = (
+                    pl.read_parquet(path, columns=["key", "payload", "deleted"])
+                    .filter(pl.col("key") == key)
+                    .tail(1)
+                )
+                if matches.is_empty():
+                    continue
+                row = matches.row(0, named=True)
+                if row["deleted"]:
+                    return None
+                payload = row["payload"]
+                if payload is None:
+                    return None
+                return _load_feature_cache_payload(payload)
+            return None
 
     def store(self, utterance_id: str, featurizer: AudioFeaturizer, features: Tensor) -> None:
-        key = self._key(utterance_id, featurizer)
-        buffer = io.BytesIO()
-        torch.save(features, buffer)
-        shard_index = self._shard_index(key)
-        self._append_row(
-            shard_index,
-            key=key,
-            payload=buffer.getvalue(),
-            deleted=False,
-        )
+        with self._lock:
+            key = self._key(utterance_id, featurizer)
+            buffer = io.BytesIO()
+            torch.save(features, buffer)
+            shard_index = self._shard_index(key)
+            self._append_row(
+                shard_index,
+                key=key,
+                payload=buffer.getvalue(),
+                deleted=False,
+            )
 
     def flush(self) -> None:
-        for shard_index in list(self._pending_rows):
-            self._flush_shard(shard_index)
+        with self._lock:
+            for shard_index in list(self._pending_rows):
+                self._flush_shard(shard_index)
 
     def __del__(self) -> None:
         try:
@@ -1432,10 +1439,11 @@ class ShardedParquetFeatureCache:
             pass
 
     def delete(self, utterance_id: str, featurizer: AudioFeaturizer) -> None:
-        key = self._key(utterance_id, featurizer)
-        shard_index = self._shard_index(key)
-        self._append_row(shard_index, key=key, payload=None, deleted=True)
-        self._flush_shard(shard_index)
+        with self._lock:
+            key = self._key(utterance_id, featurizer)
+            shard_index = self._shard_index(key)
+            self._append_row(shard_index, key=key, payload=None, deleted=True)
+            self._flush_shard(shard_index)
 
 
 class ASRDataset(Dataset[dict[str, Any]]):
