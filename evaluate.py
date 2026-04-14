@@ -153,6 +153,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
+        "--dataloader-backend",
+        choices=["torch", "yomikomi"],
+        default="torch",
+        help="Data loading backend. 'yomikomi' uses Yomikomi stream prefetch threads.",
+    )
+    parser.add_argument(
         "--dataloader-worker-threads",
         type=int,
         default=1,
@@ -160,6 +166,12 @@ def parse_args() -> argparse.Namespace:
             "CPU threads allowed inside each DataLoader worker process. Set 0 to leave "
             "worker thread pools unchanged."
         ),
+    )
+    parser.add_argument(
+        "--yomikomi-prefetch-buffer-size",
+        type=int,
+        default=None,
+        help="Optional Yomikomi prefetch buffer size when --dataloader-backend=yomikomi.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -257,6 +269,11 @@ def parse_args() -> argparse.Namespace:
     if args.dataloader_worker_threads < 0:
         raise ValueError(
             f"--dataloader-worker-threads must be >= 0, got {args.dataloader_worker_threads}."
+        )
+    if args.yomikomi_prefetch_buffer_size is not None and args.yomikomi_prefetch_buffer_size <= 0:
+        raise ValueError(
+            "--yomikomi-prefetch-buffer-size must be > 0, "
+            f"got {args.yomikomi_prefetch_buffer_size}."
         )
     if args.beam_length_bonus < 0:
         raise ValueError(f"--beam-length-bonus must be >= 0, got {args.beam_length_bonus}.")
@@ -408,6 +425,8 @@ def main() -> None:
         prefetch_factor=args.prefetch_factor,
         multiprocessing_context=getattr(args, "dataloader_mp_context", "auto"),
         worker_threads=args.dataloader_worker_threads,
+        backend=args.dataloader_backend,
+        yomikomi_prefetch_buffer_size=args.yomikomi_prefetch_buffer_size,
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)
     lm_scorer = load_lm_scorer(args.lm_scorer)

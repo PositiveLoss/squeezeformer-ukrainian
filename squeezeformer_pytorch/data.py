@@ -2052,6 +2052,104 @@ class DistributedBatchSampler(BatchSampler):
         return (remaining + self.world_size - 1) // self.world_size
 
 
+class IndexBatchSampler(BatchSampler):
+    def __init__(
+        self,
+        sampler: Sampler[int],
+        batch_size: int,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be > 0, got {batch_size}.")
+        self.sampler = sampler
+        self.batch_size = int(batch_size)
+
+    def __iter__(self):
+        batch: list[int] = []
+        for index in self.sampler:
+            batch.append(int(index))
+            if len(batch) == self.batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    def __len__(self) -> int:
+        sampler_length = len(self.sampler)  # type: ignore[arg-type]
+        return math.ceil(sampler_length / self.batch_size)
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(epoch)
+
+
+class EpochIndexSampler(Sampler[int]):
+    def __init__(
+        self,
+        dataset_size: int,
+        *,
+        shuffle: bool,
+        seed: int = 0,
+    ) -> None:
+        self.dataset_size = int(dataset_size)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        indices = list(range(self.dataset_size))
+        if self.shuffle:
+            order = _epoch_shuffled_order(self.dataset_size, seed=self.seed, epoch=self.epoch)
+            indices = [indices[index] for index in order]
+        yield from indices
+
+    def __len__(self) -> int:
+        return self.dataset_size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+
+class YomikomiDataLoader:
+    def __init__(
+        self,
+        dataset: ASRDataset,
+        *,
+        batch_sampler: BatchSampler,
+        collate_fn: Callable[[list[dict[str, Any] | None]], dict[str, Any] | None],
+        num_workers: int = 0,
+        prefetch_buffer_size: int | None = None,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_sampler = batch_sampler
+        self.sampler = getattr(batch_sampler, "sampler", None)
+        self.collate_fn = collate_fn
+        self.num_workers = max(0, int(num_workers))
+        self.prefetch_buffer_size = prefetch_buffer_size
+        try:
+            import yomikomi
+        except ImportError as exc:
+            raise ImportError(
+                "Yomikomi DataLoader backend requested, but the 'yomikomi' package is not "
+                "installed. Install yomikomi or use --dataloader-backend torch."
+            ) from exc
+        self._yomikomi = yomikomi
+
+    def __iter__(self):
+        def load_batch(indices: list[int]):
+            return self.collate_fn([self.dataset[int(index)] for index in indices])
+
+        stream = self._yomikomi.stream(iter(self.batch_sampler)).map(load_batch)
+        if self.num_workers > 0:
+            kwargs: dict[str, Any] = {"num_threads": self.num_workers}
+            if self.prefetch_buffer_size is not None:
+                kwargs["buffer_size"] = self.prefetch_buffer_size
+            stream = stream.prefetch(**kwargs)
+        return iter(stream)
+
+    def __len__(self) -> int:
+        return len(self.batch_sampler)
+
+
 def _record_is_valid(record: AudioRecord) -> bool:
     try:
         if record.audio_path is not None and Path(record.audio_path).exists():
@@ -2249,20 +2347,23 @@ def create_dataloader(
     pad_distributed_batches: bool = False,
     in_order: bool = True,
     worker_threads: int | None = 1,
+    backend: str = "torch",
+    yomikomi_prefetch_buffer_size: int | None = None,
     progress_logger: logging.Logger | None = None,
     progress_label: str = "dataloader",
-) -> DataLoader[dict[str, Any]]:
+) -> DataLoader[dict[str, Any]] | YomikomiDataLoader:
     stage_start_time = time.perf_counter()
     if progress_logger is not None:
         progress_logger.info(
             "%s create_dataloader started samples=%s batch_size=%s shuffle=%s "
-            "num_workers=%s worker_threads=%s",
+            "num_workers=%s worker_threads=%s backend=%s",
             progress_label,
             len(dataset),
             batch_size,
             shuffle,
             num_workers,
             worker_threads if num_workers > 0 else "none",
+            backend,
         )
     if hasattr(dataset.records, "populate_metadata"):
         dataset.records.populate_metadata(
@@ -2295,6 +2396,46 @@ def create_dataloader(
             progress_logger=progress_logger,
             progress_label=progress_label,
         )
+    if backend not in {"torch", "yomikomi"}:
+        raise ValueError(f"backend must be one of {{'torch', 'yomikomi'}}, got {backend!r}.")
+
+    def make_loader(
+        *,
+        batch_sampler: BatchSampler | None = None,
+        sampler: Sampler[int] | None = None,
+        loader_batch_size: int | None = None,
+        loader_shuffle: bool = False,
+    ):
+        if backend == "yomikomi":
+            if batch_sampler is None:
+                resolved_sampler = sampler
+                if resolved_sampler is None:
+                    resolved_sampler = EpochIndexSampler(
+                        len(dataset),
+                        shuffle=loader_shuffle,
+                        seed=seed,
+                    )
+                batch_sampler = IndexBatchSampler(
+                    resolved_sampler,
+                    batch_size=batch_size if loader_batch_size is None else loader_batch_size,
+                )
+            return YomikomiDataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_asr_batch,
+                num_workers=num_workers,
+                prefetch_buffer_size=yomikomi_prefetch_buffer_size,
+            )
+        if batch_sampler is not None:
+            return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size if loader_batch_size is None else loader_batch_size,
+            shuffle=loader_shuffle,
+            sampler=sampler,
+            **dataloader_kwargs,
+        )
+
     dataloader_kwargs = {
         "num_workers": num_workers,
         "collate_fn": collate_asr_batch,
@@ -2333,7 +2474,7 @@ def create_dataloader(
                 world_size=world_size,
                 pad_to_world_size=pad_distributed_batches,
             )
-        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
+        return make_loader(batch_sampler=batch_sampler)
     if max_batch_duration_sec is not None:
         batch_sampler = DurationBatchSampler(
             dataset.records,
@@ -2351,7 +2492,7 @@ def create_dataloader(
                 world_size=world_size,
                 pad_to_world_size=pad_distributed_batches,
             )
-        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
+        return make_loader(batch_sampler=batch_sampler)
     if max_batch_frames is not None:
         batch_sampler = MaxFramesBatchSampler(
             dataset.records,
@@ -2369,7 +2510,7 @@ def create_dataloader(
                 world_size=world_size,
                 pad_to_world_size=pad_distributed_batches,
             )
-        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
+        return make_loader(batch_sampler=batch_sampler)
     if bucket_by_length:
         batch_sampler = LengthBucketBatchSampler(
             dataset.records,
@@ -2387,7 +2528,7 @@ def create_dataloader(
                 world_size=world_size,
                 pad_to_world_size=pad_distributed_batches,
             )
-        return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
+        return make_loader(batch_sampler=batch_sampler)
     if distributed and world_size > 1:
         sampler = DistributedIndexSampler(
             len(dataset),
@@ -2397,16 +2538,5 @@ def create_dataloader(
             seed=seed,
             pad_to_world_size=pad_distributed_batches,
         )
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            sampler=sampler,
-            **dataloader_kwargs,
-        )
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        **dataloader_kwargs,
-    )
+        return make_loader(sampler=sampler, loader_batch_size=batch_size, loader_shuffle=False)
+    return make_loader(loader_batch_size=batch_size, loader_shuffle=shuffle)

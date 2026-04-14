@@ -153,6 +153,25 @@ def test_parse_args_allows_disabling_dataloader_worker_thread_limit() -> None:
     assert args.dataloader_worker_threads == 0
 
 
+def test_parse_args_accepts_yomikomi_dataloader_backend() -> None:
+    args = parse_args(
+        [
+            "--device",
+            "cpu",
+            "--dataloader-backend",
+            "yomikomi",
+            "--num-workers",
+            "4",
+            "--yomikomi-prefetch-buffer-size",
+            "16",
+        ]
+    )
+
+    assert args.dataloader_backend == "yomikomi"
+    assert args.num_workers == 4
+    assert args.yomikomi_prefetch_buffer_size == 16
+
+
 def test_parse_args_accepts_zipformer_fp8() -> None:
     args = parse_args(
         [

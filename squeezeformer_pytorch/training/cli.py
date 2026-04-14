@@ -154,6 +154,10 @@ def _validate_startup_args(
     }
     if args.prefetch_factor is not None:
         positive_int_arguments["--prefetch-factor"] = args.prefetch_factor
+    if args.yomikomi_prefetch_buffer_size is not None:
+        positive_int_arguments["--yomikomi-prefetch-buffer-size"] = (
+            args.yomikomi_prefetch_buffer_size
+        )
     if args.num_time_masks is not None:
         positive_int_arguments["--num-time-masks"] = args.num_time_masks
     if args.max_train_samples is not None:
@@ -527,6 +531,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
+        "--dataloader-backend",
+        choices=["torch", "yomikomi"],
+        default="torch",
+        help=(
+            "Data loading backend. 'torch' uses PyTorch DataLoader workers; 'yomikomi' "
+            "uses Yomikomi stream prefetch threads and keeps this training code's samplers."
+        ),
+    )
+    parser.add_argument(
         "--dataloader-worker-threads",
         type=int,
         default=1,
@@ -535,6 +548,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "multi-worker loading from multiplying PyTorch/OpenMP/BLAS thread pools. Set 0 "
             "to leave worker thread pools unchanged."
         ),
+    )
+    parser.add_argument(
+        "--yomikomi-prefetch-buffer-size",
+        type=int,
+        default=None,
+        help="Optional Yomikomi prefetch buffer size when --dataloader-backend=yomikomi.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
