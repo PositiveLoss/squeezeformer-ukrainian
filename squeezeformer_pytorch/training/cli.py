@@ -466,8 +466,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--auto-resume",
         action="store_true",
         help=(
-            "Resume from OUTPUT_DIR/checkpoint_last.pt when it exists and passes validation. "
-            "Starts a fresh run when no last checkpoint is available."
+            "Resume from the newest valid last checkpoint in OUTPUT_DIR "
+            "(checkpoint_last.pt or checkpoint_step_last.pt). Starts a fresh run when no "
+            "last checkpoint is available."
         ),
     )
     parser.add_argument(

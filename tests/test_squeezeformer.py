@@ -309,6 +309,53 @@ def test_validate_resume_tokenizer_configuration_rejects_tokenizer_path_mismatch
     assert "does not match the tokenizer loaded" in str(error.value)
 
 
+def _write_resume_checkpoint(path: Path, *, epoch: int, global_step: int) -> None:
+    save_checkpoint(
+        {
+            "model_state_dict": {},
+            "encoder_config": {},
+            "tokenizer": CharacterTokenizer(symbols=[]).to_dict(),
+            "optimizer_state_dicts": [],
+            "scheduler_state_dicts": [],
+            "epoch": epoch,
+            "global_step": global_step,
+        },
+        path,
+    )
+
+
+def test_auto_resume_uses_step_last_checkpoint_when_epoch_last_is_missing(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint_step_last.pt"
+    _write_resume_checkpoint(checkpoint_path, epoch=1, global_step=500)
+    args = type("Args", (), {"resume": None, "auto_resume": True})()
+
+    resolved_path = train._resolve_resume_checkpoint_path(
+        args,
+        output_dir=tmp_path,
+        logger=logging.getLogger("test"),
+    )
+
+    assert resolved_path == checkpoint_path
+
+
+def test_auto_resume_uses_highest_global_step_checkpoint(tmp_path: Path) -> None:
+    epoch_checkpoint_path = tmp_path / "checkpoint_last.pt"
+    step_checkpoint_path = tmp_path / "checkpoint_step_last.pt"
+    _write_resume_checkpoint(epoch_checkpoint_path, epoch=1, global_step=100)
+    _write_resume_checkpoint(step_checkpoint_path, epoch=1, global_step=500)
+    args = type("Args", (), {"resume": None, "auto_resume": True})()
+
+    resolved_path = train._resolve_resume_checkpoint_path(
+        args,
+        output_dir=tmp_path,
+        logger=logging.getLogger("test"),
+    )
+
+    assert resolved_path == step_checkpoint_path
+
+
 def test_build_trackio_cli_arguments_table_records_explicit_arguments() -> None:
     table = _build_trackio_cli_arguments_table(
         [

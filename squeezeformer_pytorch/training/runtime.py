@@ -500,21 +500,30 @@ def _resolve_resume_checkpoint_path(
     if not args.auto_resume:
         return None
 
-    checkpoint_path = output_dir / "checkpoint_last.pt"
-    if not checkpoint_path.exists():
+    candidate_paths = [
+        output_dir / "checkpoint_last.pt",
+        output_dir / "checkpoint_step_last.pt",
+    ]
+    existing_paths = [path for path in candidate_paths if path.exists()]
+    if not existing_paths:
         logger.info(
             "auto-resume requested but no checkpoint found at %s; starting a fresh run",
-            checkpoint_path,
+            ", ".join(str(path) for path in candidate_paths),
         )
         return None
 
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    except Exception as error:
-        raise RuntimeError(
-            f"Failed to load auto-resume checkpoint '{checkpoint_path}': {error}"
-        ) from error
-    _validate_resume_checkpoint_payload(checkpoint, checkpoint_path=checkpoint_path)
+    candidates: list[tuple[int, Path, dict[str, object]]] = []
+    for checkpoint_path in existing_paths:
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        except Exception as error:
+            raise RuntimeError(
+                f"Failed to load auto-resume checkpoint '{checkpoint_path}': {error}"
+            ) from error
+        _validate_resume_checkpoint_payload(checkpoint, checkpoint_path=checkpoint_path)
+        candidates.append((int(checkpoint.get("global_step", 0)), checkpoint_path, checkpoint))
+
+    _, checkpoint_path, checkpoint = max(candidates, key=lambda candidate: candidate[0])
     logger.info(
         "auto-resume validated checkpoint path=%s epoch=%s global_step=%s",
         checkpoint_path,
