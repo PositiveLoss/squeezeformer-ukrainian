@@ -2172,6 +2172,8 @@ class RustParquetFeatureDataLoader:
         batch_sampler: BatchSampler,
         num_workers: int = 0,
         prefetch_batches: int = 2,
+        progress_logger: logging.Logger | None = None,
+        progress_label: str = "dataloader",
     ) -> None:
         if dataset.feature_cache_dir is None:
             raise ValueError("rust-parquet backend requires dataset.feature_cache_dir")
@@ -2193,7 +2195,27 @@ class RustParquetFeatureDataLoader:
         self.sampler = getattr(batch_sampler, "sampler", None)
         self.num_workers = max(0, int(num_workers))
         self.prefetch_batches = max(1, int(prefetch_batches))
+        self.progress_logger = progress_logger
+        self.progress_label = progress_label
+        index_start_time = time.perf_counter()
+        if self.progress_logger is not None:
+            self.progress_logger.info(
+                "%s rust-parquet feature cache index build started cache_dir=%s batches=%s "
+                "num_workers=%s prefetch_batches=%s",
+                self.progress_label,
+                dataset.feature_cache_dir,
+                len(batch_sampler),
+                self.num_workers,
+                self.prefetch_batches,
+            )
         self.reader = RustParquetFeatureCacheReader(str(dataset.feature_cache_dir))
+        if self.progress_logger is not None:
+            self.progress_logger.info(
+                "%s rust-parquet feature cache index ready entries=%s elapsed=%.1fs",
+                self.progress_label,
+                self.reader.len(),
+                time.perf_counter() - index_start_time,
+            )
 
     def __iter__(self):
         iterator = iter(self.batch_sampler)
@@ -2574,6 +2596,8 @@ def create_dataloader(
                 batch_sampler=batch_sampler,
                 num_workers=num_workers,
                 prefetch_batches=rust_prefetch_batches,
+                progress_logger=progress_logger,
+                progress_label=progress_label,
             )
         if batch_sampler is not None:
             return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
