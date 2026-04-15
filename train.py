@@ -1667,21 +1667,17 @@ def main() -> None:
     )
     stage_start_time = time.perf_counter()
     logger.info(
-        "building dataloaders train_samples=%s val_samples=%s distributed=%s world_size=%s train_hours=%.2f val_hours=%.2f dataloader_backend=%s num_workers=%s dataloader_worker_threads=%s metadata_workers=%s force_audio_metadata_probe=%s persistent_workers=%s prefetch_factor=%s train_in_order=%s feature_cache_format=%s",
+        "building dataloaders train_samples=%s val_samples=%s distributed=%s world_size=%s train_hours=%.2f val_hours=%.2f dataloader=rust-parquet num_workers=%s metadata_workers=%s force_audio_metadata_probe=%s rust_prefetch_batches=%s feature_cache_format=%s",
         len(train_records),
         len(val_records),
         distributed,
         world_size,
         _record_store_duration_hours(train_records, hop_length=featurizer.hop_length),
         _record_store_duration_hours(val_records, hop_length=featurizer.hop_length),
-        args.dataloader_backend,
         args.num_workers,
-        args.dataloader_worker_threads if args.num_workers > 0 else "none",
         args.metadata_workers,
         args.force_audio_metadata_probe,
-        args.persistent_workers,
-        args.prefetch_factor,
-        args.dataloader_in_order,
+        args.rust_prefetch_batches,
         args.feature_cache_format,
     )
     train_loader = create_dataloader(
@@ -1694,21 +1690,14 @@ def main() -> None:
         max_batch_frames=args.max_batch_frames,
         adaptive_batch_unit=args.adaptive_batch_unit,
         adaptive_batch_budget=args.adaptive_batch_budget,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor,
         metadata_workers=args.metadata_workers,
         force_audio_metadata_probe=args.force_audio_metadata_probe,
         longest_batches_first=args.longest_batches_first,
-        multiprocessing_context=args.dataloader_mp_context,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
         seed=args.seed,
         pad_distributed_batches=distributed,
-        in_order=args.dataloader_in_order,
-        worker_threads=args.dataloader_worker_threads,
-        backend=args.dataloader_backend,
         rust_prefetch_batches=args.rust_prefetch_batches,
         progress_logger=logger if is_main_process else None,
         progress_label="train dataloader",
@@ -1723,21 +1712,14 @@ def main() -> None:
         max_batch_frames=args.max_batch_frames,
         adaptive_batch_unit=args.adaptive_batch_unit,
         adaptive_batch_budget=args.adaptive_batch_budget,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor,
         metadata_workers=args.metadata_workers,
         force_audio_metadata_probe=args.force_audio_metadata_probe,
         longest_batches_first=False,
-        multiprocessing_context=args.dataloader_mp_context,
         distributed=distributed,
         rank=rank,
         world_size=world_size,
         seed=args.seed,
         pad_distributed_batches=False,
-        in_order=True,
-        worker_threads=args.dataloader_worker_threads,
-        backend=args.dataloader_backend,
         rust_prefetch_batches=args.rust_prefetch_batches,
         progress_logger=logger if is_main_process else None,
         progress_label="validation dataloader",
@@ -2099,11 +2081,6 @@ def main() -> None:
                 loader_wait_details = (
                     f"backend=rust-parquet num_workers={args.num_workers} "
                     f"prefetch_batches={args.rust_prefetch_batches}"
-                    if args.dataloader_backend == "rust-parquet"
-                    else (
-                        f"backend=torch num_workers={args.num_workers} "
-                        f"prefetch_factor={args.prefetch_factor}"
-                    )
                 )
                 batch, data_wait_seconds = _next_with_wait_logging(
                     train_iterator,

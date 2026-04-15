@@ -153,28 +153,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
-        "--dataloader-backend",
-        choices=["torch", "rust-parquet"],
-        default="torch",
-        help=(
-            "Data loading backend. 'torch' uses PyTorch DataLoader workers; "
-            "'rust-parquet' reads parquet feature cache payloads through the Rust extension."
-        ),
-    )
-    parser.add_argument(
-        "--dataloader-worker-threads",
-        type=int,
-        default=1,
-        help=(
-            "CPU threads allowed inside each DataLoader worker process. Set 0 to leave "
-            "worker thread pools unchanged."
-        ),
-    )
-    parser.add_argument(
         "--rust-prefetch-batches",
         type=int,
         default=2,
-        help="Number of ordered batches to prefetch when --dataloader-backend=rust-parquet.",
+        help="Number of ordered batches to prefetch in the Rust parquet dataloader.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -195,26 +177,6 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument(
-        "--pin-memory",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--persistent-workers",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--dataloader-mp-context",
-        choices=["auto", "fork", "forkserver", "spawn"],
-        default="auto",
-        help=(
-            "Multiprocessing start method for DataLoader workers. 'auto' keeps the current "
-            "platform-aware default and uses 'spawn' when distributed training is initialized."
-        ),
-    )
-    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--prevalidate-audio",
         action=argparse.BooleanOptionalAction,
@@ -269,10 +231,6 @@ def parse_args() -> argparse.Namespace:
         _validate_existing_local_path_argument("--dataset-source", source)
     for source in args.validation_dataset_source or []:
         _validate_existing_local_path_argument("--validation-dataset-source", source)
-    if args.dataloader_worker_threads < 0:
-        raise ValueError(
-            f"--dataloader-worker-threads must be >= 0, got {args.dataloader_worker_threads}."
-        )
     if args.rust_prefetch_batches <= 0:
         raise ValueError(f"--rust-prefetch-batches must be > 0, got {args.rust_prefetch_batches}.")
     if args.beam_length_bonus < 0:
@@ -420,12 +378,6 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         bucket_by_length=args.bucket_by_length,
-        pin_memory=args.pin_memory,
-        persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor,
-        multiprocessing_context=getattr(args, "dataloader_mp_context", "auto"),
-        worker_threads=args.dataloader_worker_threads,
-        backend=args.dataloader_backend,
         rust_prefetch_batches=args.rust_prefetch_batches,
     )
     criterion = nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True)

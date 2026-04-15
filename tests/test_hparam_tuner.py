@@ -46,7 +46,6 @@ def test_estimate_training_hparams_cpu_smoke() -> None:
     assert estimate.gradient_accumulation_steps >= 1
     assert estimate.num_workers >= 1
     assert estimate.metadata_workers >= 1
-    assert estimate.prefetch_factor == 2
     assert estimate.beam_size <= 8
     assert estimate.estimated_effective_frames >= estimate.max_batch_frames
     assert estimate.variant == "sm"
@@ -83,6 +82,7 @@ def test_build_train_command_includes_estimated_knobs() -> None:
     assert f"--max-batch-frames {estimate.max_batch_frames}" in command
     assert f"--gradient-accumulation-steps {estimate.gradient_accumulation_steps}" in command
     assert f"--dtype {estimate.resolved_dtype}" in command
+    assert "--rust-prefetch-batches 32" in command
     assert "--compile" in command
 
 

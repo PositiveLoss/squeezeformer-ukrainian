@@ -152,8 +152,6 @@ def _validate_startup_args(
         "--num-freq-masks": args.num_freq_masks,
         "--freq-mask-param": args.freq_mask_param,
     }
-    if args.prefetch_factor is not None:
-        positive_int_arguments["--prefetch-factor"] = args.prefetch_factor
     positive_int_arguments["--rust-prefetch-batches"] = args.rust_prefetch_batches
     if args.num_time_masks is not None:
         positive_int_arguments["--num-time-masks"] = args.num_time_masks
@@ -173,7 +171,6 @@ def _validate_startup_args(
 
     nonnegative_int_arguments = {
         "--num-workers": args.num_workers,
-        "--dataloader-worker-threads": args.dataloader_worker_threads,
         "--seed": args.seed,
         "--ema-warmup-steps": args.ema_warmup_steps,
         "--save-audio-preview-samples": args.save_audio_preview_samples,
@@ -528,29 +525,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument(
-        "--dataloader-backend",
-        choices=["torch", "rust-parquet"],
-        default="torch",
-        help=(
-            "Data loading backend. 'torch' uses PyTorch DataLoader workers; "
-            "'rust-parquet' reads parquet feature cache payloads through the Rust extension."
-        ),
-    )
-    parser.add_argument(
-        "--dataloader-worker-threads",
-        type=int,
-        default=1,
-        help=(
-            "CPU threads allowed inside each DataLoader worker process. The default keeps "
-            "multi-worker loading from multiplying PyTorch/OpenMP/BLAS thread pools. Set 0 "
-            "to leave worker thread pools unchanged."
-        ),
-    )
-    parser.add_argument(
         "--rust-prefetch-batches",
         type=int,
         default=2,
-        help="Number of ordered batches to prefetch when --dataloader-backend=rust-parquet.",
+        help="Number of ordered batches to prefetch in the Rust parquet dataloader.",
     )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--val-fraction", type=float, default=0.1)
@@ -652,36 +630,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--bucket-by-length",
         action=argparse.BooleanOptionalAction,
         default=True,
-    )
-    parser.add_argument(
-        "--pin-memory",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--persistent-workers",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--dataloader-mp-context",
-        choices=["auto", "fork", "forkserver", "spawn"],
-        default="auto",
-        help=(
-            "Multiprocessing start method for DataLoader workers. 'auto' keeps the current "
-            "platform-aware default and uses 'spawn' when distributed training is initialized."
-        ),
-    )
-    parser.add_argument("--prefetch-factor", type=int, default=2)
-    parser.add_argument(
-        "--dataloader-in-order",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Yield training DataLoader batches in sampler order. Disable this to let PyTorch "
-            "return whichever worker finishes first, reducing head-of-line stalls during cold "
-            "audio decode or feature-cache warmup. Validation remains ordered."
-        ),
     )
     parser.add_argument("--metadata-workers", type=int, default=4)
     parser.add_argument(

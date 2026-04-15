@@ -46,10 +46,7 @@ class TrainingEstimate:
     gradient_accumulation_steps: int
     num_workers: int
     metadata_workers: int
-    prefetch_factor: int
     beam_size: int
-    pin_memory: bool
-    persistent_workers: bool
     model_parameters: int
     model_parameters_millions: float
     reference_model_parameters: int
@@ -275,7 +272,6 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         batch_cap = 16
         num_workers = min(8, max(1, profile.cpu_count // 2))
         metadata_workers = min(8, max(1, profile.cpu_count))
-        pin_memory = False
     elif profile.device_type == "cuda":
         memory_factor = max(memory_gb, 4.0) / 8.0
         frame_budget = (
@@ -293,7 +289,6 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         batch_cap = 48
         num_workers = min(8, max(2, profile.cpu_count // 2))
         metadata_workers = min(8, max(2, profile.cpu_count // 2))
-        pin_memory = True
     else:
         memory_factor = math.sqrt(max(memory_gb, 8.0) / 16.0)
         frame_budget = (
@@ -312,7 +307,6 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         batch_cap = 24
         num_workers = min(6, max(1, profile.cpu_count // 2))
         metadata_workers = min(6, max(1, profile.cpu_count // 2))
-        pin_memory = False
 
     batch_size = max(1, min(batch_cap, max_batch_frames // max(1, args.avg_frames_per_sample)))
     per_rank_effective_frames = max_batch_frames
@@ -320,9 +314,6 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         1,
         math.ceil(target_effective_frames / max(1, per_rank_effective_frames * world_size)),
     )
-    prefetch_factor = 2 if num_workers > 0 else 0
-    persistent_workers = num_workers > 0
-
     if args.decode_strategy == "beam":
         if profile.device_type == "cpu":
             beam_size = min(args.beam_size, 4 if args.variant in {"sm", "m", "ml", "l"} else 6)
@@ -340,10 +331,7 @@ def estimate_training_hparams(args: argparse.Namespace) -> TrainingEstimate:
         gradient_accumulation_steps=gradient_accumulation_steps,
         num_workers=num_workers,
         metadata_workers=metadata_workers,
-        prefetch_factor=prefetch_factor,
         beam_size=beam_size,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
         model_parameters=model_parameters,
         model_parameters_millions=model_parameters_millions,
         reference_model_parameters=reference_model_parameters,
@@ -402,9 +390,7 @@ def build_train_command(args: argparse.Namespace, estimate: TrainingEstimate) ->
             f"--epochs {args.epochs}",
             f"--num-workers {estimate.num_workers}",
             f"--metadata-workers {estimate.metadata_workers}",
-            f"--prefetch-factor {estimate.prefetch_factor}",
-            "--pin-memory" if estimate.pin_memory else "--no-pin-memory",
-            "--persistent-workers" if estimate.persistent_workers else "--no-persistent-workers",
+            "--rust-prefetch-batches 32",
         ]
     )
     return " \\\n  ".join(command)

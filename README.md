@@ -253,8 +253,7 @@ Important defaults:
 - `--decay-exponent 1.0`
 - `--bucket-by-length`
 - `--metadata-workers 4`
-- `--pin-memory`
-- `--persistent-workers`
+- `--rust-prefetch-batches 32`
 - `--ema-decay 0.0`
 
 Training supports:

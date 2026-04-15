@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import atexit
-import functools
 import hashlib
 import io
 import logging
 import math
-import multiprocessing as mp
 import os
 import re
 import struct
-import sys
 import threading
 import time
 import wave
@@ -27,7 +24,7 @@ import torchaudio
 from huggingface_hub import hf_hub_url, list_repo_files, snapshot_download
 from torch import Tensor
 from torch.nn import functional as F
-from torch.utils.data import BatchSampler, DataLoader, Dataset, Sampler
+from torch.utils.data import BatchSampler, Dataset, Sampler
 
 from .asr import Tokenizer
 from .frontend import (
@@ -54,50 +51,6 @@ def _epoch_shuffled_order(length: int, *, seed: int, epoch: int) -> list[int]:
     generator = torch.Generator()
     generator.manual_seed(int(seed) + int(epoch))
     return torch.randperm(length, generator=generator).tolist()
-
-
-def _dataloader_multiprocessing_context(
-    num_workers: int,
-    multiprocessing_context: str | None = None,
-):
-    if num_workers <= 0 or not sys.platform.startswith("linux"):
-        return None
-    if multiprocessing_context is not None and multiprocessing_context != "auto":
-        return mp.get_context(multiprocessing_context)
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        # Avoid forking a process that already owns distributed/CUDA runtime state.
-        return mp.get_context("spawn")
-    return mp.get_context("fork")
-
-
-def _limit_dataloader_worker_threads(worker_id: int, *, num_threads: int) -> None:
-    del worker_id
-    worker_threads = max(1, int(num_threads))
-    for variable in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-        "BLIS_NUM_THREADS",
-    ):
-        os.environ[variable] = str(worker_threads)
-    try:
-        torch.set_num_threads(worker_threads)
-    except Exception:
-        logger.debug("failed to set torch DataLoader worker threads", exc_info=True)
-    try:
-        torch.set_num_interop_threads(1)
-    except Exception:
-        logger.debug("failed to set torch DataLoader worker interop threads", exc_info=True)
-    try:
-        from threadpoolctl import threadpool_limits
-    except ImportError:
-        return
-    try:
-        threadpool_limits(limits=worker_threads)
-    except Exception:
-        logger.debug("failed to limit native DataLoader worker thread pools", exc_info=True)
 
 
 def _progress_log_interval(total: int) -> int:
@@ -2144,7 +2097,7 @@ class RustParquetFeatureDataLoader:
             from asr_features import RustParquetFeatureCacheReader
         except ImportError as exc:
             raise ImportError(
-                "rust-parquet DataLoader backend requested, but asr_features was not built "
+                "rust-parquet dataloader requested, but asr_features was not built "
                 "with RustParquetFeatureCacheReader."
             ) from exc
         self.dataset = dataset
@@ -2469,37 +2422,28 @@ def create_dataloader(
     max_batch_frames: int | None = None,
     adaptive_batch_unit: str | None = None,
     adaptive_batch_budget: int | None = None,
-    pin_memory: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int = 2,
     metadata_workers: int = 4,
     force_audio_metadata_probe: bool = False,
     longest_batches_first: bool = False,
-    multiprocessing_context: str | None = None,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
     seed: int = 0,
     pad_distributed_batches: bool = False,
-    in_order: bool = True,
-    worker_threads: int | None = 1,
-    backend: str = "torch",
     rust_prefetch_batches: int = 2,
     progress_logger: logging.Logger | None = None,
     progress_label: str = "dataloader",
-) -> DataLoader[dict[str, Any]] | RustParquetFeatureDataLoader:
+) -> RustParquetFeatureDataLoader:
     stage_start_time = time.perf_counter()
     if progress_logger is not None:
         progress_logger.info(
             "%s create_dataloader started samples=%s batch_size=%s shuffle=%s "
-            "num_workers=%s worker_threads=%s backend=%s",
+            "num_workers=%s backend=rust-parquet",
             progress_label,
             len(dataset),
             batch_size,
             shuffle,
             num_workers,
-            worker_threads if num_workers > 0 else "none",
-            backend,
         )
     if hasattr(dataset.records, "populate_metadata"):
         dataset.records.populate_metadata(
@@ -2532,11 +2476,6 @@ def create_dataloader(
             progress_logger=progress_logger,
             progress_label=progress_label,
         )
-    if backend not in {"torch", "rust-parquet"}:
-        raise ValueError(
-            "backend must be one of {'torch', 'rust-parquet'}, "
-            f"got {backend!r}."
-        )
 
     def make_loader(
         *,
@@ -2544,58 +2483,28 @@ def create_dataloader(
         sampler: Sampler[int] | None = None,
         loader_batch_size: int | None = None,
         loader_shuffle: bool = False,
-    ):
-        if backend == "rust-parquet":
-            if batch_sampler is None:
-                resolved_sampler = sampler
-                if resolved_sampler is None:
-                    resolved_sampler = EpochIndexSampler(
-                        len(dataset),
-                        shuffle=loader_shuffle,
-                        seed=seed,
-                    )
-                batch_sampler = IndexBatchSampler(
-                    resolved_sampler,
-                    batch_size=batch_size if loader_batch_size is None else loader_batch_size,
+    ) -> RustParquetFeatureDataLoader:
+        if batch_sampler is None:
+            resolved_sampler = sampler
+            if resolved_sampler is None:
+                resolved_sampler = EpochIndexSampler(
+                    len(dataset),
+                    shuffle=loader_shuffle,
+                    seed=seed,
                 )
-            return RustParquetFeatureDataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                num_workers=num_workers,
-                prefetch_batches=rust_prefetch_batches,
-                progress_logger=progress_logger,
-                progress_label=progress_label,
+            batch_sampler = IndexBatchSampler(
+                resolved_sampler,
+                batch_size=batch_size if loader_batch_size is None else loader_batch_size,
             )
-        if batch_sampler is not None:
-            return DataLoader(dataset, batch_sampler=batch_sampler, **dataloader_kwargs)
-        return DataLoader(
+        return RustParquetFeatureDataLoader(
             dataset,
-            batch_size=batch_size if loader_batch_size is None else loader_batch_size,
-            shuffle=loader_shuffle,
-            sampler=sampler,
-            **dataloader_kwargs,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            prefetch_batches=rust_prefetch_batches,
+            progress_logger=progress_logger,
+            progress_label=progress_label,
         )
 
-    dataloader_kwargs = {
-        "num_workers": num_workers,
-        "collate_fn": collate_asr_batch,
-        "pin_memory": pin_memory,
-        "persistent_workers": persistent_workers and num_workers > 0,
-    }
-    if num_workers > 0:
-        dataloader_kwargs["prefetch_factor"] = prefetch_factor
-        dataloader_kwargs["in_order"] = in_order
-        if worker_threads is not None and worker_threads > 0:
-            dataloader_kwargs["worker_init_fn"] = functools.partial(
-                _limit_dataloader_worker_threads,
-                num_threads=int(worker_threads),
-            )
-        resolved_multiprocessing_context = _dataloader_multiprocessing_context(
-            num_workers,
-            multiprocessing_context=multiprocessing_context,
-        )
-        if resolved_multiprocessing_context is not None:
-            dataloader_kwargs["multiprocessing_context"] = resolved_multiprocessing_context
     if adaptive_batch_unit is not None and adaptive_batch_budget is not None:
         batch_sampler = AdaptiveBatchSampler(
             dataset.records,
