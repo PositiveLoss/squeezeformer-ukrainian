@@ -1300,6 +1300,9 @@ class ShardedParquetFeatureCache:
 
     def _key(self, utterance_id: str, featurizer: AudioFeaturizer) -> str:
         cache_config: dict[str, object] = {"featurizer": featurizer.config_dict()}
+        return self._key_from_config(utterance_id, cache_config)
+
+    def _key_from_config(self, utterance_id: str, cache_config: dict[str, object]) -> str:
         frontend_hash = hashlib.sha256(repr(cache_config).encode("utf-8")).hexdigest()[:12]
         return hashlib.sha256(f"{utterance_id}:{frontend_hash}".encode("utf-8")).hexdigest()
 
@@ -2248,8 +2251,17 @@ class RustParquetFeatureDataLoader:
     def _load_batch(self, indices: list[int]) -> dict[str, Any] | None:
         start_time = time.perf_counter()
         records = [self.dataset.records[int(index)] for index in indices]
-        keys = [self.dataset.feature_cache._key(record.utterance_id, self.dataset.featurizer) for record in records]  # type: ignore[union-attr]
-        rust_features = self.reader.fetch_many(keys)
+        key_groups = [self._cache_keys_for_record(record) for record in records]
+        flat_keys = [key for keys in key_groups for key in keys]
+        flat_features = self.reader.fetch_many(flat_keys)
+        rust_features = []
+        offset = 0
+        for keys in key_groups:
+            candidates = flat_features[offset : offset + len(keys)]
+            offset += len(keys)
+            rust_features.append(
+                next((candidate for candidate in candidates if candidate is not None), None)
+            )
         items: list[dict[str, Any] | None] = []
         rust_hits = 0
         fallbacks = 0
@@ -2303,6 +2315,21 @@ class RustParquetFeatureDataLoader:
                 time.perf_counter() - start_time,
             )
         return batch
+
+    def _cache_keys_for_record(self, record: AudioRecord) -> list[str]:
+        assert self.dataset.feature_cache is not None
+        keys = [self.dataset.feature_cache._key(record.utterance_id, self.dataset.featurizer)]
+        featurizer_config = self.dataset.featurizer.config_dict()
+        if featurizer_config.get("type") == "w2v_bert":
+            default_config = dict(featurizer_config)
+            default_config["model_source"] = "facebook/w2v-bert-2.0"
+            default_key = self.dataset.feature_cache._key_from_config(
+                record.utterance_id,
+                {"featurizer": default_config},
+            )
+            if default_key not in keys:
+                keys.append(default_key)
+        return keys
 
 
 class _ThreadSafeIterator:
