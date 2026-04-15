@@ -1,23 +1,50 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context, Result};
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef, Int64Builder, StringBuilder, UInt64Builder, UInt8Builder};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use numpy::ndarray::Array2;
 use numpy::IntoPyArray;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
+use rayon::prelude::*;
 
 use crate::arrow_utils::{column_by_name, scalar_as_bytes, scalar_as_string};
 use crate::cache::RUST_PAYLOAD_MAGIC;
 
-#[derive(Clone, Debug)]
-struct FeatureLocation {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FeatureLocation {
+    pub(crate) path: PathBuf,
+    pub(crate) row_index: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PartMetadata {
     path: PathBuf,
+    mtime_ns: i64,
+    size: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PartUpdate {
+    order: usize,
+    path: PathBuf,
+    rows: Vec<PartRowUpdate>,
+}
+
+#[derive(Clone, Debug)]
+struct PartRowUpdate {
+    key: String,
     row_index: usize,
+    deleted: bool,
 }
 
 #[pyclass]
@@ -103,12 +130,50 @@ fn py_error(error: anyhow::Error) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
 
-fn build_feature_index(
+pub(crate) fn build_feature_index(
     cache_root: &Path,
     num_shards: usize,
 ) -> Result<HashMap<String, FeatureLocation>> {
-    let shard_root = cache_root.join("feature_shards");
+    let part_metadata = collect_part_metadata(cache_root, num_shards)?;
+    if let Some(index) = load_persisted_index(cache_root, &part_metadata)? {
+        return Ok(index);
+    }
+    let index = build_feature_index_from_parts(&part_metadata)?;
+    write_persisted_index(cache_root, &part_metadata, &index)?;
+    Ok(index)
+}
+
+fn build_feature_index_from_parts(
+    part_metadata: &[PartMetadata],
+) -> Result<HashMap<String, FeatureLocation>> {
+    let mut updates = part_metadata
+        .par_iter()
+        .enumerate()
+        .map(|(order, metadata)| read_part_updates(order, &metadata.path))
+        .collect::<Result<Vec<_>>>()?;
+    updates.sort_by_key(|update| update.order);
     let mut index = HashMap::new();
+    for update in updates {
+        for row in update.rows {
+            if row.deleted {
+                index.remove(&row.key);
+            } else {
+                index.insert(
+                    row.key,
+                    FeatureLocation {
+                        path: update.path.clone(),
+                        row_index: row.row_index,
+                    },
+                );
+            }
+        }
+    }
+    Ok(index)
+}
+
+fn collect_part_metadata(cache_root: &Path, num_shards: usize) -> Result<Vec<PartMetadata>> {
+    let shard_root = cache_root.join("feature_shards");
+    let mut parts = Vec::new();
     for shard_index in 0..num_shards {
         let shard_path = shard_root.join(format!("features_{shard_index:02}"));
         if !shard_path.is_dir() {
@@ -129,18 +194,35 @@ fn build_feature_index(
                 .ok()
         });
         for part_path in part_paths {
-            apply_part_to_index(&part_path, &mut index)?;
+            let metadata = part_path
+                .metadata()
+                .with_context(|| format!("failed to stat {}", part_path.display()))?;
+            let modified = metadata
+                .modified()
+                .with_context(|| format!("failed to read mtime for {}", part_path.display()))?;
+            let mtime_ns = modified
+                .duration_since(UNIX_EPOCH)
+                .with_context(|| format!("mtime before unix epoch for {}", part_path.display()))?
+                .as_nanos()
+                .try_into()
+                .context("part mtime nanoseconds does not fit into i64")?;
+            parts.push(PartMetadata {
+                path: part_path,
+                mtime_ns,
+                size: metadata.len(),
+            });
         }
     }
-    Ok(index)
+    Ok(parts)
 }
 
-fn apply_part_to_index(path: &Path, index: &mut HashMap<String, FeatureLocation>) -> Result<()> {
+fn read_part_updates(order: usize, path: &Path) -> Result<PartUpdate> {
     let input = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(input)?
         .with_batch_size(8192)
         .build()?;
     let mut global_row_index = 0usize;
+    let mut rows = Vec::new();
     for batch_result in reader {
         let batch = batch_result?;
         let key_column = column_by_name(&batch, &["key"])
@@ -153,21 +235,19 @@ fn apply_part_to_index(path: &Path, index: &mut HashMap<String, FeatureLocation>
                 continue;
             };
             let deleted = scalar_as_bool(deleted_column.as_ref(), row_index).unwrap_or(false);
-            if deleted {
-                index.remove(&key);
-            } else {
-                index.insert(
-                    key,
-                    FeatureLocation {
-                        path: path.to_path_buf(),
-                        row_index: global_row_index,
-                    },
-                );
-            }
+            rows.push(PartRowUpdate {
+                key,
+                row_index: global_row_index,
+                deleted,
+            });
             global_row_index += 1;
         }
     }
-    Ok(())
+    Ok(PartUpdate {
+        order,
+        path: path.to_path_buf(),
+        rows,
+    })
 }
 
 fn read_payloads_from_part(
@@ -202,6 +282,147 @@ fn read_payloads_from_part(
     Ok(payloads)
 }
 
+pub(crate) fn persisted_index_path(cache_root: &Path) -> PathBuf {
+    cache_root.join("rust_feature_index.parquet")
+}
+
+fn load_persisted_index(
+    cache_root: &Path,
+    part_metadata: &[PartMetadata],
+) -> Result<Option<HashMap<String, FeatureLocation>>> {
+    let index_path = persisted_index_path(cache_root);
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+    let input = File::open(&index_path)
+        .with_context(|| format!("failed to open {}", index_path.display()))?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(input)?
+        .with_batch_size(8192)
+        .build()?;
+    let mut source_parts = Vec::new();
+    let mut index = HashMap::new();
+    for batch_result in reader {
+        let batch = batch_result?;
+        let kind_column = column_by_name(&batch, &["kind"])
+            .ok_or_else(|| anyhow!("{} has no kind column", index_path.display()))?;
+        let path_column = column_by_name(&batch, &["path"])
+            .ok_or_else(|| anyhow!("{} has no path column", index_path.display()))?;
+        let mtime_column = column_by_name(&batch, &["mtime_ns"])
+            .ok_or_else(|| anyhow!("{} has no mtime_ns column", index_path.display()))?;
+        let size_column = column_by_name(&batch, &["size"])
+            .ok_or_else(|| anyhow!("{} has no size column", index_path.display()))?;
+        let key_column = column_by_name(&batch, &["key"])
+            .ok_or_else(|| anyhow!("{} has no key column", index_path.display()))?;
+        let row_index_column = column_by_name(&batch, &["row_index"])
+            .ok_or_else(|| anyhow!("{} has no row_index column", index_path.display()))?;
+        for row_index in 0..batch.num_rows() {
+            let kind = scalar_as_u8(kind_column.as_ref(), row_index).unwrap_or(0);
+            let path = scalar_as_string(path_column.as_ref(), row_index)
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            if kind == 0 {
+                source_parts.push(PartMetadata {
+                    path,
+                    mtime_ns: scalar_as_i64(mtime_column.as_ref(), row_index).unwrap_or(0),
+                    size: scalar_as_u64(size_column.as_ref(), row_index).unwrap_or(0),
+                });
+                continue;
+            }
+            let Some(key) = scalar_as_string(key_column.as_ref(), row_index) else {
+                continue;
+            };
+            let Some(cached_row_index) = scalar_as_u64(row_index_column.as_ref(), row_index) else {
+                continue;
+            };
+            index.insert(
+                key,
+                FeatureLocation {
+                    path,
+                    row_index: cached_row_index
+                        .try_into()
+                        .context("cached row_index does not fit into usize")?,
+                },
+            );
+        }
+    }
+    if source_parts == part_metadata {
+        Ok(Some(index))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_persisted_index(
+    cache_root: &Path,
+    part_metadata: &[PartMetadata],
+    index: &HashMap<String, FeatureLocation>,
+) -> Result<()> {
+    let index_path = persisted_index_path(cache_root);
+    let tmp_path = index_path.with_extension("parquet.tmp");
+    let mut kind_builder = UInt8Builder::new();
+    let mut path_builder = StringBuilder::new();
+    let mut mtime_builder = Int64Builder::new();
+    let mut size_builder = UInt64Builder::new();
+    let mut key_builder = StringBuilder::new();
+    let mut row_index_builder = UInt64Builder::new();
+
+    for part in part_metadata {
+        kind_builder.append_value(0);
+        path_builder.append_value(part.path.to_string_lossy());
+        mtime_builder.append_value(part.mtime_ns);
+        size_builder.append_value(part.size);
+        key_builder.append_null();
+        row_index_builder.append_null();
+    }
+    let mut entries = index.iter().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, location) in entries {
+        kind_builder.append_value(1);
+        path_builder.append_value(location.path.to_string_lossy());
+        mtime_builder.append_null();
+        size_builder.append_null();
+        key_builder.append_value(key);
+        row_index_builder.append_value(
+            location
+                .row_index
+                .try_into()
+                .context("row_index does not fit into u64")?,
+        );
+    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("kind", DataType::UInt8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("mtime_ns", DataType::Int64, true),
+        Field::new("size", DataType::UInt64, true),
+        Field::new("key", DataType::Utf8, true),
+        Field::new("row_index", DataType::UInt64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(kind_builder.finish()) as ArrayRef,
+            Arc::new(path_builder.finish()) as ArrayRef,
+            Arc::new(mtime_builder.finish()) as ArrayRef,
+            Arc::new(size_builder.finish()) as ArrayRef,
+            Arc::new(key_builder.finish()) as ArrayRef,
+            Arc::new(row_index_builder.finish()) as ArrayRef,
+        ],
+    )?;
+    let file = File::create(&tmp_path)
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, None)?;
+    writer.write(&batch)?;
+    writer.close()?;
+    fs::rename(&tmp_path, &index_path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            index_path.display(),
+            tmp_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn scalar_as_bool(array: &dyn Array, row_index: usize) -> Option<bool> {
     if array.is_null(row_index) {
         return None;
@@ -209,6 +430,36 @@ fn scalar_as_bool(array: &dyn Array, row_index: usize) -> Option<bool> {
     array
         .as_any()
         .downcast_ref::<arrow::array::BooleanArray>()
+        .map(|values| values.value(row_index))
+}
+
+fn scalar_as_i64(array: &dyn Array, row_index: usize) -> Option<i64> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    array
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .map(|values| values.value(row_index))
+}
+
+fn scalar_as_u64(array: &dyn Array, row_index: usize) -> Option<u64> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    array
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .map(|values| values.value(row_index))
+}
+
+fn scalar_as_u8(array: &dyn Array, row_index: usize) -> Option<u8> {
+    if array.is_null(row_index) {
+        return None;
+    }
+    array
+        .as_any()
+        .downcast_ref::<arrow::array::UInt8Array>()
         .map(|values| values.value(row_index))
 }
 

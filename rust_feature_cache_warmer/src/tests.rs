@@ -10,6 +10,13 @@ use crate::dsp::{
 use crate::feature_cache::{resolve_input_manifests, Cli};
 use crate::frontend::{AudioFrontendConfig, FeatureMatrix, FrontendConfig, W2vBertFrontendConfig};
 
+#[cfg(feature = "python")]
+use crate::cache::cache_key;
+#[cfg(feature = "python")]
+use crate::cache::{CacheRow, ShardedCacheWriter};
+#[cfg(feature = "python")]
+use crate::feature_loader::{build_feature_index, persisted_index_path, FeatureLocation};
+
 #[test]
 fn squeezeformer_config_hash_matches_python_repr_contract() {
     let cli = Cli::parse_from(["test", "--input", "in.parquet", "--cache-dir", "cache"]);
@@ -70,6 +77,54 @@ fn payload_roundtrip_header_is_stable() {
     assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 2);
     assert_eq!(u32::from_le_bytes(payload[12..16].try_into().unwrap()), 3);
     assert_eq!(payload.len(), 16 + 6 * 4);
+}
+
+#[cfg(feature = "python")]
+#[test]
+fn rust_feature_index_persists_and_reloads() {
+    let root = tempfile::tempdir().unwrap();
+    let mut writer = ShardedCacheWriter::new(root.path(), 2, 1).unwrap();
+    writer
+        .push(CacheRow {
+            key: cache_key("key-a", "test"),
+            payload: encode_feature_payload(&FeatureMatrix {
+                rows: 1,
+                cols: 2,
+                values: vec![1.0, 2.0],
+            })
+            .unwrap(),
+        })
+        .unwrap();
+    writer
+        .push(CacheRow {
+            key: cache_key("key-b", "test"),
+            payload: encode_feature_payload(&FeatureMatrix {
+                rows: 1,
+                cols: 2,
+                values: vec![3.0, 4.0],
+            })
+            .unwrap(),
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let first = build_feature_index(root.path(), 2).unwrap();
+    let index_path = persisted_index_path(root.path());
+    assert!(index_path.is_file());
+    let first_index_metadata = fs::metadata(&index_path).unwrap();
+    let second = build_feature_index(root.path(), 2).unwrap();
+    let second_index_metadata = fs::metadata(&index_path).unwrap();
+
+    assert_eq!(first.len(), 2);
+    assert_eq!(first, second);
+    assert_eq!(
+        first_index_metadata.modified().unwrap(),
+        second_index_metadata.modified().unwrap()
+    );
+    assert!(matches!(
+        first.get(&cache_key("key-a", "test")),
+        Some(FeatureLocation { row_index: 0, .. })
+    ));
 }
 
 #[test]
