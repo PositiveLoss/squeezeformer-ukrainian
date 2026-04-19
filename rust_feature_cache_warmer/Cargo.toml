@@ -1,6 +1,6 @@
 [package]
 name = "asr-features"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "ASR feature extraction and cache warming utilities"
 license = "MIT"
@@ -9,31 +9,72 @@ license = "MIT"
 name = "asr_features"
 crate-type = ["rlib", "cdylib"]
 
+[[bin]]
+name = "asr-features"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
 default = []
-bundled-ffmpeg = ["ffmpeg-next/build"]
-python = ["dep:numpy", "dep:pyo3"]
+frontend = [
+    "dep:anyhow",
+    "dep:audioadapter-buffers",
+    "dep:log",
+    "dep:rubato",
+    "dep:rustfft",
+    "dep:sha2",
+]
+audio-decode = [
+    "dep:anyhow",
+    "dep:ffmpeg-next",
+    "dep:log",
+    "dep:opus-decoder",
+    "dep:symphonia",
+    "dep:tempfile",
+]
+cli = [
+    "frontend",
+    "audio-decode",
+    "dep:arrow",
+    "dep:clap",
+    "dep:csv",
+    "dep:env_logger",
+    "dep:log",
+    "dep:parquet",
+    "dep:rayon",
+    "dep:serde_json",
+]
+python = [
+    "frontend",
+    "dep:anyhow",
+    "dep:arrow",
+    "dep:numpy",
+    "dep:parquet",
+    "dep:pyo3",
+    "dep:rayon",
+]
+bundled-ffmpeg = ["audio-decode", "ffmpeg-next/build"]
 
 [dependencies]
-anyhow = "1.0"
-audioadapter-buffers = "3.0"
-arrow = "56"
-clap = { version = "4.5", features = ["derive"] }
-csv = "1.4"
-env_logger = "0.11"
-ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-resampling"] }
-log = "0.4"
+anyhow = { version = "1.0", optional = true }
+audioadapter-buffers = { version = "3.0", optional = true }
+arrow = { version = "56", optional = true }
+clap = { version = "4.5", optional = true, features = ["derive"] }
+csv = { version = "1.4", optional = true }
+env_logger = { version = "0.11", optional = true }
+ffmpeg-next = { version = "8.1", optional = true, default-features = false, features = ["codec", "format", "software-resampling"] }
+log = { version = "0.4", optional = true }
 numpy = { version = "0.28", optional = true }
-opus-decoder = "0.1.1"
-parquet = { version = "56", features = ["arrow"] }
+opus-decoder = { version = "0.1.1", optional = true }
+parquet = { version = "56", optional = true, features = ["arrow"] }
 pyo3 = { version = "0.28", optional = true, features = ["abi3-py310", "extension-module"] }
-rayon = "1.11"
-rubato = "2.0"
-rustfft = "6.4"
-serde_json = "1.0"
-sha2 = "0.10"
-symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
-tempfile = "3.23"
+rayon = { version = "1.11", optional = true }
+rubato = { version = "2.0", optional = true }
+rustfft = { version = "6.4", optional = true }
+serde_json = { version = "1.0", optional = true }
+sha2 = { version = "0.10", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+tempfile = { version = "3.23", optional = true }
 
 [profile.release]
 codegen-units = 1
