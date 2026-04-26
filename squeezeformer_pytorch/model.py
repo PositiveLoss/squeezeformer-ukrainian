@@ -11,7 +11,13 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .masking import make_attention_mask, make_sequence_mask
-from .pyptx_kernels import scale_bias_or_torch, silu_or_torch
+from .pyptx_kernels import (
+    apply_time_mask_or_torch,
+    layer_norm_or_torch,
+    scale_bias_or_torch,
+    silu_or_torch,
+    time_recovery_repeat_or_torch,
+)
 
 try:
     import transformer_engine.pytorch as te
@@ -160,11 +166,22 @@ def make_linear(
     return nn.Linear(in_features, out_features, bias=bias)
 
 
+class PyptxLayerNorm(nn.LayerNorm):
+    def forward(self, x: Tensor) -> Tensor:
+        return layer_norm_or_torch(
+            x,
+            tuple(self.normalized_shape),
+            self.weight,
+            self.bias,
+            float(self.eps),
+        )
+
+
 def make_layer_norm(dim: int, *, use_transformer_engine: bool = False) -> nn.Module:
     # Keep LayerNorm on PyTorch kernels. Transformer Engine FP8 support is still
     # applied through TE Linear modules, while TE LayerNorm has shown unstable
     # kernel launch behavior on this model's [batch, time, hidden] activations.
-    return nn.LayerNorm(dim)
+    return PyptxLayerNorm(dim)
 
 
 def apply_linear_with_fp8_padding(module: nn.Module, x: Tensor) -> Tensor:
@@ -384,22 +401,21 @@ class ConvolutionModule(nn.Module):
         residual = x
         x = self.input_transform(x)
         x = x.transpose(1, 2)
-        mask = pad_mask.unsqueeze(1).to(dtype=x.dtype) if pad_mask is not None else None
         x = self.pointwise_in(x)
         x = silu_or_torch(x)
-        if mask is not None:
-            x = x * mask
+        if pad_mask is not None:
+            x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = self.depthwise(x)
-        if mask is not None:
-            x = x * mask
+        if pad_mask is not None:
+            x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = x.transpose(1, 2)
         x = silu_or_torch(x)
         if pad_mask is not None:
-            x = x * pad_mask.unsqueeze(-1).to(dtype=x.dtype)
+            x = apply_time_mask_or_torch(x, pad_mask, layout="btd")
         x = x.transpose(1, 2)
         x = self.pointwise_out(x)
-        if mask is not None:
-            x = x * mask
+        if pad_mask is not None:
+            x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = x.transpose(1, 2)
         x = self.dropout(x)
         return residual + x
@@ -606,7 +622,7 @@ class TimeReductionLayer(nn.Module):
     def forward(self, x: Tensor, lengths: Tensor) -> tuple[Tensor, Tensor]:
         x = x.transpose(1, 2)
         pad_mask = make_sequence_mask(lengths, max_length=x.size(-1))
-        x = x * pad_mask.unsqueeze(1).to(dtype=x.dtype)
+        x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = _pad_conv1d_input_for_kernel(
             x,
             kernel_size=self.kernel_size,
@@ -631,13 +647,8 @@ class TimeRecoveryLayer(nn.Module):
         self.stride = stride
 
     def forward(self, x: Tensor, skip: Tensor) -> Tensor:
-        x = torch.repeat_interleave(x, repeats=self.stride, dim=1)
         target_length = skip.size(1)
-        if x.size(1) < target_length:
-            pad_length = target_length - x.size(1)
-            x = F.pad(x, (0, 0, 0, pad_length), mode="replicate")
-        else:
-            x = x[:, :target_length, :]
+        x = time_recovery_repeat_or_torch(x, target_length, self.stride)
         return apply_linear_with_fp8_padding(self.proj, x) + skip
 
 
@@ -810,7 +821,7 @@ class SqueezeformerEncoder(nn.Module):
         x = x * math.sqrt(self.config.d_model)
         x = self.dropout(x)
         x = self.input_norm(x)
-        x = x * make_sequence_mask(lengths, max_length=x.size(1)).unsqueeze(-1).to(dtype=x.dtype)
+        x = apply_time_mask_or_torch(x, make_sequence_mask(lengths, max_length=x.size(1)))
 
         recover_stack: list[tuple[Tensor, Tensor]] = []
         intermediate_xs: dict[int, Tensor] = {}
@@ -858,9 +869,7 @@ class SqueezeformerEncoder(nn.Module):
             else:
                 x = block(x, pos=pos, attn_mask=attn_mask, pad_mask=pad_mask)
             x = x[:, : int(lengths.max().item()), :]
-            x = x * make_sequence_mask(lengths, max_length=x.size(1)).unsqueeze(-1).to(
-                dtype=x.dtype
-            )
+            x = apply_time_mask_or_torch(x, make_sequence_mask(lengths, max_length=x.size(1)))
             if layer_index in intermediate_layer_indices:
                 if intermediate_layer_callback is not None:
                     intermediate_layer_callback(layer_index, x, lengths)
@@ -870,9 +879,7 @@ class SqueezeformerEncoder(nn.Module):
             if layer_index in post_block_transforms:
                 x, lengths = post_block_transforms[layer_index](x, lengths)
                 x = x[:, : int(lengths.max().item()), :]
-                x = x * make_sequence_mask(lengths, max_length=x.size(1)).unsqueeze(-1).to(
-                    dtype=x.dtype
-                )
+                x = apply_time_mask_or_torch(x, make_sequence_mask(lengths, max_length=x.size(1)))
 
         return x, lengths, intermediate_xs, intermediate_lengths
 

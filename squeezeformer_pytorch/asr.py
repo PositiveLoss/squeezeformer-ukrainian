@@ -22,6 +22,7 @@ from .model import (
     apply_linear_with_fp8_padding,
     make_linear,
 )
+from .pyptx_kernels import ctc_log_prob_frame_stats_or_torch
 
 _CTC_HEAD_TARGET_BYTES = 128 * 1024 * 1024
 DEFAULT_CTC_BEAM_LENGTH_BONUS = 0.1
@@ -464,27 +465,20 @@ class SqueezeformerCTC(nn.Module):
         targets: Tensor | None = None,
         target_lengths: Tensor | None = None,
     ) -> dict[str, float]:
-        valid_mask = torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(
-            0
-        ) < output_lengths.unsqueeze(1)
-        valid_frames = int(valid_mask.sum().item())
-        blank_probabilities = log_probs[..., blank_id].exp()
-        argmax_tokens = log_probs.argmax(dim=-1)
-        argmax_blank_frames = int(((argmax_tokens == blank_id) & valid_mask).sum().item())
-
-        nonblank_log_probs = log_probs.clone()
-        nonblank_log_probs[..., blank_id] = float("-inf")
-        top_nonblank_probabilities = nonblank_log_probs.max(dim=-1).values.exp()
+        frame_stats = ctc_log_prob_frame_stats_or_torch(
+            log_probs,
+            output_lengths,
+            blank_id=blank_id,
+        )
+        totals = frame_stats.sum(dim=(0, 1))
+        valid_frames = int(totals[1].item())
+        argmax_blank_frames = int(totals[2].item())
 
         diagnostics = {
-            "blank_probability_sum": float(
-                blank_probabilities.masked_select(valid_mask).sum().item()
-            ),
+            "blank_probability_sum": float(totals[0].item()),
             "decoded_frames": float(valid_frames),
             "argmax_blank_frames": float(argmax_blank_frames),
-            "top_nonblank_probability_sum": float(
-                top_nonblank_probabilities.masked_select(valid_mask).sum().item()
-            ),
+            "top_nonblank_probability_sum": float(totals[3].item()),
             "sample_count": float(output_lengths.numel()),
             "output_frames_sum": float(output_lengths.sum().item()),
         }

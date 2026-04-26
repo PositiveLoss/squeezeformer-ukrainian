@@ -77,6 +77,15 @@ def _is_cuda_int64(x: Tensor) -> bool:
     return major >= 9
 
 
+def _is_cuda_bool(x: Tensor) -> bool:
+    if _PYPTX_DISABLED:
+        return False
+    if not (x.is_cuda and x.dtype == torch.bool and x.is_contiguous()):
+        return False
+    major, _minor = torch.cuda.get_device_capability(x.device)
+    return major >= 9
+
+
 def _pick_block(n: int) -> int:
     for block in _BLOCK_CANDIDATES:
         if n % (block * 4) == 0 and block >= 128:
@@ -140,6 +149,121 @@ def _build_attention_mask_kernel(batch: int, time: int, arch: str):
         ptx.ret()
 
     return attention_mask
+
+
+@lru_cache(maxsize=128)
+def _build_sequence_mask_kernel(batch: int, time: int, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import pred, s64, u8, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    items_per_thread = (time + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(batch, s64),),
+        out_specs=(Tile(batch, time, u8),),
+        grid=(batch, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def sequence_mask(lengths, out):
+        pl, po = ptx.global_ptrs(lengths, out)
+        row = reg.scalar(u32)
+        ptx.inst.mov.u32(row, ptx.special.ctaid.x())
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+
+        length = reg.scalar(s64)
+        ptx.inst.ld.global_.s64(length, ptx.addr(pl + row * 8))
+        out_row = po + row * time
+        one = reg.scalar(u8, init=1)
+        zero = reg.scalar(u8, init=0)
+
+        for i in range(items_per_thread):
+            col = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, col, time)
+            col_s64 = reg.scalar(s64)
+            ptx.inst.cvt.s64.u32(col_s64, col)
+            is_valid = reg.scalar(pred)
+            ptx.inst.setp.lt.s64(is_valid, col_s64, length)
+            value = reg.scalar(u8)
+            ptx.selp(u8, value, one, zero, is_valid)
+            ptx.inst.st.global_.u8(ptx.addr(out_row + col), value, pred=in_bounds)
+        ptx.ret()
+
+    return sequence_mask
+
+
+@lru_cache(maxsize=128)
+def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import pred, s64, u8, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    total = time * time
+    items_per_thread = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(batch, s64),),
+        out_specs=(Tile(batch, time, time, u8),),
+        grid=(batch, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def attention_bool_mask(lengths, out):
+        pl, po = ptx.global_ptrs(lengths, out)
+        batch_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(batch_idx, ptx.special.ctaid.x())
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+
+        length = reg.scalar(s64)
+        ptx.inst.ld.global_.s64(length, ptx.addr(pl + batch_idx * 8))
+        out_batch = po + batch_idx * total
+        one = reg.scalar(u8, init=1)
+        zero = reg.scalar(u8, init=0)
+
+        for i in range(items_per_thread):
+            linear = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            q = reg.scalar(u32)
+            ptx.inst.div.u32(q, linear, time)
+            k = reg.scalar(u32)
+            ptx.inst.rem.u32(k, linear, time)
+            q_s64 = reg.scalar(s64)
+            k_s64 = reg.scalar(s64)
+            ptx.inst.cvt.s64.u32(q_s64, q)
+            ptx.inst.cvt.s64.u32(k_s64, k)
+            q_valid = reg.scalar(pred)
+            k_valid = reg.scalar(pred)
+            ptx.inst.setp.lt.s64(q_valid, q_s64, length)
+            ptx.inst.setp.lt.s64(k_valid, k_s64, length)
+            q_word = reg.scalar(u32)
+            k_word = reg.scalar(u32)
+            valid_word = reg.scalar(u32)
+            ptx.selp(u32, q_word, 1, 0, q_valid)
+            ptx.selp(u32, k_word, 1, 0, k_valid)
+            ptx.inst.and_.b32(valid_word, q_word, k_word)
+            is_valid = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(is_valid, valid_word, 0)
+            value = reg.scalar(u8)
+            ptx.selp(u8, value, one, zero, is_valid)
+            ptx.inst.st.global_.u8(ptx.addr(out_batch + linear), value, pred=in_bounds)
+        ptx.ret()
+
+    return attention_bool_mask
 
 
 @lru_cache(maxsize=128)
@@ -457,6 +581,266 @@ def _build_layer_norm_kernel(rows: int, dim: int, eps: float, arch: str):
 
 
 @lru_cache(maxsize=128)
+def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    total = batch * time * dim
+    items_per_thread = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, time, dim, f32),),
+        grid=(1, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def apply_btd(x, mask, out):
+        px, pm, po = ptx.global_ptrs(x, mask, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        zero = reg.scalar(f32, init=0.0)
+        for i in range(items_per_thread):
+            linear = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            bt = reg.scalar(u32)
+            ptx.inst.div.u32(bt, linear, dim)
+            mask_value = reg.scalar(u32, init=0)
+            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
+            keep = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(keep, mask_value, 0)
+            x_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            y_value = reg.scalar(f32)
+            ptx.selp(f32, y_value, x_value, zero, keep)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        ptx.ret()
+
+    @kernel(
+        in_specs=(Tile(batch, dim, time, f32), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, dim, time, f32),),
+        grid=(1, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def apply_bdt(x, mask, out):
+        px, pm, po = ptx.global_ptrs(x, mask, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        zero = reg.scalar(f32, init=0.0)
+        for i in range(items_per_thread):
+            linear = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            sample = reg.scalar(u32)
+            ptx.inst.div.u32(sample, linear, dim * time)
+            rem = linear - sample * (dim * time)
+            t = reg.scalar(u32)
+            ptx.inst.rem.u32(t, rem, time)
+            mask_idx = sample * time + t
+            mask_value = reg.scalar(u32, init=0)
+            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
+            keep = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(keep, mask_value, 0)
+            x_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            y_value = reg.scalar(f32)
+            ptx.selp(f32, y_value, x_value, zero, keep)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        ptx.ret()
+
+    return apply_bdt if layout == "bdt" else apply_btd
+
+
+@lru_cache(maxsize=128)
+def _build_time_recovery_repeat_kernel(batch: int, source_time: int, target_time: int, dim: int, stride: int, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    total = batch * target_time * dim
+    items_per_thread = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(batch, source_time, dim, f32),),
+        out_specs=(Tile(batch, target_time, dim, f32),),
+        grid=(1, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def repeat_recover(x, out):
+        px, po = ptx.global_ptrs(x, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        max_source = source_time - 1
+        for i in range(items_per_thread):
+            linear = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            sample = reg.scalar(u32)
+            ptx.inst.div.u32(sample, linear, target_time * dim)
+            rem = linear - sample * (target_time * dim)
+            target_t = reg.scalar(u32)
+            ptx.inst.div.u32(target_t, rem, dim)
+            feature = rem - target_t * dim
+            source_t = reg.scalar(u32)
+            ptx.inst.div.u32(source_t, target_t, stride)
+            over = reg.scalar(pred)
+            ptx.inst.setp.gt.u32(over, source_t, max_source)
+            clipped_source = reg.scalar(u32)
+            ptx.selp(u32, clipped_source, max_source, source_t, over)
+            src_idx = (sample * source_time + clipped_source) * dim + feature
+            value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(value, ptx.addr(px + src_idx * 4), pred=in_bounds)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), value, pred=in_bounds)
+        ptx.ret()
+
+    return repeat_recover
+
+
+@lru_cache(maxsize=128)
+def _build_ctc_log_prob_frame_stats_kernel(
+    batch: int,
+    time: int,
+    vocab: int,
+    blank_id: int,
+    arch: str,
+):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, s64, u32
+
+    from pyptx import Tile, kernel, ptx, reg, smem
+
+    warp_size = 32
+    block = 256
+    num_warps = block // warp_size
+    items_per_thread = (vocab + block - 1) // block
+    min_f32 = -3.4028234663852886e38
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(batch, time, vocab, f32), Tile(batch, s64)),
+        out_specs=(Tile(batch, time, 4, f32),),
+        grid=(batch, time, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def ctc_log_prob_frame_stats(log_probs, lengths, out):
+        partials = smem.alloc(f32, (num_warps, 2))
+        stats = smem.alloc(f32, (2, 1))
+        plp, plen, po = ptx.global_ptrs(log_probs, lengths, out)
+
+        batch_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(batch_idx, ptx.special.ctaid.x())
+        time_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(time_idx, ptx.special.ctaid.y())
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        lane = tid & (warp_size - 1)
+        warp_id = tid >> 5
+
+        length = reg.scalar(s64)
+        ptx.inst.ld.global_.s64(length, ptx.addr(plen + batch_idx * 8))
+        time_s64 = reg.scalar(s64)
+        ptx.inst.cvt.s64.u32(time_s64, time_idx)
+        is_valid_frame = reg.scalar(pred)
+        ptx.inst.setp.lt.s64(is_valid_frame, time_s64, length)
+
+        frame_base = (batch_idx * time + time_idx) * vocab
+        blank_log_prob = reg.scalar(f32, init=min_f32)
+        ptx.inst.ld.global_.f32(
+            blank_log_prob,
+            ptx.addr(plp + (frame_base + blank_id) * 4),
+            pred=is_valid_frame,
+        )
+
+        top_any = reg.scalar(f32, init=min_f32)
+        top_nonblank = reg.scalar(f32, init=min_f32)
+        for i in range(items_per_thread):
+            token = tid if i == 0 else tid + (i * block)
+            in_vocab = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_vocab, token, vocab)
+            value = reg.scalar(f32, init=min_f32)
+            ptx.inst.ld.global_.f32(value, ptx.addr(plp + (frame_base + token) * 4), pred=in_vocab)
+            ptx.inst.max.f32(top_any, top_any, value)
+
+            is_blank = reg.scalar(pred)
+            ptx.inst.setp.eq.u32(is_blank, token, blank_id)
+            is_nonblank_word = reg.scalar(u32)
+            ptx.selp(u32, is_nonblank_word, 0, 1, is_blank)
+            is_nonblank = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(is_nonblank, is_nonblank_word, 0)
+            nonblank_value = reg.scalar(f32)
+            ptx.selp(f32, nonblank_value, value, min_f32, is_nonblank)
+            ptx.inst.max.f32(top_nonblank, top_nonblank, nonblank_value)
+
+        ptx.warp.reduce_max(top_any)
+        ptx.warp.reduce_max(top_nonblank)
+
+        with ptx.if_(lane == 0):
+            partials[warp_id, 0] = top_any
+            partials[warp_id, 1] = top_nonblank
+        ptx.bar.sync(0)
+
+        with ptx.if_(tid == 0):
+            block_top_any = reg.scalar(f32, init=min_f32)
+            block_top_nonblank = reg.scalar(f32, init=min_f32)
+            for i in range(num_warps):
+                ptx.inst.max.f32(block_top_any, block_top_any, partials[i, 0])
+                ptx.inst.max.f32(block_top_nonblank, block_top_nonblank, partials[i, 1])
+            stats[0, 0] = block_top_any
+            stats[1, 0] = block_top_nonblank
+        ptx.bar.sync(0)
+
+        with ptx.if_(tid == 0):
+            ptx.inst.mov.f32(top_nonblank, stats[1, 0])
+            blank_is_argmax = reg.scalar(pred)
+            ptx.inst.setp.ge.f32(blank_is_argmax, blank_log_prob, top_nonblank)
+
+            valid_value = reg.scalar(f32)
+            ptx.selp(f32, valid_value, 1.0, 0.0, is_valid_frame)
+            argmax_blank_value = reg.scalar(f32)
+            ptx.selp(f32, argmax_blank_value, 1.0, 0.0, blank_is_argmax)
+            ptx.inst.mul.f32(argmax_blank_value, argmax_blank_value, valid_value)
+
+            blank_exp_arg = reg.scalar(f32)
+            ptx.inst.mul.f32(blank_exp_arg, blank_log_prob, _LOG2E)
+            blank_prob = reg.scalar(f32)
+            ptx.inst.ex2.approx.f32(blank_prob, blank_exp_arg)
+            ptx.inst.mul.f32(blank_prob, blank_prob, valid_value)
+
+            nonblank_exp_arg = reg.scalar(f32)
+            ptx.inst.mul.f32(nonblank_exp_arg, top_nonblank, _LOG2E)
+            top_nonblank_prob = reg.scalar(f32)
+            ptx.inst.ex2.approx.f32(top_nonblank_prob, nonblank_exp_arg)
+            ptx.inst.mul.f32(top_nonblank_prob, top_nonblank_prob, valid_value)
+
+            out_base = (batch_idx * time + time_idx) * 4
+            ptx.inst.st.global_.f32(ptx.addr(po + (out_base + 0) * 4), blank_prob)
+            ptx.inst.st.global_.f32(ptx.addr(po + (out_base + 1) * 4), valid_value)
+            ptx.inst.st.global_.f32(ptx.addr(po + (out_base + 2) * 4), argmax_blank_value)
+            ptx.inst.st.global_.f32(ptx.addr(po + (out_base + 3) * 4), top_nonblank_prob)
+        ptx.ret()
+
+    return ctc_log_prob_frame_stats
+
+
+@lru_cache(maxsize=128)
 def _build_silu_kernel(m: int, f: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
@@ -564,6 +948,65 @@ def attention_mask_from_lengths_or_torch(lengths: Tensor, max_length: int) -> Te
         ).to(dtype=torch.long)
 
 
+def sequence_mask_or_torch(lengths: Tensor, max_length: int | None = None) -> Tensor:
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    if max_length <= 0:
+        return torch.empty((lengths.size(0), 0), device=lengths.device, dtype=torch.bool)
+    lengths = lengths.to(dtype=torch.long).contiguous()
+    if not _is_cuda_int64(lengths) or lengths.dim() != 1:
+        return torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+    try:
+        kernel = _build_sequence_mask_kernel(lengths.size(0), int(max_length), _arch_for(lengths))
+        _log_kernel_use_once("sequence_mask", lengths.size(0), int(max_length), _arch_for(lengths))
+        return kernel(lengths).bool()
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch sequence_mask fallback after pyptx failure shape=(%s, %s): %s",
+            lengths.size(0),
+            max_length,
+            exc,
+        )
+        return torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+
+
+def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | None = None) -> Tensor:
+    if max_length is None:
+        max_length = int(lengths.max().item())
+    if max_length <= 0:
+        return torch.empty(
+            (lengths.size(0), 0, 0),
+            device=lengths.device,
+            dtype=torch.bool,
+        )
+    lengths = lengths.to(dtype=torch.long).contiguous()
+    if not _is_cuda_int64(lengths) or lengths.dim() != 1:
+        sequence_mask = sequence_mask_or_torch(lengths, max_length=max_length)
+        return sequence_mask.unsqueeze(1) & sequence_mask.unsqueeze(2)
+    try:
+        kernel = _build_attention_bool_mask_kernel(
+            lengths.size(0),
+            int(max_length),
+            _arch_for(lengths),
+        )
+        _log_kernel_use_once(
+            "squeezeformer_attention_mask",
+            lengths.size(0),
+            int(max_length),
+            _arch_for(lengths),
+        )
+        return kernel(lengths).bool()
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch squeezeformer_attention_mask fallback after pyptx failure shape=(%s, %s): %s",
+            lengths.size(0),
+            max_length,
+            exc,
+        )
+        sequence_mask = sequence_mask_or_torch(lengths, max_length=max_length)
+        return sequence_mask.unsqueeze(1) & sequence_mask.unsqueeze(2)
+
+
 def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
     if not _is_inference_cuda_f32(x, scale, bias) or x.dim() < 1:
         _LOGGER.debug(
@@ -656,6 +1099,148 @@ def layer_norm_or_torch(
             exc,
         )
         return F.layer_norm(x, normalized_shape, weight, bias, eps)
+
+
+def apply_time_mask_or_torch(x: Tensor, mask: Tensor, *, layout: str = "btd") -> Tensor:
+    if (
+        layout not in {"btd", "bdt"}
+        or torch.is_grad_enabled()
+        or x.dim() != 3
+        or not _is_inference_cuda_f32(x)
+        or not _is_cuda_bool(mask)
+    ):
+        if layout == "bdt":
+            return x * mask.unsqueeze(1).to(dtype=x.dtype)
+        return x * mask.unsqueeze(-1).to(dtype=x.dtype)
+    batch = x.size(0)
+    time = x.size(2) if layout == "bdt" else x.size(1)
+    dim = x.size(1) if layout == "bdt" else x.size(2)
+    if mask.shape != (batch, time):
+        if layout == "bdt":
+            return x * mask.unsqueeze(1).to(dtype=x.dtype)
+        return x * mask.unsqueeze(-1).to(dtype=x.dtype)
+    try:
+        kernel = _build_apply_time_mask_kernel(batch, time, dim, layout, _arch_for(x))
+        _log_kernel_use_once("apply_time_mask", batch, time, dim, layout, _arch_for(x))
+        return kernel(x, mask)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch apply_time_mask fallback after pyptx failure shape=%s layout=%s: %s",
+            tuple(x.shape),
+            layout,
+            exc,
+        )
+        if layout == "bdt":
+            return x * mask.unsqueeze(1).to(dtype=x.dtype)
+        return x * mask.unsqueeze(-1).to(dtype=x.dtype)
+
+
+def time_recovery_repeat_or_torch(x: Tensor, target_length: int, stride: int) -> Tensor:
+    if (
+        torch.is_grad_enabled()
+        or x.dim() != 3
+        or not _is_inference_cuda_f32(x)
+        or target_length <= 0
+    ):
+        repeated = torch.repeat_interleave(x, repeats=stride, dim=1)
+        if repeated.size(1) < target_length:
+            pad_length = target_length - repeated.size(1)
+            return F.pad(repeated, (0, 0, 0, pad_length), mode="replicate")
+        return repeated[:, :target_length, :]
+    try:
+        kernel = _build_time_recovery_repeat_kernel(
+            x.size(0),
+            x.size(1),
+            int(target_length),
+            x.size(2),
+            int(stride),
+            _arch_for(x),
+        )
+        _log_kernel_use_once(
+            "time_recovery_repeat",
+            x.size(0),
+            x.size(1),
+            int(target_length),
+            x.size(2),
+            int(stride),
+            _arch_for(x),
+        )
+        return kernel(x)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch time_recovery_repeat fallback after pyptx failure shape=%s target=%s: %s",
+            tuple(x.shape),
+            target_length,
+            exc,
+        )
+        repeated = torch.repeat_interleave(x, repeats=stride, dim=1)
+        if repeated.size(1) < target_length:
+            pad_length = target_length - repeated.size(1)
+            return F.pad(repeated, (0, 0, 0, pad_length), mode="replicate")
+        return repeated[:, :target_length, :]
+
+
+def ctc_log_prob_frame_stats_or_torch(
+    log_probs: Tensor,
+    output_lengths: Tensor,
+    *,
+    blank_id: int,
+) -> Tensor:
+    def torch_frame_stats() -> Tensor:
+        valid_mask = (
+            torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(0)
+            < output_lengths.to(dtype=torch.long).unsqueeze(1)
+        )
+        blank_probabilities = log_probs[..., blank_id].exp()
+        argmax_blank = log_probs.argmax(dim=-1).eq(blank_id).to(dtype=torch.float32)
+        nonblank_log_probs = log_probs.clone()
+        nonblank_log_probs[..., blank_id] = float("-inf")
+        top_nonblank = nonblank_log_probs.max(dim=-1).values.exp()
+        valid = valid_mask.to(dtype=torch.float32)
+        return torch.stack(
+            (
+                blank_probabilities * valid,
+                valid,
+                argmax_blank * valid,
+                top_nonblank * valid,
+            ),
+            dim=-1,
+        )
+
+    if (
+        torch.is_grad_enabled()
+        or log_probs.dim() != 3
+        or not _is_inference_cuda_f32(log_probs)
+        or not _is_cuda_int64(output_lengths.contiguous())
+        or output_lengths.dim() != 1
+        or output_lengths.size(0) != log_probs.size(0)
+    ):
+        return torch_frame_stats()
+    try:
+        lengths = output_lengths.to(dtype=torch.long).contiguous()
+        kernel = _build_ctc_log_prob_frame_stats_kernel(
+            log_probs.size(0),
+            log_probs.size(1),
+            log_probs.size(2),
+            int(blank_id),
+            _arch_for(log_probs),
+        )
+        _log_kernel_use_once(
+            "ctc_log_prob_frame_stats",
+            log_probs.size(0),
+            log_probs.size(1),
+            log_probs.size(2),
+            int(blank_id),
+            _arch_for(log_probs),
+        )
+        return kernel(log_probs, lengths)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch ctc_log_prob_frame_stats fallback after pyptx failure shape=%s: %s",
+            tuple(log_probs.shape),
+            exc,
+        )
+        return torch_frame_stats()
 
 
 def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:

@@ -20,6 +20,7 @@ from squeezeformer_pytorch.checkpoints import save_checkpoint
 from squeezeformer_pytorch.data import AudioFeaturizer
 from squeezeformer_pytorch.metrics import char_error_rate, word_error_rate
 from squeezeformer_pytorch.model import SqueezeformerConfig
+from squeezeformer_pytorch.pyptx_kernels import ctc_log_prob_frame_stats_or_torch
 from squeezeformer_pytorch.runtime_types import DecodeStrategy, DTypeChoice, ValidationModelSource
 from squeezeformer_pytorch.secrets import sanitize_for_serialization
 from squeezeformer_pytorch.training.runtime import (
@@ -138,25 +139,20 @@ def ctc_batch_diagnostics(
     targets: torch.Tensor | None = None,
     target_lengths: torch.Tensor | None = None,
 ) -> dict[str, float]:
-    valid_mask = torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(
-        0
-    ) < output_lengths.unsqueeze(1)
-    valid_frames = int(valid_mask.sum().item())
-    blank_probabilities = log_probs[..., tokenizer.blank_id].exp()
-    argmax_tokens = log_probs.argmax(dim=-1)
-    argmax_blank_frames = int(((argmax_tokens == tokenizer.blank_id) & valid_mask).sum().item())
-
-    nonblank_log_probs = log_probs.clone()
-    nonblank_log_probs[..., tokenizer.blank_id] = float("-inf")
-    top_nonblank_probabilities = nonblank_log_probs.max(dim=-1).values.exp()
+    frame_stats = ctc_log_prob_frame_stats_or_torch(
+        log_probs,
+        output_lengths,
+        blank_id=tokenizer.blank_id,
+    )
+    totals = frame_stats.sum(dim=(0, 1))
+    valid_frames = int(totals[1].item())
+    argmax_blank_frames = int(totals[2].item())
 
     diagnostics = {
-        "blank_probability_sum": float(blank_probabilities.masked_select(valid_mask).sum().item()),
+        "blank_probability_sum": float(totals[0].item()),
         "decoded_frames": float(valid_frames),
         "argmax_blank_frames": float(argmax_blank_frames),
-        "top_nonblank_probability_sum": float(
-            top_nonblank_probabilities.masked_select(valid_mask).sum().item()
-        ),
+        "top_nonblank_probability_sum": float(totals[3].item()),
         "sample_count": float(output_lengths.numel()),
         "output_frames_sum": float(output_lengths.sum().item()),
     }
