@@ -112,7 +112,7 @@ def _build_attention_mask_kernel(batch: int, time: int, arch: str):
 
     block = 256
     items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, s64),),
@@ -162,7 +162,7 @@ def _build_sequence_mask_kernel(batch: int, time: int, arch: str):
 
     block = 256
     items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, s64),),
@@ -182,8 +182,8 @@ def _build_sequence_mask_kernel(batch: int, time: int, arch: str):
         length = reg.scalar(s64)
         ptx.inst.ld.global_.s64(length, ptx.addr(pl + row * 8))
         out_row = po + row * time
-        one = reg.scalar(u8, init=1)
-        zero = reg.scalar(u8, init=0)
+        one = reg.scalar(u32, init=1)
+        zero = reg.scalar(u32, init=0)
 
         for i in range(items_per_thread):
             col = tid if i == 0 else tid + (i * block)
@@ -193,8 +193,8 @@ def _build_sequence_mask_kernel(batch: int, time: int, arch: str):
             ptx.inst.cvt.s64.u32(col_s64, col)
             is_valid = reg.scalar(pred)
             ptx.inst.setp.lt.s64(is_valid, col_s64, length)
-            value = reg.scalar(u8)
-            ptx.selp(u8, value, one, zero, is_valid)
+            value = reg.scalar(u32)
+            ptx.selp(u32, value, one, zero, is_valid)
             ptx.inst.st.global_.u8(ptx.addr(out_row + col), value, pred=in_bounds)
         ptx.ret()
 
@@ -211,7 +211,7 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
 
     block = 256
     items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, s64),),
@@ -232,8 +232,8 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
         length = reg.scalar(s64)
         ptx.inst.ld.global_.s64(length, ptx.addr(pl + batch_idx * 8))
         out_row = po + (batch_idx * time + q) * time
-        one = reg.scalar(u8, init=1)
-        zero = reg.scalar(u8, init=0)
+        one = reg.scalar(u32, init=1)
+        zero = reg.scalar(u32, init=0)
 
         q_s64 = reg.scalar(s64)
         ptx.inst.cvt.s64.u32(q_s64, q)
@@ -256,8 +256,8 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
             ptx.inst.and_.b32(valid_word, q_word, k_word)
             is_valid = reg.scalar(pred)
             ptx.inst.setp.ne.u32(is_valid, valid_word, 0)
-            value = reg.scalar(u8)
-            ptx.selp(u8, value, one, zero, is_valid)
+            value = reg.scalar(u32)
+            ptx.selp(u32, value, one, zero, is_valid)
             ptx.inst.st.global_.u8(ptx.addr(out_row + k), value, pred=in_bounds)
         ptx.ret()
 
@@ -276,7 +276,7 @@ def _build_scale_bias_kernel(m: int, f: int, arch: str):
     items_per_thread = f // block
     use_v4 = items_per_thread % 4 == 0
     v4_iters = items_per_thread // 4 if use_v4 else 0
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(m, f, f32), Tile(f, f32), Tile(f, f32)),
@@ -345,7 +345,7 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
     block = 256
     num_warps = block // warp_size
     items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, s64)),
@@ -450,7 +450,7 @@ def _build_layer_norm_kernel(rows: int, dim: int, eps: float, arch: str):
     items_per_thread = dim // block
     use_v4 = items_per_thread >= 4 and items_per_thread % 4 == 0
     v4_iters = items_per_thread // 4 if use_v4 else 0
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(rows, dim, f32), Tile(dim, f32), Tile(dim, f32)),
@@ -589,7 +589,7 @@ def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, 
     block = 256
     feature_items_per_thread = (dim + block - 1) // block
     time_items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
@@ -676,7 +676,7 @@ def _build_time_recovery_repeat_kernel(
 
     block = 256
     feature_items_per_thread = (dim + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, source_time, dim, f32),),
@@ -736,7 +736,7 @@ def _build_ctc_log_prob_frame_stats_kernel(
     num_warps = block // warp_size
     items_per_thread = (vocab + block - 1) // block
     min_f32 = -3.4028234663852886e38
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(batch, time, vocab, f32), Tile(batch, s64)),
@@ -858,7 +858,7 @@ def _build_silu_kernel(m: int, f: int, arch: str):
     items_per_thread = f // block
     use_v4 = items_per_thread % 4 == 0
     v4_iters = items_per_thread // 4 if use_v4 else 0
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(m, f, f32),),
@@ -926,7 +926,7 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
     block = 256
     total = batch * time * dim
     grid_x = (total + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     def emit_silu(xv):
         neg_log2e = reg.scalar(f32, init=-_LOG2E)
@@ -1024,7 +1024,7 @@ def _build_residual_add_kernel(total: int, scale: float, arch: str):
 
     block = 256
     grid_x = (total + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(total, f32), Tile(total, f32)),
@@ -1069,7 +1069,7 @@ def _build_swoosh_kernel(
 
     block = 256
     grid_x = (total + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(total, f32),),
@@ -1139,7 +1139,7 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
     f = f2 // 2
     total = m * f
     grid_x = (total + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(m, f2, f32),),
@@ -1205,7 +1205,7 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
     block = 256
     num_warps = block // warp_size
     items_per_thread = (dim + block - 1) // block
-    version = (8, 7) if arch.startswith("sm_100") else None
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(rows, dim, f32), Tile(dim, f32), Tile(1, f32)),
