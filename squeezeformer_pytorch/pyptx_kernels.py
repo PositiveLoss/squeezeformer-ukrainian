@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from functools import lru_cache
@@ -18,6 +19,16 @@ _PYPTX_DISABLED = os.environ.get("SQUEEZEFORMER_DISABLE_PYPTX", "").lower() in {
 _BLOCK_CANDIDATES = (1024, 512, 256, 128, 64, 32)
 _LOG2E = 1.4426950408889634
 _PYPTX_IMPORT_READY = False
+_LOGGER = logging.getLogger(__name__)
+_LOGGED_KERNEL_USES: set[tuple[object, ...]] = set()
+
+
+def _log_kernel_use_once(name: str, *shape: object) -> None:
+    key = (name, *shape)
+    if key in _LOGGED_KERNEL_USES:
+        return
+    _LOGGED_KERNEL_USES.add(key)
+    _LOGGER.info("using pyptx %s kernel shape=%s", name, shape)
 
 
 def _ensure_pyptx_importable() -> bool:
@@ -525,14 +536,28 @@ def attention_mask_from_lengths_or_torch(lengths: Tensor, max_length: int) -> Te
     if max_length <= 0:
         return torch.empty((lengths.size(0), 0), device=lengths.device, dtype=torch.long)
     if not _is_cuda_int64(lengths) or lengths.dim() != 1:
+        _LOGGER.debug(
+            "using torch attention_mask fallback shape=(%s, %s) device=%s dtype=%s",
+            lengths.size(0),
+            max_length,
+            lengths.device,
+            lengths.dtype,
+        )
         return (
             torch.arange(max_length, device=lengths.device).unsqueeze(0)
             < lengths.to(dtype=torch.long).unsqueeze(1)
         ).to(dtype=torch.long)
     try:
         kernel = _build_attention_mask_kernel(lengths.size(0), int(max_length), _arch_for(lengths))
+        _log_kernel_use_once("attention_mask", lengths.size(0), int(max_length), _arch_for(lengths))
         return kernel(lengths)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch attention_mask fallback after pyptx failure shape=(%s, %s): %s",
+            lengths.size(0),
+            max_length,
+            exc,
+        )
         return (
             torch.arange(max_length, device=lengths.device).unsqueeze(0)
             < lengths.to(dtype=torch.long).unsqueeze(1)
@@ -541,23 +566,47 @@ def attention_mask_from_lengths_or_torch(lengths: Tensor, max_length: int) -> Te
 
 def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
     if not _is_inference_cuda_f32(x, scale, bias) or x.dim() < 1:
+        _LOGGER.debug(
+            "using torch scale_bias fallback shape=%s device=%s dtype=%s",
+            tuple(x.shape),
+            x.device,
+            x.dtype,
+        )
         return x * scale + bias
     flat, original_shape = _flat_2d(x)
     try:
         kernel = _build_scale_bias_kernel(flat.size(0), flat.size(1), _arch_for(x))
+        _log_kernel_use_once("scale_bias", flat.size(0), flat.size(1), _arch_for(x))
         return kernel(flat, scale, bias).reshape(original_shape)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch scale_bias fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
         return x * scale + bias
 
 
 def silu_or_torch(x: Tensor) -> Tensor:
     if not _is_inference_cuda_f32(x) or x.dim() < 1:
+        _LOGGER.debug(
+            "using torch silu fallback shape=%s device=%s dtype=%s",
+            tuple(x.shape),
+            x.device,
+            x.dtype,
+        )
         return F.silu(x)
     flat, original_shape = _flat_2d(x)
     try:
         kernel = _build_silu_kernel(flat.size(0), flat.size(1), _arch_for(x))
+        _log_kernel_use_once("silu", flat.size(0), flat.size(1), _arch_for(x))
         return kernel(flat).reshape(original_shape)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch silu fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
         return F.silu(x)
 
 
@@ -575,9 +624,21 @@ def layer_norm_or_torch(
         or not _is_inference_cuda_f32(x, weight, bias)
         or x.dim() < 1
     ):
+        _LOGGER.debug(
+            "using torch layer_norm fallback shape=%s normalized_shape=%s device=%s dtype=%s",
+            tuple(x.shape),
+            normalized_shape,
+            x.device,
+            x.dtype,
+        )
         return F.layer_norm(x, normalized_shape, weight, bias, eps)
     flat, original_shape = _flat_2d(x)
     if flat.size(1) != normalized_shape[0]:
+        _LOGGER.debug(
+            "using torch layer_norm fallback for mismatched shape=%s normalized_shape=%s",
+            original_shape,
+            normalized_shape,
+        )
         return F.layer_norm(x, normalized_shape, weight, bias, eps)
     try:
         kernel = _build_layer_norm_kernel(
@@ -586,8 +647,14 @@ def layer_norm_or_torch(
             float(eps),
             _arch_for(x),
         )
+        _log_kernel_use_once("layer_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
         return kernel(flat, weight, bias).reshape(original_shape)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch layer_norm fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
         return F.layer_norm(x, normalized_shape, weight, bias, eps)
 
 
@@ -604,6 +671,13 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
             and _is_cuda_int64(attention_mask)
         )
     ):
+        _LOGGER.debug(
+            "using torch masked_mean fallback hidden_shape=%s mask_shape=%s device=%s dtype=%s",
+            tuple(hidden.shape),
+            tuple(attention_mask.shape),
+            hidden.device,
+            hidden.dtype,
+        )
         mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden * mask).sum(dim=1) / denom
@@ -614,8 +688,20 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
             hidden.size(2),
             _arch_for(hidden),
         )
+        _log_kernel_use_once(
+            "masked_mean",
+            hidden.size(0),
+            hidden.size(1),
+            hidden.size(2),
+            _arch_for(hidden),
+        )
         return kernel(hidden, attention_mask)
-    except Exception:
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch masked_mean fallback after pyptx failure hidden_shape=%s: %s",
+            tuple(hidden.shape),
+            exc,
+        )
         mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden * mask).sum(dim=1) / denom
