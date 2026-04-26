@@ -57,6 +57,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--time-steps", type=int, default=512)
     parser.add_argument("--vocab-size", type=int, default=128)
+    parser.add_argument(
+        "--dtype",
+        default="float32",
+        choices=("float32", "bfloat16"),
+        help="Floating point dtype for tensor-valued benchmark cases.",
+    )
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
@@ -160,6 +166,10 @@ def lengths_for(batch: int, time: int, device: torch.device) -> torch.Tensor:
     return values.round().to(dtype=torch.long).clamp_(1, time)
 
 
+def benchmark_dtype(name: str) -> torch.dtype:
+    return torch.bfloat16 if name == "bfloat16" else torch.float32
+
+
 def make_cases(args: argparse.Namespace) -> list[Case]:
     batch = args.batch_size
     time = args.time_steps
@@ -167,6 +177,10 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
     hidden_dim = dim * 4
     conv_dim = dim * 2
     vocab = args.vocab_size
+    dtype = benchmark_dtype(args.dtype)
+
+    def randn(*shape: int, device: torch.device) -> torch.Tensor:
+        return torch.randn(*shape, device=device, dtype=dtype)
 
     def attention_mask_case(device: torch.device):
         lengths = lengths_for(batch, time, device)
@@ -179,16 +193,16 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     def scale_bias_case(device: torch.device):
-        x = torch.randn(batch, time, dim, device=device)
-        scale = torch.randn(dim, device=device)
-        bias = torch.randn(dim, device=device)
+        x = randn(batch, time, dim, device=device)
+        scale = randn(dim, device=device)
+        bias = randn(dim, device=device)
         return (
             lambda: scale_bias_or_torch(x, scale, bias),
             lambda: x * scale + bias,
         )
 
     def silu_mask_bdt_case(device: torch.device):
-        x = torch.randn(batch, conv_dim, time, device=device)
+        x = randn(batch, conv_dim, time, device=device)
         mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
         return (
             lambda: silu_time_mask_or_torch(x, mask, layout="bdt"),
@@ -196,7 +210,7 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     def silu_mask_btd_case(device: torch.device):
-        x = torch.randn(batch, time, dim, device=device)
+        x = randn(batch, time, dim, device=device)
         mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
         return (
             lambda: silu_time_mask_or_torch(x, mask, layout="btd"),
@@ -204,29 +218,29 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     def swoosh_l_case(device: torch.device):
-        x = torch.randn(batch, time, hidden_dim, device=device)
+        x = randn(batch, time, hidden_dim, device=device)
         return (
             lambda: swoosh_l_or_torch(x),
             lambda: F.softplus(x - 4.0) - 0.08 * x - 0.035,
         )
 
     def swoosh_r_case(device: torch.device):
-        x = torch.randn(batch, time, conv_dim, device=device)
+        x = randn(batch, time, conv_dim, device=device)
         return (
             lambda: swoosh_r_or_torch(x),
             lambda: F.softplus(x - 1.0) - 0.08 * x - 0.313261687,
         )
 
     def gated_linear_unit_case(device: torch.device):
-        x = torch.randn(batch, time, conv_dim, device=device)
+        x = randn(batch, time, conv_dim, device=device)
         return (
             lambda: gated_linear_unit_or_torch(x),
             lambda: x[..., :dim] * torch.sigmoid(x[..., dim:]),
         )
 
     def conv_output_epilogue_case(device: torch.device):
-        residual = torch.randn(batch, time, dim, device=device)
-        x = torch.randn(batch, dim, time, device=device)
+        residual = randn(batch, time, dim, device=device)
+        x = randn(batch, dim, time, device=device)
         mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
         return (
             lambda: conv_output_epilogue_or_torch(residual, x, mask),
@@ -234,9 +248,9 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     def bias_norm_case(device: torch.device):
-        x = torch.randn(batch, time, dim, device=device)
-        bias = torch.randn(dim, device=device)
-        log_scale = torch.randn((), device=device) * 0.1
+        x = randn(batch, time, dim, device=device)
+        bias = randn(dim, device=device)
+        log_scale = torch.randn((), device=device, dtype=dtype) * 0.1
         return (
             lambda: bias_norm_or_torch(x, bias, log_scale, 1.0e-8),
             lambda: (
@@ -247,7 +261,7 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     def masked_mean_case(device: torch.device):
-        hidden = torch.randn(batch, time, dim, device=device)
+        hidden = randn(batch, time, dim, device=device)
         mask = (
             lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
         ).to(dtype=torch.long)

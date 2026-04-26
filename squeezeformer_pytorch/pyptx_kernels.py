@@ -89,6 +89,32 @@ def _is_inference_cuda_f32(x: Tensor, *others: Tensor) -> bool:
     return major >= 9
 
 
+def _is_inference_cuda_float(x: Tensor, *others: Tensor) -> bool:
+    if _PYPTX_DISABLED or torch.is_grad_enabled():
+        return False
+    tensors = (x, *others)
+    dtype = x.dtype
+    if dtype not in {torch.float32, torch.bfloat16}:
+        return False
+    if not all(
+        tensor.is_cuda
+        and tensor.dtype == dtype
+        and tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        return False
+    major, _minor = torch.cuda.get_device_capability(x.device)
+    return major >= 9
+
+
+def _float_dtype_key(x: Tensor) -> str:
+    if x.dtype == torch.bfloat16:
+        return "bf16"
+    if x.dtype == torch.float32:
+        return "f32"
+    raise ValueError(f"unsupported pyptx float dtype: {x.dtype}")
+
+
 def _is_cuda_int64(x: Tensor) -> bool:
     if _PYPTX_DISABLED:
         return False
@@ -206,21 +232,41 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
 
 
 @lru_cache(maxsize=128)
-def _build_scale_bias_kernel(m: int, f: int, arch: str):
+def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import f32, u32
+    from pyptx.types import b16, bf16, f32, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
     block = _pick_block(f)
     items_per_thread = f // block
-    use_v4 = items_per_thread % 4 == 0
+    use_v4 = dtype == "f32" and items_per_thread % 4 == 0
     v4_iters = items_per_thread // 4 if use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr))
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr))
+        return value
+
+    def store_data_f32(ptr, value):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value)
+
     @kernel(
-        in_specs=(Tile(m, f, f32), Tile(f, f32), Tile(f, f32)),
-        out_specs=(Tile(m, f, f32),),
+        in_specs=(Tile(m, f, data_t), Tile(f, data_t), Tile(f, data_t)),
+        out_specs=(Tile(m, f, data_t),),
         grid=(m, 1, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -230,7 +276,7 @@ def _build_scale_bias_kernel(m: int, f: int, arch: str):
         px, ps, pb, po = ptx.global_ptrs(x, scale, bias, out)
         row = reg.scalar(u32)
         ptx.inst.mov.u32(row, ptx.special.ctaid.x())
-        row_byte_off = row * (f * 4)
+        row_byte_off = row * (f * elem_bytes)
         px += row_byte_off
         po += row_byte_off
 
@@ -241,7 +287,7 @@ def _build_scale_bias_kernel(m: int, f: int, arch: str):
             elem_base = tid << 2
             for j in range(v4_iters):
                 idx = elem_base if j == 0 else elem_base + (j * block * 4)
-                off = idx * 4
+                off = idx * elem_bytes
                 x_vals = [reg.scalar(f32) for _ in range(4)]
                 s_vals = [reg.scalar(f32) for _ in range(4)]
                 b_vals = [reg.scalar(f32) for _ in range(4)]
@@ -258,37 +304,54 @@ def _build_scale_bias_kernel(m: int, f: int, arch: str):
             for i in range(items_per_thread):
                 idx = reg.scalar(u32)
                 ptx.inst.add.u32(idx, tid, i * block)
-                off = idx * 4
-                xv = reg.scalar(f32)
-                sv = reg.scalar(f32)
-                bv = reg.scalar(f32)
+                off = idx * elem_bytes
+                xv = load_data_f32(px + off)
+                sv = load_data_f32(ps + off)
+                bv = load_data_f32(pb + off)
                 y = reg.scalar(f32)
-                ptx.inst.ld.global_.f32(xv, ptx.addr(px + off))
-                ptx.inst.ld.global_.f32(sv, ptx.addr(ps + off))
-                ptx.inst.ld.global_.f32(bv, ptx.addr(pb + off))
                 ptx.inst.fma.rn.f32(y, xv, sv, bv)
-                ptx.inst.st.global_.f32(ptx.addr(po + off), y)
+                store_data_f32(po + off, y)
         ptx.ret()
 
     return scale_bias
 
 
 @lru_cache(maxsize=128)
-def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
+def _build_masked_mean_kernel(batch: int, time: int, dim: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg, smem
-    from pyptx.types import f32, pred, s64, u32
+    from pyptx.types import b16, bf16, f32, pred, s64, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
     warp_size = 32
     block = 256
     num_warps = block // warp_size
     items_per_thread = (time + block - 1) // block
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value)
+
     @kernel(
-        in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, s64)),
-        out_specs=(Tile(batch, dim, f32),),
+        in_specs=(Tile(batch, time, dim, data_t), Tile(batch, time, s64)),
+        out_specs=(Tile(batch, dim, data_t),),
         grid=(batch, dim, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -308,7 +371,7 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
         lane = tid & (warp_size - 1)
         warp_id = tid >> 5
 
-        hidden_row_base = batch_idx * (time * dim * 4)
+        hidden_row_base = batch_idx * (time * dim * elem_bytes)
         mask_row_base = batch_idx * (time * 8)
         sum_value = reg.scalar(f32, init=0.0)
         count_value = reg.scalar(f32, init=0.0)
@@ -329,13 +392,8 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
             is_valid = reg.scalar(pred)
             ptx.inst.setp.ne.s64(is_valid, mask_value, zero_s64)
 
-            hidden_value = reg.scalar(f32, init=0.0)
-            hidden_off = hidden_row_base + (col * dim + feature_idx) * 4
-            ptx.inst.ld.global_.f32(
-                hidden_value,
-                ptx.addr(ph + hidden_off),
-                pred=is_valid,
-            )
+            hidden_off = hidden_row_base + (col * dim + feature_idx) * elem_bytes
+            hidden_value = load_data_f32(ph + hidden_off, pred=is_valid)
             ptx.inst.add.f32(sum_value, sum_value, hidden_value)
             ptx.inst.add.f32(count_value, count_value, one_f32, pred=is_valid)
 
@@ -366,8 +424,8 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
         ptx.bar.sync(0)
 
         with ptx.if_(tid == 0):
-            ptx.inst.st.global_.f32(
-                ptx.addr(po + (batch_idx * dim + feature_idx) * 4),
+            store_data_f32(
+                po + (batch_idx * dim + feature_idx) * elem_bytes,
                 stats[0, 0],
             )
         ptx.ret()
@@ -504,24 +562,52 @@ def _build_ctc_log_prob_frame_stats_kernel(
 
 
 @lru_cache(maxsize=128)
-def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, arch: str):
+def _build_silu_time_mask_kernel(
+    batch: int,
+    time: int,
+    dim: int,
+    layout: str,
+    dtype: str,
+    arch: str,
+):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import f32, pred, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
+    can_use_v4 = dtype == "f32"
     total = batch * time * dim
     scalar_block = 256
     scalar_grid_x = (total + scalar_block - 1) // scalar_block
-    btd_v4_block = _pick_v4_block_or_none(dim)
+    btd_v4_block = _pick_v4_block_or_none(dim) if can_use_v4 else None
     btd_use_v4 = btd_v4_block is not None
     btd_block = btd_v4_block if btd_v4_block is not None else scalar_block
     btd_v4_iters = dim // (btd_block * 4) if btd_use_v4 else 0
-    bdt_v4_block = _pick_v4_block_or_none(time)
+    bdt_v4_block = _pick_v4_block_or_none(time) if can_use_v4 else None
     bdt_use_v4 = bdt_v4_block is not None
     bdt_block = bdt_v4_block if bdt_v4_block is not None else scalar_block
     bdt_v4_iters = time // (bdt_block * 4) if bdt_use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
+
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
 
     def emit_silu(xv):
         neg_log2e = reg.scalar(f32, init=-_LOG2E)
@@ -539,8 +625,8 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
         return y
 
     @kernel(
-        in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
-        out_specs=(Tile(batch, time, dim, f32),),
+        in_specs=(Tile(batch, time, dim, data_t), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, time, dim, data_t),),
         grid=(batch * time if btd_use_v4 else scalar_grid_x, 1, 1),
         block=(btd_block, 1, 1),
         arch=arch,
@@ -556,7 +642,7 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
 
         if btd_use_v4:
             row = block_idx
-            row_byte_off = row * (dim * 4)
+            row_byte_off = row * (dim * elem_bytes)
             px += row_byte_off
             po += row_byte_off
             mask_value = reg.scalar(u32, init=0)
@@ -566,7 +652,7 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
             elem_base = tid << 2
             for j in range(btd_v4_iters):
                 idx = elem_base if j == 0 else elem_base + (j * btd_block * 4)
-                off = idx * 4
+                off = idx * elem_bytes
                 x_vals = [reg.scalar(f32) for _ in range(4)]
                 ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(px + off))
                 y_vals = []
@@ -586,15 +672,15 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
             keep = reg.scalar(pred)
             ptx.inst.setp.ne.u32(keep, mask_value, 0)
             x_value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            x_value = load_data_f32(px + linear * elem_bytes, pred=in_bounds)
             y_value = emit_silu(x_value)
             ptx.selp(f32, y_value, y_value, zero, keep)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+            store_data_f32(po + linear * elem_bytes, y_value, pred=in_bounds)
         ptx.ret()
 
     @kernel(
-        in_specs=(Tile(batch, dim, time, f32), Tile(batch, time, pred)),
-        out_specs=(Tile(batch, dim, time, f32),),
+        in_specs=(Tile(batch, dim, time, data_t), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, dim, time, data_t),),
         grid=(batch * dim if bdt_use_v4 else scalar_grid_x, 1, 1),
         block=(bdt_block, 1, 1),
         arch=arch,
@@ -610,7 +696,7 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
 
         if bdt_use_v4:
             row = block_idx
-            row_byte_off = row * (time * 4)
+            row_byte_off = row * (time * elem_bytes)
             px += row_byte_off
             po += row_byte_off
             sample = reg.scalar(u32)
@@ -619,7 +705,7 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
             elem_base = tid << 2
             for j in range(bdt_v4_iters):
                 idx = elem_base if j == 0 else elem_base + (j * bdt_block * 4)
-                off = idx * 4
+                off = idx * elem_bytes
                 x_vals = [reg.scalar(f32) for _ in range(4)]
                 ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(px + off))
                 y_vals = []
@@ -646,37 +732,57 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
             ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
             keep = reg.scalar(pred)
             ptx.inst.setp.ne.u32(keep, mask_value, 0)
-            x_value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            x_value = load_data_f32(px + linear * elem_bytes, pred=in_bounds)
             y_value = emit_silu(x_value)
             ptx.selp(f32, y_value, y_value, zero, keep)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+            store_data_f32(po + linear * elem_bytes, y_value, pred=in_bounds)
         ptx.ret()
 
     return silu_mask_bdt if layout == "bdt" else silu_mask_btd
 
 
 @lru_cache(maxsize=128)
-def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: str):
+def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import f32, pred, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
-    v4_block = _pick_v4_block_or_none(dim)
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
+    can_use_v4 = dtype == "f32"
+    v4_block = _pick_v4_block_or_none(dim) if can_use_v4 else None
     block = v4_block if v4_block is not None else 256
     use_v4 = v4_block is not None
     v4_iters = dim // (block * 4) if use_v4 else 0
     items_per_thread = (dim + block - 1) // block
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
     @kernel(
         in_specs=(
-            Tile(batch, time, dim, f32),
-            Tile(batch, dim, time, f32),
+            Tile(batch, time, dim, data_t),
+            Tile(batch, dim, time, data_t),
             Tile(batch, time, pred),
         ),
-        out_specs=(Tile(batch, time, dim, f32),),
+        out_specs=(Tile(batch, time, dim, data_t),),
         grid=(batch, time, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -704,14 +810,14 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: st
             elem_base = tid << 2
             for j in range(v4_iters):
                 feature = elem_base if j == 0 else elem_base + (j * block * 4)
-                out_off = (residual_row + feature) * 4
+                out_off = (residual_row + feature) * elem_bytes
                 residual_vals = [reg.scalar(f32) for _ in range(4)]
                 ptx.inst.ld.global_.v4.f32(residual_vals, ptx.addr(pr + out_off))
                 y_vals = []
                 for sub in range(4):
                     x_value = reg.scalar(f32, init=0.0)
                     x_idx = x_sample_base + (feature + sub) * time + time_idx
-                    ptx.inst.ld.global_.f32(x_value, ptx.addr(px + x_idx * 4))
+                    ptx.inst.ld.global_.f32(x_value, ptx.addr(px + x_idx * elem_bytes))
                     ptx.selp(f32, x_value, x_value, zero, keep)
                     y = reg.scalar(f32)
                     ptx.inst.add.f32(y, residual_vals[sub], x_value)
@@ -725,17 +831,13 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: st
                 residual_idx = residual_row + feature
                 residual_value = reg.scalar(f32, init=0.0)
                 x_value = reg.scalar(f32, init=0.0)
-                ptx.inst.ld.global_.f32(
-                    residual_value,
-                    ptx.addr(pr + residual_idx * 4),
-                    pred=in_bounds,
-                )
+                residual_value = load_data_f32(pr + residual_idx * elem_bytes, pred=in_bounds)
                 x_idx = x_sample_base + feature * time + time_idx
-                ptx.inst.ld.global_.f32(x_value, ptx.addr(px + x_idx * 4), pred=in_bounds)
+                x_value = load_data_f32(px + x_idx * elem_bytes, pred=in_bounds)
                 ptx.selp(f32, x_value, x_value, zero, keep)
                 y = reg.scalar(f32)
                 ptx.inst.add.f32(y, residual_value, x_value)
-                ptx.inst.st.global_.f32(ptx.addr(po + residual_idx * 4), y, pred=in_bounds)
+                store_data_f32(po + residual_idx * elem_bytes, y, pred=in_bounds)
         ptx.ret()
 
     return conv_output_epilogue
@@ -743,20 +845,40 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: st
 
 @lru_cache(maxsize=128)
 def _build_swoosh_kernel(
-    total: int, offset: float, linear_scale: float, constant: float, arch: str
+    total: int, offset: float, linear_scale: float, constant: float, dtype: str, arch: str
 ):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import f32, pred, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
     block = 256
     grid_x = (total + block - 1) // block
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
     @kernel(
-        in_specs=(Tile(total, f32),),
-        out_specs=(Tile(total, f32),),
+        in_specs=(Tile(total, data_t),),
+        out_specs=(Tile(total, data_t),),
         grid=(grid_x, 1, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -778,8 +900,7 @@ def _build_swoosh_kernel(
 
         in_bounds = reg.scalar(pred)
         ptx.inst.setp.lt.u32(in_bounds, idx, total)
-        xv = reg.scalar(f32, init=0.0)
-        ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
+        xv = load_data_f32(px + idx * elem_bytes, pred=in_bounds)
         shifted = reg.scalar(f32)
         ptx.inst.sub.f32(shifted, xv, offset_reg)
         abs_shifted = reg.scalar(f32)
@@ -804,32 +925,52 @@ def _build_swoosh_kernel(
         y = reg.scalar(f32)
         ptx.inst.fma.rn.f32(y, xv, linear_scale_reg, softplus)
         ptx.inst.sub.f32(y, y, constant_reg)
-        ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+        store_data_f32(po + idx * elem_bytes, y, pred=in_bounds)
         ptx.ret()
 
     return swoosh
 
 
 @lru_cache(maxsize=128)
-def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
+def _build_gated_linear_unit_kernel(m: int, f2: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import f32, pred, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
     f = f2 // 2
     total = m * f
     scalar_block = 256
     scalar_grid_x = (total + scalar_block - 1) // scalar_block
-    v4_block = _pick_v4_block_or_none(f)
+    v4_block = _pick_v4_block_or_none(f) if dtype == "f32" else None
     use_v4 = v4_block is not None
     block = v4_block if v4_block is not None else scalar_block
     v4_iters = f // (block * 4) if use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
     @kernel(
-        in_specs=(Tile(m, f2, f32),),
-        out_specs=(Tile(m, f, f32),),
+        in_specs=(Tile(m, f2, data_t),),
+        out_specs=(Tile(m, f, data_t),),
         grid=(m if use_v4 else scalar_grid_x, 1, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -859,16 +1000,16 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
 
         if use_v4:
             row = block_idx
-            pp += row * (f2 * 4)
-            po += row * (f * 4)
+            pp += row * (f2 * elem_bytes)
+            po += row * (f * elem_bytes)
             elem_base = tid << 2
             for j in range(v4_iters):
                 idx = elem_base if j == 0 else elem_base + (j * block * 4)
-                off = idx * 4
+                off = idx * elem_bytes
                 x_vals = [reg.scalar(f32) for _ in range(4)]
                 gate_vals = [reg.scalar(f32) for _ in range(4)]
                 ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(pp + off))
-                ptx.inst.ld.global_.v4.f32(gate_vals, ptx.addr(pp + (f * 4) + off))
+                ptx.inst.ld.global_.v4.f32(gate_vals, ptx.addr(pp + (f * elem_bytes) + off))
                 ptx.inst.st.global_.v4.f32(
                     ptx.addr(po + off),
                     [emit_one(x_vals[sub], gate_vals[sub]) for sub in range(4)],
@@ -881,41 +1022,51 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
             ptx.inst.div.u32(row, linear, f)
             col = linear - row * f
             row_base = row * f2
-            x_value = reg.scalar(f32, init=0.0)
-            gate_value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(
-                x_value,
-                ptx.addr(pp + (row_base + col) * 4),
-                pred=in_bounds,
-            )
-            ptx.inst.ld.global_.f32(
-                gate_value,
-                ptx.addr(pp + (row_base + f + col) * 4),
-                pred=in_bounds,
-            )
+            x_value = load_data_f32(pp + (row_base + col) * elem_bytes, pred=in_bounds)
+            gate_value = load_data_f32(pp + (row_base + f + col) * elem_bytes, pred=in_bounds)
             y = emit_one(x_value, gate_value)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y, pred=in_bounds)
+            store_data_f32(po + linear * elem_bytes, y, pred=in_bounds)
         ptx.ret()
 
     return gated_linear_unit
 
 
 @lru_cache(maxsize=128)
-def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
+def _build_bias_norm_kernel(rows: int, dim: int, eps: float, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg, smem
-    from pyptx.types import f32, pred, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
     warp_size = 32
     block = 256
     num_warps = block // warp_size
     items_per_thread = (dim + block - 1) // block
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
     @kernel(
-        in_specs=(Tile(rows, dim, f32), Tile(dim, f32), Tile(1, f32)),
-        out_specs=(Tile(rows, dim, f32),),
+        in_specs=(Tile(rows, dim, data_t), Tile(dim, data_t), Tile(1, data_t)),
+        out_specs=(Tile(rows, dim, data_t),),
         grid=(rows, 1, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -931,7 +1082,7 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
         lane = tid & (warp_size - 1)
         warp_id = tid >> 5
-        row_byte_off = row * (dim * 4)
+        row_byte_off = row * (dim * elem_bytes)
         px += row_byte_off
         po += row_byte_off
 
@@ -940,10 +1091,8 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
             idx = tid if i == 0 else tid + (i * block)
             in_bounds = reg.scalar(pred)
             ptx.inst.setp.lt.u32(in_bounds, idx, dim)
-            xv = reg.scalar(f32, init=0.0)
-            bv = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
-            ptx.inst.ld.global_.f32(bv, ptx.addr(pb + idx * 4), pred=in_bounds)
+            xv = load_data_f32(px + idx * elem_bytes, pred=in_bounds)
+            bv = load_data_f32(pb + idx * elem_bytes, pred=in_bounds)
             diff = reg.scalar(f32)
             ptx.inst.sub.f32(diff, xv, bv)
             ptx.inst.fma.rn.f32(sum_sq, diff, diff, sum_sq)
@@ -968,8 +1117,7 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
         ptx.inst.add.f32(mean_sq, mean_sq, eps_reg)
         rstd = reg.scalar(f32)
         ptx.inst.rsqrt.approx.f32(rstd, mean_sq)
-        ls = reg.scalar(f32)
-        ptx.inst.ld.global_.f32(ls, ptx.addr(pls))
+        ls = load_data_f32(pls)
         exp_arg = reg.scalar(f32)
         ptx.inst.mul.f32(exp_arg, ls, _LOG2E)
         scale = reg.scalar(f32)
@@ -980,11 +1128,10 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
             idx = tid if i == 0 else tid + (i * block)
             in_bounds = reg.scalar(pred)
             ptx.inst.setp.lt.u32(in_bounds, idx, dim)
-            xv = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
+            xv = load_data_f32(px + idx * elem_bytes, pred=in_bounds)
             y = reg.scalar(f32)
             ptx.inst.mul.f32(y, xv, scale)
-            ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+            store_data_f32(po + idx * elem_bytes, y, pred=in_bounds)
         ptx.ret()
 
     return bias_norm
@@ -1085,7 +1232,7 @@ def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | Non
 
 
 def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
-    if not _is_inference_cuda_f32(x, scale, bias) or x.dim() < 1:
+    if not _is_inference_cuda_float(x, scale, bias) or x.dim() < 1:
         _LOGGER.debug(
             "using torch scale_bias fallback shape=%s device=%s dtype=%s",
             tuple(x.shape),
@@ -1095,8 +1242,9 @@ def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
         return x * scale + bias
     flat, original_shape = _flat_2d(x)
     try:
-        kernel = _build_scale_bias_kernel(flat.size(0), flat.size(1), _arch_for(x))
-        _log_kernel_use_once("scale_bias", flat.size(0), flat.size(1), _arch_for(x))
+        dtype = _float_dtype_key(x)
+        kernel = _build_scale_bias_kernel(flat.size(0), flat.size(1), dtype, _arch_for(x))
+        _log_kernel_use_once("scale_bias", flat.size(0), flat.size(1), dtype, _arch_for(x))
         return _launch_pyptx_kernel(kernel, flat, scale, bias).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
@@ -1118,7 +1266,7 @@ def silu_time_mask_or_torch(x: Tensor, mask: Tensor, *, layout: str = "bdt") -> 
         layout not in {"btd", "bdt"}
         or torch.is_grad_enabled()
         or x.dim() != 3
-        or not _is_inference_cuda_f32(x)
+        or not _is_inference_cuda_float(x)
         or not _is_cuda_bool(mask)
     ):
         return torch_silu_mask()
@@ -1128,8 +1276,9 @@ def silu_time_mask_or_torch(x: Tensor, mask: Tensor, *, layout: str = "bdt") -> 
     if mask.shape != (batch, time):
         return torch_silu_mask()
     try:
-        kernel = _build_silu_time_mask_kernel(batch, time, dim, layout, _arch_for(x))
-        _log_kernel_use_once("silu_time_mask", batch, time, dim, layout, _arch_for(x))
+        dtype = _float_dtype_key(x)
+        kernel = _build_silu_time_mask_kernel(batch, time, dim, layout, dtype, _arch_for(x))
+        _log_kernel_use_once("silu_time_mask", batch, time, dim, layout, dtype, _arch_for(x))
         return _launch_pyptx_kernel(kernel, x, mask)
     except Exception as exc:
         _LOGGER.debug(
@@ -1154,15 +1303,17 @@ def conv_output_epilogue_or_torch(residual: Tensor, x_bdt: Tensor, mask: Tensor)
         or residual.size(2) != x_bdt.size(1)
         or mask.shape != (residual.size(0), residual.size(1))
         or torch.is_grad_enabled()
-        or not _is_inference_cuda_f32(residual, x_bdt)
+        or not _is_inference_cuda_float(residual, x_bdt)
         or not _is_cuda_bool(mask)
     ):
         return torch_epilogue()
     try:
+        dtype = _float_dtype_key(residual)
         kernel = _build_conv_output_epilogue_kernel(
             residual.size(0),
             residual.size(1),
             residual.size(2),
+            dtype,
             _arch_for(residual),
         )
         _log_kernel_use_once(
@@ -1170,6 +1321,7 @@ def conv_output_epilogue_or_torch(residual: Tensor, x_bdt: Tensor, mask: Tensor)
             residual.size(0),
             residual.size(1),
             residual.size(2),
+            dtype,
             _arch_for(residual),
         )
         return _launch_pyptx_kernel(kernel, residual, x_bdt, mask)
@@ -1209,18 +1361,20 @@ def _swoosh_or_torch(
     def torch_swoosh() -> Tensor:
         return F.softplus(x - offset) + linear_scale * x - constant
 
-    if not _is_inference_cuda_f32(x) or x.dim() < 1:
+    if not _is_inference_cuda_float(x) or x.dim() < 1:
         return torch_swoosh()
     flat, original_shape = _flat_1d(x)
     try:
+        dtype = _float_dtype_key(x)
         kernel = _build_swoosh_kernel(
             flat.numel(),
             float(offset),
             float(linear_scale),
             float(constant),
+            dtype,
             _arch_for(x),
         )
-        _log_kernel_use_once(name, flat.numel(), _arch_for(x))
+        _log_kernel_use_once(name, flat.numel(), dtype, _arch_for(x))
         return _launch_pyptx_kernel(kernel, flat).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
@@ -1236,16 +1390,23 @@ def gated_linear_unit_or_torch(projected: Tensor) -> Tensor:
     if projected.size(-1) % 2 != 0:
         x, gate = projected.chunk(2, dim=-1)
         return x * torch.sigmoid(gate)
-    if not _is_inference_cuda_f32(projected) or projected.dim() < 1:
+    if not _is_inference_cuda_float(projected) or projected.dim() < 1:
         x, gate = projected.chunk(2, dim=-1)
         return x * torch.sigmoid(gate)
     flat, original_shape = _flat_2d(projected)
     try:
-        kernel = _build_gated_linear_unit_kernel(flat.size(0), flat.size(1), _arch_for(projected))
+        dtype = _float_dtype_key(projected)
+        kernel = _build_gated_linear_unit_kernel(
+            flat.size(0),
+            flat.size(1),
+            dtype,
+            _arch_for(projected),
+        )
         _log_kernel_use_once(
             "gated_linear_unit",
             flat.size(0),
             flat.size(1),
+            dtype,
             _arch_for(projected),
         )
         return _launch_pyptx_kernel(kernel, flat).reshape(
@@ -1272,13 +1433,27 @@ def bias_norm_or_torch(x: Tensor, bias: Tensor, log_scale: Tensor, eps: float) -
         x.dim() < 1
         or x.size(-1) != bias.numel()
         or log_scale.numel() != 1
-        or not _is_inference_cuda_f32(x, bias, log_scale)
+        or not _is_inference_cuda_float(x, bias, log_scale)
     ):
         return torch_bias_norm()
     flat, original_shape = _flat_2d(x)
     try:
-        kernel = _build_bias_norm_kernel(flat.size(0), flat.size(1), float(eps), _arch_for(x))
-        _log_kernel_use_once("bias_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
+        dtype = _float_dtype_key(x)
+        kernel = _build_bias_norm_kernel(
+            flat.size(0),
+            flat.size(1),
+            float(eps),
+            dtype,
+            _arch_for(x),
+        )
+        _log_kernel_use_once(
+            "bias_norm",
+            flat.size(0),
+            flat.size(1),
+            float(eps),
+            dtype,
+            _arch_for(x),
+        )
         return _launch_pyptx_kernel(kernel, flat, bias, log_scale.reshape(1)).reshape(
             original_shape
         )
@@ -1361,7 +1536,7 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
         or attention_mask.shape != hidden.shape[:2]
         or not (
             hidden.is_cuda
-            and hidden.dtype == torch.float32
+            and hidden.dtype in {torch.float32, torch.bfloat16}
             and hidden.is_contiguous()
             and _is_cuda_int64(attention_mask)
         )
@@ -1377,10 +1552,12 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden * mask).sum(dim=1) / denom
     try:
+        dtype = _float_dtype_key(hidden)
         kernel = _build_masked_mean_kernel(
             hidden.size(0),
             hidden.size(1),
             hidden.size(2),
+            dtype,
             _arch_for(hidden),
         )
         _log_kernel_use_once(
@@ -1388,6 +1565,7 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
             hidden.size(0),
             hidden.size(1),
             hidden.size(2),
+            dtype,
             _arch_for(hidden),
         )
         return _launch_pyptx_kernel(kernel, hidden, attention_mask)
