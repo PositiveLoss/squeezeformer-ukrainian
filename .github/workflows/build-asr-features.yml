@@ -18,6 +18,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   binary:
     name: Build Linux binary
@@ -42,14 +46,14 @@ jobs:
           cargo build \
             --release \
             --locked \
-            --manifest-path rust_feature_cache_warmer/Cargo.toml \
+            --manifest-path rust/Cargo.toml \
             --bin asr-features \
-            --features bundled-ffmpeg
+            --features cli,bundled-ffmpeg
 
       - name: Package binary
         run: |
           mkdir -p dist
-          tar -C rust_feature_cache_warmer/target/release \
+          tar -C rust/target/release \
             -czf dist/asr-features-x86_64-unknown-linux-gnu.tar.gz \
             asr-features
 
@@ -61,8 +65,18 @@ jobs:
           if-no-files-found: error
 
   wheel:
-    name: Build Python 3.10+ wheel
-    runs-on: ubuntu-latest
+    name: Build Python 3.10+ wheel (${{ matrix.platform.name }})
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux
+            runner: ubuntu-latest
+          - name: windows
+            runner: windows-latest
+          - name: macos
+            runner: macos-latest
 
     steps:
       - name: Check out repository
@@ -73,11 +87,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install bundled FFmpeg build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang nasm pkg-config
-
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
@@ -87,18 +96,18 @@ jobs:
         run: python -m pip install --upgrade "maturin>=1.9,<2"
 
       - name: Build abi3 wheel with Python feature
-        working-directory: rust_feature_cache_warmer
+        working-directory: rust
         run: |
           python -m maturin build \
             --release \
             --locked \
-            --features python,bundled-ffmpeg \
+            --features python \
             --out ../dist/wheels
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: asr-features-python310-plus-wheel
+          name: asr-features-${{ matrix.platform.name }}-python310-plus-wheel
           path: dist/wheels/*.whl
           if-no-files-found: error
 
@@ -121,11 +130,12 @@ jobs:
           name: asr-features-x86_64-unknown-linux-gnu
           path: release-assets
 
-      - name: Download wheel artifact
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
-          name: asr-features-python310-plus-wheel
+          pattern: asr-features-*-python310-plus-wheel
           path: release-assets
+          merge-multiple: true
 
       - name: Resolve release tag
         id: release
