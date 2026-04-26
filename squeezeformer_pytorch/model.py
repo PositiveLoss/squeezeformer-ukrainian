@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from .masking import make_attention_mask, make_sequence_mask
+from .pyptx_kernels import scale_bias_or_torch, silu_or_torch
 
 try:
     import transformer_engine.pytorch as te
@@ -187,7 +188,7 @@ class ScaleBiasLayer(nn.Module):
         self.bias = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        return x * self.scale + self.bias
+        return scale_bias_or_torch(x, self.scale, self.bias)
 
 
 class RelativePositionalEncoding(nn.Module):
@@ -298,7 +299,6 @@ class FeedForwardModule(nn.Module):
             expansion_factor * dim,
             use_transformer_engine=use_transformer_engine,
         )
-        self.activation = nn.SiLU()
         self.dropout1 = nn.Dropout(dropout)
         self.linear2 = make_linear(
             expansion_factor * dim,
@@ -312,7 +312,7 @@ class FeedForwardModule(nn.Module):
         residual = x
         x = self.input_transform(x)
         x = apply_linear_with_fp8_padding(self.linear1, x)
-        x = self.activation(x)
+        x = silu_or_torch(x)
         x = self.dropout1(x)
         x = apply_linear_with_fp8_padding(self.linear2, x)
         x = self.dropout2(x)
@@ -370,7 +370,6 @@ class ConvolutionModule(nn.Module):
             else make_layer_norm(dim, use_transformer_engine=use_transformer_engine)
         )
         self.pointwise_in = nn.Conv1d(dim, hidden_dim, kernel_size=1)
-        self.activation1 = nn.SiLU()
         self.depthwise = nn.Conv1d(
             hidden_dim,
             hidden_dim,
@@ -378,7 +377,6 @@ class ConvolutionModule(nn.Module):
             padding=kernel_size // 2,
             groups=hidden_dim,
         )
-        self.activation2 = nn.SiLU()
         self.pointwise_out = nn.Conv1d(hidden_dim, dim, kernel_size=1)
         self.dropout = nn.Dropout(dropout)
 
@@ -388,14 +386,14 @@ class ConvolutionModule(nn.Module):
         x = x.transpose(1, 2)
         mask = pad_mask.unsqueeze(1).to(dtype=x.dtype) if pad_mask is not None else None
         x = self.pointwise_in(x)
-        x = self.activation1(x)
+        x = silu_or_torch(x)
         if mask is not None:
             x = x * mask
         x = self.depthwise(x)
         if mask is not None:
             x = x * mask
         x = x.transpose(1, 2)
-        x = self.activation2(x)
+        x = silu_or_torch(x)
         if pad_mask is not None:
             x = x * pad_mask.unsqueeze(-1).to(dtype=x.dtype)
         x = x.transpose(1, 2)
