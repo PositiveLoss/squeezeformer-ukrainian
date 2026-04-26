@@ -246,7 +246,7 @@ def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
     def load_data_f32(ptr):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr))
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -255,7 +255,7 @@ def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
 
     def store_data_f32(ptr, value):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
         else:
@@ -331,7 +331,7 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, dtype: str, arch:
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -340,7 +340,7 @@ def _build_masked_mean_kernel(batch: int, time: int, dim: int, dtype: str, arch:
 
     def store_data_f32(ptr, value):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
         else:
@@ -591,7 +591,7 @@ def _build_silu_time_mask_kernel(
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -600,7 +600,7 @@ def _build_silu_time_mask_kernel(
 
     def store_data_f32(ptr, value, *, pred=None):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
         else:
@@ -758,7 +758,7 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, dtype: s
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -767,7 +767,7 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, dtype: s
 
     def store_data_f32(ptr, value, *, pred=None):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
         else:
@@ -858,7 +858,7 @@ def _build_swoosh_kernel(
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -867,7 +867,7 @@ def _build_swoosh_kernel(
 
     def store_data_f32(ptr, value, *, pred=None):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
         else:
@@ -950,7 +950,7 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, dtype: str, arch: str):
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -959,7 +959,7 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, dtype: str, arch: str):
 
     def store_data_f32(ptr, value, *, pred=None):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
         else:
@@ -1046,7 +1046,7 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, dtype: str, arch: s
     def load_data_f32(ptr, *, pred=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
@@ -1055,7 +1055,7 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, dtype: str, arch: s
 
     def store_data_f32(ptr, value, *, pred=None):
         if dtype == "bf16":
-            raw = reg.scalar(b16)
+            raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
             ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
         else:
