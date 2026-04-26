@@ -117,6 +117,15 @@ def _pick_block(n: int) -> int:
     raise ValueError(f"feature dimension {n} is not supported by pyptx fast kernels")
 
 
+def _pick_v4_block(n: int) -> int:
+    if n % 4 != 0:
+        raise ValueError(f"dimension {n} is not divisible by 4")
+    for block in (256, 128, 64, 32):
+        if n % (block * 4) == 0:
+            return block
+    raise ValueError(f"dimension {n} is not supported by pyptx v4 kernels")
+
+
 def _flat_2d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
     original_shape = tuple(x.shape)
     return x.reshape(-1, original_shape[-1]), original_shape
@@ -948,9 +957,15 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
 
     from pyptx import Tile, kernel, ptx, reg
 
-    block = 256
     total = batch * time * dim
-    grid_x = (total + block - 1) // block
+    scalar_block = 256
+    scalar_grid_x = (total + scalar_block - 1) // scalar_block
+    btd_use_v4 = dim % 4 == 0
+    btd_block = _pick_v4_block(dim) if btd_use_v4 else scalar_block
+    btd_v4_iters = dim // (btd_block * 4) if btd_use_v4 else 0
+    bdt_use_v4 = time % 4 == 0
+    bdt_block = _pick_v4_block(time) if bdt_use_v4 else scalar_block
+    bdt_v4_iters = time // (bdt_block * 4) if bdt_use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     def emit_silu(xv):
@@ -971,8 +986,8 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
     @kernel(
         in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
         out_specs=(Tile(batch, time, dim, f32),),
-        grid=(grid_x, 1, 1),
-        block=(block, 1, 1),
+        grid=(batch * time if btd_use_v4 else scalar_grid_x, 1, 1),
+        block=(btd_block, 1, 1),
         arch=arch,
         version=version,
     )
@@ -982,29 +997,51 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
         block_idx = reg.scalar(u32)
         ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
-        linear = block_idx * block + tid
         zero = reg.scalar(f32, init=0.0)
 
-        in_bounds = reg.scalar(pred)
-        ptx.inst.setp.lt.u32(in_bounds, linear, total)
-        bt = reg.scalar(u32)
-        ptx.inst.div.u32(bt, linear, dim)
-        mask_value = reg.scalar(u32, init=0)
-        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
-        keep = reg.scalar(pred)
-        ptx.inst.setp.ne.u32(keep, mask_value, 0)
-        x_value = reg.scalar(f32, init=0.0)
-        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
-        y_value = emit_silu(x_value)
-        ptx.selp(f32, y_value, y_value, zero, keep)
-        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        if btd_use_v4:
+            row = block_idx
+            row_byte_off = row * (dim * 4)
+            px += row_byte_off
+            po += row_byte_off
+            mask_value = reg.scalar(u32, init=0)
+            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + row))
+            keep = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(keep, mask_value, 0)
+            elem_base = tid << 2
+            for j in range(btd_v4_iters):
+                idx = elem_base if j == 0 else elem_base + (j * btd_block * 4)
+                off = idx * 4
+                x_vals = [reg.scalar(f32) for _ in range(4)]
+                ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(px + off))
+                y_vals = []
+                for sub in range(4):
+                    y_value = emit_silu(x_vals[sub])
+                    ptx.selp(f32, y_value, y_value, zero, keep)
+                    y_vals.append(y_value)
+                ptx.inst.st.global_.v4.f32(ptx.addr(po + off), y_vals)
+        else:
+            linear = block_idx * scalar_block + tid
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            bt = reg.scalar(u32)
+            ptx.inst.div.u32(bt, linear, dim)
+            mask_value = reg.scalar(u32, init=0)
+            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
+            keep = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(keep, mask_value, 0)
+            x_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            y_value = emit_silu(x_value)
+            ptx.selp(f32, y_value, y_value, zero, keep)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
         ptx.ret()
 
     @kernel(
         in_specs=(Tile(batch, dim, time, f32), Tile(batch, time, pred)),
         out_specs=(Tile(batch, dim, time, f32),),
-        grid=(grid_x, 1, 1),
-        block=(block, 1, 1),
+        grid=(batch * dim if bdt_use_v4 else scalar_grid_x, 1, 1),
+        block=(bdt_block, 1, 1),
         arch=arch,
         version=version,
     )
@@ -1014,26 +1051,51 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
         block_idx = reg.scalar(u32)
         ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
-        linear = block_idx * block + tid
         zero = reg.scalar(f32, init=0.0)
 
-        in_bounds = reg.scalar(pred)
-        ptx.inst.setp.lt.u32(in_bounds, linear, total)
-        sample = reg.scalar(u32)
-        ptx.inst.div.u32(sample, linear, dim * time)
-        rem = linear - sample * (dim * time)
-        t = reg.scalar(u32)
-        ptx.inst.rem.u32(t, rem, time)
-        mask_idx = sample * time + t
-        mask_value = reg.scalar(u32, init=0)
-        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
-        keep = reg.scalar(pred)
-        ptx.inst.setp.ne.u32(keep, mask_value, 0)
-        x_value = reg.scalar(f32, init=0.0)
-        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
-        y_value = emit_silu(x_value)
-        ptx.selp(f32, y_value, y_value, zero, keep)
-        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        if bdt_use_v4:
+            row = block_idx
+            row_byte_off = row * (time * 4)
+            px += row_byte_off
+            po += row_byte_off
+            sample = reg.scalar(u32)
+            ptx.inst.div.u32(sample, row, dim)
+            mask_row = sample * time
+            elem_base = tid << 2
+            for j in range(bdt_v4_iters):
+                idx = elem_base if j == 0 else elem_base + (j * bdt_block * 4)
+                off = idx * 4
+                x_vals = [reg.scalar(f32) for _ in range(4)]
+                ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(px + off))
+                y_vals = []
+                for sub in range(4):
+                    mask_value = reg.scalar(u32, init=0)
+                    ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_row + idx + sub))
+                    keep = reg.scalar(pred)
+                    ptx.inst.setp.ne.u32(keep, mask_value, 0)
+                    y_value = emit_silu(x_vals[sub])
+                    ptx.selp(f32, y_value, y_value, zero, keep)
+                    y_vals.append(y_value)
+                ptx.inst.st.global_.v4.f32(ptx.addr(po + off), y_vals)
+        else:
+            linear = block_idx * scalar_block + tid
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            sample = reg.scalar(u32)
+            ptx.inst.div.u32(sample, linear, dim * time)
+            rem = linear - sample * (dim * time)
+            t = reg.scalar(u32)
+            ptx.inst.rem.u32(t, rem, time)
+            mask_idx = sample * time + t
+            mask_value = reg.scalar(u32, init=0)
+            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
+            keep = reg.scalar(pred)
+            ptx.inst.setp.ne.u32(keep, mask_value, 0)
+            x_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+            y_value = emit_silu(x_value)
+            ptx.selp(f32, y_value, y_value, zero, keep)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
         ptx.ret()
 
     return silu_mask_bdt if layout == "bdt" else silu_mask_btd
@@ -1048,7 +1110,8 @@ def _build_residual_add_kernel(total: int, scale: float, arch: str):
     from pyptx import Tile, kernel, ptx, reg
 
     block = 256
-    grid_x = (total + block - 1) // block
+    use_v4 = total % (block * 4) == 0
+    grid_x = (total + (block * 4 if use_v4 else block) - 1) // (block * 4 if use_v4 else block)
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
@@ -1065,18 +1128,32 @@ def _build_residual_add_kernel(total: int, scale: float, arch: str):
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
         block_idx = reg.scalar(u32)
         ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
-        idx = block_idx * block + tid
         scale_reg = reg.scalar(f32, init=scale)
 
-        in_bounds = reg.scalar(pred)
-        ptx.inst.setp.lt.u32(in_bounds, idx, total)
-        residual_value = reg.scalar(f32, init=0.0)
-        x_value = reg.scalar(f32, init=0.0)
-        ptx.inst.ld.global_.f32(residual_value, ptx.addr(pr + idx * 4), pred=in_bounds)
-        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + idx * 4), pred=in_bounds)
-        y = reg.scalar(f32)
-        ptx.inst.fma.rn.f32(y, x_value, scale_reg, residual_value)
-        ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+        if use_v4:
+            idx = (block_idx * block + tid) << 2
+            off = idx * 4
+            residual_vals = [reg.scalar(f32) for _ in range(4)]
+            x_vals = [reg.scalar(f32) for _ in range(4)]
+            ptx.inst.ld.global_.v4.f32(residual_vals, ptx.addr(pr + off))
+            ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(px + off))
+            y_vals = []
+            for sub in range(4):
+                y = reg.scalar(f32)
+                ptx.inst.fma.rn.f32(y, x_vals[sub], scale_reg, residual_vals[sub])
+                y_vals.append(y)
+            ptx.inst.st.global_.v4.f32(ptx.addr(po + off), y_vals)
+        else:
+            idx = block_idx * block + tid
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, idx, total)
+            residual_value = reg.scalar(f32, init=0.0)
+            x_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(residual_value, ptx.addr(pr + idx * 4), pred=in_bounds)
+            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + idx * 4), pred=in_bounds)
+            y = reg.scalar(f32)
+            ptx.inst.fma.rn.f32(y, x_value, scale_reg, residual_value)
+            ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
         ptx.ret()
 
     return residual_add
@@ -1160,16 +1237,19 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
 
     from pyptx import Tile, kernel, ptx, reg
 
-    block = 256
     f = f2 // 2
     total = m * f
-    grid_x = (total + block - 1) // block
+    scalar_block = 256
+    scalar_grid_x = (total + scalar_block - 1) // scalar_block
+    use_v4 = f % 4 == 0
+    block = _pick_v4_block(f) if use_v4 else scalar_block
+    v4_iters = f // (block * 4) if use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
         in_specs=(Tile(m, f2, f32),),
         out_specs=(Tile(m, f, f32),),
-        grid=(grid_x, 1, 1),
+        grid=(m if use_v4 else scalar_grid_x, 1, 1),
         block=(block, 1, 1),
         arch=arch,
         version=version,
@@ -1180,39 +1260,60 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
         block_idx = reg.scalar(u32)
         ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
-        linear = block_idx * block + tid
         neg_log2e = reg.scalar(f32, init=-_LOG2E)
         one = reg.scalar(f32, init=1.0)
 
-        in_bounds = reg.scalar(pred)
-        ptx.inst.setp.lt.u32(in_bounds, linear, total)
-        row = reg.scalar(u32)
-        ptx.inst.div.u32(row, linear, f)
-        col = linear - row * f
-        row_base = row * f2
-        x_value = reg.scalar(f32, init=0.0)
-        gate_value = reg.scalar(f32, init=0.0)
-        ptx.inst.ld.global_.f32(
-            x_value,
-            ptx.addr(pp + (row_base + col) * 4),
-            pred=in_bounds,
-        )
-        ptx.inst.ld.global_.f32(
-            gate_value,
-            ptx.addr(pp + (row_base + f + col) * 4),
-            pred=in_bounds,
-        )
-        neg_gate = reg.scalar(f32)
-        ptx.inst.mul.f32(neg_gate, gate_value, neg_log2e)
-        exp_neg = reg.scalar(f32)
-        ptx.inst.ex2.approx.f32(exp_neg, neg_gate)
-        denom = reg.scalar(f32)
-        ptx.inst.add.f32(denom, one, exp_neg)
-        sigm = reg.scalar(f32)
-        ptx.inst.rcp.approx.f32(sigm, denom)
-        y = reg.scalar(f32)
-        ptx.inst.mul.f32(y, x_value, sigm)
-        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y, pred=in_bounds)
+        def emit_one(x_value, gate_value):
+            neg_gate = reg.scalar(f32)
+            ptx.inst.mul.f32(neg_gate, gate_value, neg_log2e)
+            exp_neg = reg.scalar(f32)
+            ptx.inst.ex2.approx.f32(exp_neg, neg_gate)
+            denom = reg.scalar(f32)
+            ptx.inst.add.f32(denom, one, exp_neg)
+            sigm = reg.scalar(f32)
+            ptx.inst.rcp.approx.f32(sigm, denom)
+            y = reg.scalar(f32)
+            ptx.inst.mul.f32(y, x_value, sigm)
+            return y
+
+        if use_v4:
+            row = block_idx
+            pp += row * (f2 * 4)
+            po += row * (f * 4)
+            elem_base = tid << 2
+            for j in range(v4_iters):
+                idx = elem_base if j == 0 else elem_base + (j * block * 4)
+                off = idx * 4
+                x_vals = [reg.scalar(f32) for _ in range(4)]
+                gate_vals = [reg.scalar(f32) for _ in range(4)]
+                ptx.inst.ld.global_.v4.f32(x_vals, ptx.addr(pp + off))
+                ptx.inst.ld.global_.v4.f32(gate_vals, ptx.addr(pp + (f * 4) + off))
+                ptx.inst.st.global_.v4.f32(
+                    ptx.addr(po + off),
+                    [emit_one(x_vals[sub], gate_vals[sub]) for sub in range(4)],
+                )
+        else:
+            linear = block_idx * scalar_block + tid
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, linear, total)
+            row = reg.scalar(u32)
+            ptx.inst.div.u32(row, linear, f)
+            col = linear - row * f
+            row_base = row * f2
+            x_value = reg.scalar(f32, init=0.0)
+            gate_value = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(
+                x_value,
+                ptx.addr(pp + (row_base + col) * 4),
+                pred=in_bounds,
+            )
+            ptx.inst.ld.global_.f32(
+                gate_value,
+                ptx.addr(pp + (row_base + f + col) * 4),
+                pred=in_bounds,
+            )
+            y = emit_one(x_value, gate_value)
+            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y, pred=in_bounds)
         ptx.ret()
 
     return gated_linear_unit
