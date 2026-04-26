@@ -27,7 +27,9 @@ from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
     gated_linear_unit_or_torch,
     layer_norm_or_torch,
     masked_mean_or_torch,
+    residual_add_or_torch,
     scale_bias_or_torch,
+    silu_time_mask_or_torch,
     sequence_mask_or_torch,
     silu_or_torch,
     squeezeformer_attention_mask_or_torch,
@@ -214,6 +216,22 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             lambda: F.silu(x),
         )
 
+    def silu_mask_bdt_case(device: torch.device):
+        x = torch.randn(batch, conv_dim, time, device=device)
+        mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
+        return (
+            lambda: silu_time_mask_or_torch(x, mask, layout="bdt"),
+            lambda: F.silu(x) * mask.unsqueeze(1).to(dtype=x.dtype),
+        )
+
+    def silu_mask_btd_case(device: torch.device):
+        x = torch.randn(batch, time, dim, device=device)
+        mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
+        return (
+            lambda: silu_time_mask_or_torch(x, mask, layout="btd"),
+            lambda: F.silu(x) * mask.unsqueeze(-1).to(dtype=x.dtype),
+        )
+
     def swoosh_l_case(device: torch.device):
         x = torch.randn(batch, time, hidden_dim, device=device)
         return (
@@ -233,6 +251,15 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         return (
             lambda: gated_linear_unit_or_torch(x),
             lambda: x[..., :dim] * torch.sigmoid(x[..., dim:]),
+        )
+
+    def residual_add_case(device: torch.device):
+        residual = torch.randn(batch, time, dim, device=device)
+        x = torch.randn(batch, time, dim, device=device)
+        scale = 0.5
+        return (
+            lambda: residual_add_or_torch(residual, x, scale),
+            lambda: residual + scale * x,
         )
 
     def bias_norm_case(device: torch.device):
@@ -280,9 +307,12 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         Case("layer_norm", layer_norm_case),
         Case("scale_bias", scale_bias_case),
         Case("silu", silu_case),
+        Case("silu_mask_bdt", silu_mask_bdt_case),
+        Case("silu_mask_btd", silu_mask_btd_case),
         Case("swoosh_l", swoosh_l_case),
         Case("swoosh_r", swoosh_r_case),
         Case("gated_linear_unit", gated_linear_unit_case),
+        Case("residual_add", residual_add_case),
         Case("bias_norm", bias_norm_case),
         Case("masked_mean", masked_mean_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),

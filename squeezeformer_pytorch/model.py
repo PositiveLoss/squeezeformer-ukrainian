@@ -14,7 +14,9 @@ from .masking import make_attention_mask, make_sequence_mask
 from .pyptx_kernels import (
     apply_time_mask_or_torch,
     layer_norm_or_torch,
+    residual_add_or_torch,
     scale_bias_or_torch,
+    silu_time_mask_or_torch,
     silu_or_torch,
     time_recovery_repeat_or_torch,
 )
@@ -333,7 +335,7 @@ class FeedForwardModule(nn.Module):
         x = self.dropout1(x)
         x = apply_linear_with_fp8_padding(self.linear2, x)
         x = self.dropout2(x)
-        return residual + self.residual_factor * x
+        return residual_add_or_torch(residual, x, self.residual_factor)
 
 
 class AttentionModule(nn.Module):
@@ -364,7 +366,7 @@ class AttentionModule(nn.Module):
         x = self.input_transform(x)
         x = self.attn(x, pos=pos, mask=mask)
         x = self.dropout(x)
-        return residual + x
+        return residual_add_or_torch(residual, x)
 
 
 class ConvolutionModule(nn.Module):
@@ -402,23 +404,25 @@ class ConvolutionModule(nn.Module):
         x = self.input_transform(x)
         x = x.transpose(1, 2)
         x = self.pointwise_in(x)
-        x = silu_or_torch(x)
         if pad_mask is not None:
-            x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
+            x = silu_time_mask_or_torch(x, pad_mask, layout="bdt")
+        else:
+            x = silu_or_torch(x)
         x = self.depthwise(x)
         if pad_mask is not None:
             x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = x.transpose(1, 2)
-        x = silu_or_torch(x)
         if pad_mask is not None:
-            x = apply_time_mask_or_torch(x, pad_mask, layout="btd")
+            x = silu_time_mask_or_torch(x, pad_mask, layout="btd")
+        else:
+            x = silu_or_torch(x)
         x = x.transpose(1, 2)
         x = self.pointwise_out(x)
         if pad_mask is not None:
             x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = x.transpose(1, 2)
         x = self.dropout(x)
-        return residual + x
+        return residual_add_or_torch(residual, x)
 
 
 class MHSAFFModule(nn.Module):
@@ -649,7 +653,8 @@ class TimeRecoveryLayer(nn.Module):
     def forward(self, x: Tensor, skip: Tensor) -> Tensor:
         target_length = skip.size(1)
         x = time_recovery_repeat_or_torch(x, target_length, self.stride)
-        return apply_linear_with_fp8_padding(self.proj, x) + skip
+        x = apply_linear_with_fp8_padding(self.proj, x)
+        return residual_add_or_torch(skip, x)
 
 
 @dataclass(frozen=True)

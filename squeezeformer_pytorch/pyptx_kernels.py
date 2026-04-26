@@ -916,6 +916,148 @@ def _build_silu_kernel(m: int, f: int, arch: str):
 
 
 @lru_cache(maxsize=128)
+def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    total = batch * time * dim
+    grid_x = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    def emit_silu(xv):
+        neg_log2e = reg.scalar(f32, init=-_LOG2E)
+        one = reg.scalar(f32, init=1.0)
+        neg_x = reg.scalar(f32)
+        ptx.inst.mul.f32(neg_x, xv, neg_log2e)
+        exp_neg = reg.scalar(f32)
+        ptx.inst.ex2.approx.f32(exp_neg, neg_x)
+        denom = reg.scalar(f32)
+        ptx.inst.add.f32(denom, one, exp_neg)
+        sigm = reg.scalar(f32)
+        ptx.inst.rcp.approx.f32(sigm, denom)
+        y = reg.scalar(f32)
+        ptx.inst.mul.f32(y, xv, sigm)
+        return y
+
+    @kernel(
+        in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, time, dim, f32),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def silu_mask_btd(x, mask, out):
+        px, pm, po = ptx.global_ptrs(x, mask, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        linear = block_idx * block + tid
+        zero = reg.scalar(f32, init=0.0)
+
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, linear, total)
+        bt = reg.scalar(u32)
+        ptx.inst.div.u32(bt, linear, dim)
+        mask_value = reg.scalar(u32, init=0)
+        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
+        keep = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(keep, mask_value, 0)
+        x_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+        y_value = emit_silu(x_value)
+        ptx.selp(f32, y_value, y_value, zero, keep)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        ptx.ret()
+
+    @kernel(
+        in_specs=(Tile(batch, dim, time, f32), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, dim, time, f32),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def silu_mask_bdt(x, mask, out):
+        px, pm, po = ptx.global_ptrs(x, mask, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        linear = block_idx * block + tid
+        zero = reg.scalar(f32, init=0.0)
+
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, linear, total)
+        sample = reg.scalar(u32)
+        ptx.inst.div.u32(sample, linear, dim * time)
+        rem = linear - sample * (dim * time)
+        t = reg.scalar(u32)
+        ptx.inst.rem.u32(t, rem, time)
+        mask_idx = sample * time + t
+        mask_value = reg.scalar(u32, init=0)
+        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
+        keep = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(keep, mask_value, 0)
+        x_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+        y_value = emit_silu(x_value)
+        ptx.selp(f32, y_value, y_value, zero, keep)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        ptx.ret()
+
+    return silu_mask_bdt if layout == "bdt" else silu_mask_btd
+
+
+@lru_cache(maxsize=128)
+def _build_residual_add_kernel(total: int, scale: float, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    grid_x = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(total, f32), Tile(total, f32)),
+        out_specs=(Tile(total, f32),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def residual_add(residual, x, out):
+        pr, px, po = ptx.global_ptrs(residual, x, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        idx = block_idx * block + tid
+        scale_reg = reg.scalar(f32, init=scale)
+
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, idx, total)
+        residual_value = reg.scalar(f32, init=0.0)
+        x_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(residual_value, ptx.addr(pr + idx * 4), pred=in_bounds)
+        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + idx * 4), pred=in_bounds)
+        y = reg.scalar(f32)
+        ptx.inst.fma.rn.f32(y, x_value, scale_reg, residual_value)
+        ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+        ptx.ret()
+
+    return residual_add
+
+
+@lru_cache(maxsize=128)
 def _build_swoosh_kernel(
     total: int, offset: float, linear_scale: float, constant: float, arch: str
 ):
@@ -1157,6 +1299,8 @@ def _disable_kernel_builders_for_torch_compile() -> None:
         "_build_time_recovery_repeat_kernel",
         "_build_ctc_log_prob_frame_stats_kernel",
         "_build_silu_kernel",
+        "_build_silu_time_mask_kernel",
+        "_build_residual_add_kernel",
         "_build_swoosh_kernel",
         "_build_gated_linear_unit_kernel",
         "_build_bias_norm_kernel",
@@ -1326,6 +1470,63 @@ def silu_or_torch(x: Tensor) -> Tensor:
             exc,
         )
         return F.silu(x)
+
+
+def silu_time_mask_or_torch(x: Tensor, mask: Tensor, *, layout: str = "bdt") -> Tensor:
+    def torch_silu_mask() -> Tensor:
+        y = F.silu(x)
+        if layout == "bdt":
+            return y * mask.unsqueeze(1).to(dtype=x.dtype)
+        return y * mask.unsqueeze(-1).to(dtype=x.dtype)
+
+    if (
+        layout not in {"btd", "bdt"}
+        or torch.is_grad_enabled()
+        or x.dim() != 3
+        or not _is_inference_cuda_f32(x)
+        or not _is_cuda_bool(mask)
+    ):
+        return torch_silu_mask()
+    batch = x.size(0)
+    time = x.size(2) if layout == "bdt" else x.size(1)
+    dim = x.size(1) if layout == "bdt" else x.size(2)
+    if mask.shape != (batch, time):
+        return torch_silu_mask()
+    try:
+        kernel = _build_silu_time_mask_kernel(batch, time, dim, layout, _arch_for(x))
+        _log_kernel_use_once("silu_time_mask", batch, time, dim, layout, _arch_for(x))
+        return _launch_pyptx_kernel(kernel, x, mask)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch silu_time_mask fallback after pyptx failure shape=%s layout=%s: %s",
+            tuple(x.shape),
+            layout,
+            exc,
+        )
+        return torch_silu_mask()
+
+
+def residual_add_or_torch(residual: Tensor, x: Tensor, scale: float = 1.0) -> Tensor:
+    if (
+        residual.shape != x.shape
+        or not _is_inference_cuda_f32(residual, x)
+        or residual.dim() < 1
+    ):
+        return residual + float(scale) * x
+    residual_flat, original_shape = _flat_1d(residual)
+    x_flat, _ = _flat_1d(x)
+    try:
+        kernel = _build_residual_add_kernel(residual_flat.numel(), float(scale), _arch_for(x))
+        _log_kernel_use_once("residual_add", residual_flat.numel(), float(scale), _arch_for(x))
+        return _launch_pyptx_kernel(kernel, residual_flat, x_flat).reshape(original_shape)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch residual_add fallback after pyptx failure shape=%s scale=%s: %s",
+            original_shape,
+            scale,
+            exc,
+        )
+        return residual + float(scale) * x
 
 
 def swoosh_l_or_torch(x: Tensor) -> Tensor:
