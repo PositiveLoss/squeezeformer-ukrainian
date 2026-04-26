@@ -7,7 +7,6 @@ dependencies = [
     "asr-features>=0.1.0",
     "gradio>=5.38.0",
     "huggingface-hub>=0.34.0",
-    "kernels>=0.12.3",
     "safetensors>=0.6.2",
     "sentencepiece>=0.2.0",
     "torch>=2.9.0,<=2.11.0",
