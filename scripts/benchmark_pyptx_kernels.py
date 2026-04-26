@@ -23,6 +23,7 @@ from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
     bias_norm_or_torch,
     conv_output_epilogue_or_torch,
     ctc_log_prob_frame_stats_or_torch,
+    gated_linear_unit_bdt_or_torch,
     gated_linear_unit_or_torch,
     scale_bias_or_torch,
     silu_time_mask_or_torch,
@@ -225,6 +226,13 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             lambda: x[..., :dim] * torch.sigmoid(x[..., dim:]),
         )
 
+    def gated_linear_unit_bdt_case(device: torch.device):
+        x = randn(batch, conv_dim, time, device=device)
+        return (
+            lambda: gated_linear_unit_bdt_or_torch(x),
+            lambda: x[:, :dim, :] * torch.sigmoid(x[:, dim:, :]),
+        )
+
     def conv_output_epilogue_case(device: torch.device):
         residual = randn(batch, time, dim, device=device)
         x = randn(batch, dim, time, device=device)
@@ -263,6 +271,7 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         Case("swoosh_l", swoosh_l_case),
         Case("swoosh_r", swoosh_r_case),
         Case("gated_linear_unit", gated_linear_unit_case),
+        Case("gated_linear_unit_bdt", gated_linear_unit_bdt_case),
         Case("conv_output_epilogue", conv_output_epilogue_case),
         Case("bias_norm", bias_norm_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),

@@ -859,6 +859,89 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, dtype: str, arch: str):
 
 
 @lru_cache(maxsize=128)
+def _build_gated_linear_unit_bdt_kernel(batch: int, dim2: int, time: int, dtype: str, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import b16, bf16, f32, pred, u32
+
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
+    dim = dim2 // 2
+    total = batch * dim * time
+    block = 256
+    grid_x = (total + block - 1) // block
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
+
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16, init=0)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16, init=0)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
+    @kernel(
+        in_specs=(Tile(batch, dim2, time, data_t),),
+        out_specs=(Tile(batch, dim, time, data_t),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def gated_linear_unit_bdt(projected, out):
+        pp, po = ptx.global_ptrs(projected, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        linear = block_idx * block + tid
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, linear, total)
+
+        batch_stride = dim2 * time
+        out_batch_stride = dim * time
+        sample = reg.scalar(u32)
+        ptx.inst.div.u32(sample, linear, out_batch_stride)
+        rem = linear - sample * out_batch_stride
+        channel = reg.scalar(u32)
+        ptx.inst.div.u32(channel, rem, time)
+        time_idx = rem - channel * time
+
+        input_base = sample * batch_stride + channel * time + time_idx
+        gate_idx = input_base + dim * time
+        x_value = load_data_f32(pp + input_base * elem_bytes, pred=in_bounds)
+        gate_value = load_data_f32(pp + gate_idx * elem_bytes, pred=in_bounds)
+
+        neg_log2e = reg.scalar(f32, init=-_LOG2E)
+        one = reg.scalar(f32, init=1.0)
+        neg_gate = reg.scalar(f32)
+        ptx.inst.mul.f32(neg_gate, gate_value, neg_log2e)
+        exp_neg = reg.scalar(f32)
+        ptx.inst.ex2.approx.f32(exp_neg, neg_gate)
+        denom = reg.scalar(f32)
+        ptx.inst.add.f32(denom, one, exp_neg)
+        sigm = reg.scalar(f32)
+        ptx.inst.rcp.approx.f32(sigm, denom)
+        y = reg.scalar(f32)
+        ptx.inst.mul.f32(y, x_value, sigm)
+        store_data_f32(po + linear * elem_bytes, y, pred=in_bounds)
+        ptx.ret()
+
+    return gated_linear_unit_bdt
+
+
+@lru_cache(maxsize=128)
 def _build_bias_norm_kernel(rows: int, dim: int, eps: float, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
@@ -975,6 +1058,7 @@ def _disable_kernel_builders_for_torch_compile() -> None:
         "_build_conv_output_epilogue_kernel",
         "_build_swoosh_kernel",
         "_build_gated_linear_unit_kernel",
+        "_build_gated_linear_unit_bdt_kernel",
         "_build_bias_norm_kernel",
     ):
         globals()[name] = disable(
@@ -1198,6 +1282,41 @@ def gated_linear_unit_or_torch(projected: Tensor) -> Tensor:
             exc,
         )
         x, gate = projected.chunk(2, dim=-1)
+        return x * torch.sigmoid(gate)
+
+
+def gated_linear_unit_bdt_or_torch(projected: Tensor) -> Tensor:
+    if projected.dim() != 3 or projected.size(1) % 2 != 0:
+        x, gate = projected.chunk(2, dim=1)
+        return x * torch.sigmoid(gate)
+    if not _is_inference_cuda_float(projected):
+        x, gate = projected.chunk(2, dim=1)
+        return x * torch.sigmoid(gate)
+    try:
+        dtype = _float_dtype_key(projected)
+        kernel = _build_gated_linear_unit_bdt_kernel(
+            projected.size(0),
+            projected.size(1),
+            projected.size(2),
+            dtype,
+            _arch_for(projected),
+        )
+        _log_kernel_use_once(
+            "gated_linear_unit_bdt",
+            projected.size(0),
+            projected.size(1),
+            projected.size(2),
+            dtype,
+            _arch_for(projected),
+        )
+        return _launch_pyptx_kernel(kernel, projected)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch gated_linear_unit_bdt fallback after pyptx failure shape=%s: %s",
+            tuple(projected.shape),
+            exc,
+        )
+        x, gate = projected.chunk(2, dim=1)
         return x * torch.sigmoid(gate)
 
 

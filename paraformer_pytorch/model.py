@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from squeezeformer_pytorch.pyptx_kernels import gated_linear_unit_bdt_or_torch
+
 from .ctc_alignment import batch_ctc_viterbi_alignments, batch_uniform_alignments
 
 try:
@@ -160,7 +162,12 @@ class ConformerBlock(nn.Module):
         )
         x = x + self.self_attn_dropout(attn_out)
         conv_in = self.conv_norm(x).transpose(1, 2)
-        x = x + self.conv(conv_in).transpose(1, 2)
+        conv = self.conv
+        conv_out = conv[0](conv_in)
+        conv_out = gated_linear_unit_bdt_or_torch(conv_out)
+        for layer in conv[2:]:
+            conv_out = layer(conv_out)
+        x = x + conv_out.transpose(1, 2)
         x = x + 0.5 * self.ff2(x)
         return self.final_norm(x)
 
