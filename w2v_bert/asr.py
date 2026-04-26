@@ -12,6 +12,10 @@ from torch import Tensor, nn
 import squeezeformer_pytorch.model as _squeezeformer_model
 from squeezeformer_pytorch.asr import SqueezeformerCTC
 from squeezeformer_pytorch.model import apply_linear_with_fp8_padding, make_linear
+from squeezeformer_pytorch.pyptx_kernels import (
+    attention_mask_from_lengths_or_torch,
+    layer_norm_or_torch,
+)
 
 try:
     from transformers import (
@@ -112,11 +116,27 @@ def _convert_linear_modules_to_transformer_engine(module: nn.Module) -> int:
     return converted
 
 
+def _pyptx_layer_norm_forward(layer_norm: nn.LayerNorm, x: Tensor) -> Tensor:
+    return layer_norm_or_torch(
+        x,
+        tuple(layer_norm.normalized_shape),
+        layer_norm.weight,
+        layer_norm.bias,
+        float(layer_norm.eps),
+    )
+
+
+def _patch_layer_norm_modules_for_pyptx(module: nn.Module) -> int:
+    patched = 0
+    for child in module.modules():
+        if isinstance(child, nn.LayerNorm):
+            child.forward = MethodType(_pyptx_layer_norm_forward, child)
+            patched += 1
+    return patched
+
+
 def _attention_mask_from_lengths(lengths: Tensor, max_length: int) -> Tensor:
-    return (
-        torch.arange(max_length, device=lengths.device).unsqueeze(0)
-        < lengths.to(dtype=torch.long).unsqueeze(1)
-    ).to(dtype=torch.long)
+    return attention_mask_from_lengths_or_torch(lengths.to(dtype=torch.long).contiguous(), max_length)
 
 
 @dataclass(frozen=True)
@@ -315,6 +335,7 @@ class W2VBertCTC(SqueezeformerCTC):
             self.encoder.gradient_checkpointing_enable()
         if use_transformer_engine:
             _convert_linear_modules_to_transformer_engine(self.encoder)
+        _patch_layer_norm_modules_for_pyptx(self.encoder)
         self.classifier = make_linear(
             encoder_config.hidden_size,
             vocab_size,

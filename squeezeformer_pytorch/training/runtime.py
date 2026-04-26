@@ -24,6 +24,7 @@ from squeezeformer_pytorch.model import (
     FP8_SHAPE_ALIGNMENT,
     transformer_engine_available,
 )
+from squeezeformer_pytorch.pyptx_kernels import masked_mean_or_torch
 from squeezeformer_pytorch.runtime_types import DTypeChoice, OptimizerChoice
 from zipformer_pytorch.optim import ScaledAdam
 
@@ -172,9 +173,7 @@ class FrozenLibertaTeacher:
             second_half = self._encode_recursive(texts[midpoint:])
             return torch.cat((first_half, second_half), dim=0)
         hidden = outputs.last_hidden_state
-        mask = tokenized["attention_mask"].unsqueeze(-1).to(dtype=hidden.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        pooled = (hidden * mask).sum(dim=1) / denom
+        pooled = masked_mean_or_torch(hidden.contiguous(), tokenized["attention_mask"].contiguous())
         return pooled
 
 
@@ -259,9 +258,7 @@ class FrozenAudioTeacher:
         if attention_mask is None:
             pooled = teacher_hidden.mean(dim=1)
         else:
-            mask = attention_mask.unsqueeze(-1).to(dtype=teacher_hidden.dtype)
-            denom = mask.sum(dim=1).clamp_min(1.0)
-            pooled = (teacher_hidden * mask).sum(dim=1) / denom
+            pooled = masked_mean_or_torch(teacher_hidden.contiguous(), attention_mask.contiguous())
         return {
             "hidden_states": teacher_hidden,
             "pooled_hidden": pooled,
