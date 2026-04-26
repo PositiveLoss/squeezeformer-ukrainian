@@ -167,68 +167,6 @@ def _flat_1d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
 
 
 @lru_cache(maxsize=128)
-def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
-    if not _ensure_pyptx_importable():
-        raise RuntimeError("pyptx is not importable")
-    from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import pred, s64, u8, u32
-
-    block = 256
-    items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
-
-    @kernel(
-        in_specs=(Tile(batch, s64),),
-        out_specs=(Tile(batch, time, time, u8),),
-        grid=(batch, time, 1),
-        block=(block, 1, 1),
-        arch=arch,
-        version=version,
-    )
-    def attention_bool_mask(lengths, out):
-        pl, po = ptx.global_ptrs(lengths, out)
-        batch_idx = reg.scalar(u32)
-        ptx.inst.mov.u32(batch_idx, ptx.special.ctaid.x())
-        tid = reg.scalar(u32)
-        ptx.inst.mov.u32(tid, ptx.special.tid.x())
-        q = reg.scalar(u32)
-        ptx.inst.mov.u32(q, ptx.special.ctaid.y())
-        length = reg.scalar(s64)
-        ptx.inst.ld.global_.s64(length, ptx.addr(pl + batch_idx * 8))
-        out_row = po + (batch_idx * time + q) * time
-        one = reg.scalar(u32, init=1)
-        zero = reg.scalar(u32, init=0)
-
-        q_s64 = reg.scalar(s64)
-        ptx.inst.cvt.s64.u32(q_s64, q)
-        q_valid = reg.scalar(pred)
-        ptx.inst.setp.lt.s64(q_valid, q_s64, length)
-        q_word = reg.scalar(u32)
-        ptx.selp(u32, q_word, 1, 0, q_valid)
-
-        for i in range(items_per_thread):
-            k = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, k, time)
-            k_s64 = reg.scalar(s64)
-            ptx.inst.cvt.s64.u32(k_s64, k)
-            k_valid = reg.scalar(pred)
-            ptx.inst.setp.lt.s64(k_valid, k_s64, length)
-            k_word = reg.scalar(u32)
-            valid_word = reg.scalar(u32)
-            ptx.selp(u32, k_word, 1, 0, k_valid)
-            ptx.inst.and_.b32(valid_word, q_word, k_word)
-            is_valid = reg.scalar(pred)
-            ptx.inst.setp.ne.u32(is_valid, valid_word, 0)
-            value = reg.scalar(u32)
-            ptx.selp(u32, value, one, zero, is_valid)
-            ptx.inst.st.global_.u8(ptx.addr(out_row + k), value, pred=in_bounds)
-        ptx.ret()
-
-    return attention_bool_mask
-
-
-@lru_cache(maxsize=128)
 def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
@@ -311,123 +249,6 @@ def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
         ptx.ret()
 
     return scale_bias
-
-
-@lru_cache(maxsize=128)
-def _build_masked_mean_kernel(batch: int, time: int, dim: int, dtype: str, arch: str):
-    if not _ensure_pyptx_importable():
-        raise RuntimeError("pyptx is not importable")
-    from pyptx import Tile, kernel, ptx, reg, smem
-    from pyptx.types import b16, bf16, f32, pred, s64, u32
-
-    data_t = bf16 if dtype == "bf16" else f32
-    elem_bytes = 2 if dtype == "bf16" else 4
-    warp_size = 32
-    block = 256
-    num_warps = block // warp_size
-    items_per_thread = (time + block - 1) // block
-    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
-
-    def load_data_f32(ptr, *, pred=None):
-        value = reg.scalar(f32, init=0.0)
-        if dtype == "bf16":
-            raw = reg.scalar(b16, init=0)
-            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
-            ptx.inst.cvt.f32.bf16(value, raw)
-        else:
-            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
-        return value
-
-    def store_data_f32(ptr, value):
-        if dtype == "bf16":
-            raw = reg.scalar(b16, init=0)
-            ptx.inst.cvt.rn.bf16.f32(raw, value)
-            ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
-        else:
-            ptx.inst.st.global_.f32(ptx.addr(ptr), value)
-
-    @kernel(
-        in_specs=(Tile(batch, time, dim, data_t), Tile(batch, time, s64)),
-        out_specs=(Tile(batch, dim, data_t),),
-        grid=(batch, dim, 1),
-        block=(block, 1, 1),
-        arch=arch,
-        version=version,
-    )
-    def masked_mean(hidden, mask, out):
-        partials = smem.alloc(f32, (num_warps, 2))
-        stats = smem.alloc(f32, (1, 1))
-        ph, pm, po = ptx.global_ptrs(hidden, mask, out)
-
-        batch_idx = reg.scalar(u32)
-        ptx.inst.mov.u32(batch_idx, ptx.special.ctaid.x())
-        feature_idx = reg.scalar(u32)
-        ptx.inst.mov.u32(feature_idx, ptx.special.ctaid.y())
-        tid = reg.scalar(u32)
-        ptx.inst.mov.u32(tid, ptx.special.tid.x())
-        lane = tid & (warp_size - 1)
-        warp_id = tid >> 5
-
-        hidden_row_base = batch_idx * (time * dim * elem_bytes)
-        mask_row_base = batch_idx * (time * 8)
-        sum_value = reg.scalar(f32, init=0.0)
-        count_value = reg.scalar(f32, init=0.0)
-        zero_s64 = reg.scalar(s64, init=0)
-        one_f32 = reg.scalar(f32, init=1.0)
-
-        for i in range(items_per_thread):
-            col = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, col, time)
-
-            mask_value = reg.scalar(s64, init=0)
-            ptx.inst.ld.global_.s64(
-                mask_value,
-                ptx.addr(pm + mask_row_base + col * 8),
-                pred=in_bounds,
-            )
-            is_valid = reg.scalar(pred)
-            ptx.inst.setp.ne.s64(is_valid, mask_value, zero_s64)
-
-            hidden_off = hidden_row_base + (col * dim + feature_idx) * elem_bytes
-            hidden_value = load_data_f32(ph + hidden_off, pred=is_valid)
-            ptx.inst.add.f32(sum_value, sum_value, hidden_value)
-            ptx.inst.add.f32(count_value, count_value, one_f32, pred=is_valid)
-
-        ptx.warp.reduce_sum(sum_value)
-        ptx.warp.reduce_sum(count_value)
-
-        with ptx.if_(lane == 0):
-            partials[warp_id, 0] = sum_value
-            partials[warp_id, 1] = count_value
-        ptx.bar.sync(0)
-
-        with ptx.if_(tid == 0):
-            block_sum = reg.scalar(f32, init=0.0)
-            block_count = reg.scalar(f32, init=0.0)
-            for i in range(num_warps):
-                ptx.inst.add.f32(block_sum, block_sum, partials[i, 0])
-                ptx.inst.add.f32(block_count, block_count, partials[i, 1])
-
-            has_count = reg.scalar(pred)
-            ptx.inst.setp.gt.f32(has_count, block_count, 0.0)
-            denom = reg.scalar(f32)
-            ptx.selp(f32, denom, block_count, one_f32, has_count)
-            inv_denom = reg.scalar(f32)
-            ptx.inst.rcp.approx.f32(inv_denom, denom)
-            pooled = reg.scalar(f32)
-            ptx.inst.mul.f32(pooled, block_sum, inv_denom)
-            stats[0, 0] = pooled
-        ptx.bar.sync(0)
-
-        with ptx.if_(tid == 0):
-            store_data_f32(
-                po + (batch_idx * dim + feature_idx) * elem_bytes,
-                stats[0, 0],
-            )
-        ptx.ret()
-
-    return masked_mean
 
 
 @lru_cache(maxsize=128)
@@ -1139,9 +960,7 @@ def _disable_kernel_builders_for_torch_compile() -> None:
     if disable is None:
         return
     for name in (
-        "_build_attention_bool_mask_kernel",
         "_build_scale_bias_kernel",
-        "_build_masked_mean_kernel",
         "_build_ctc_log_prob_frame_stats_kernel",
         "_build_silu_time_mask_kernel",
         "_build_conv_output_epilogue_kernel",
@@ -1180,52 +999,6 @@ def _arch_for(x: Tensor) -> str:
     if major >= 10:
         return "sm_100a"
     return "sm_90a"
-
-
-def _torch_sequence_mask(lengths: Tensor, max_length: int | None = None) -> Tensor:
-    lengths = lengths.to(dtype=torch.long)
-    if max_length is None:
-        max_length = int(lengths.max().item()) if lengths.numel() else 0
-    if max_length <= 0:
-        return torch.empty((lengths.size(0), 0), device=lengths.device, dtype=torch.bool)
-    return torch.arange(int(max_length), device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
-
-
-def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | None = None) -> Tensor:
-    if max_length is None:
-        max_length = int(lengths.max().item())
-    if max_length <= 0:
-        return torch.empty(
-            (lengths.size(0), 0, 0),
-            device=lengths.device,
-            dtype=torch.bool,
-        )
-    lengths = lengths.to(dtype=torch.long).contiguous()
-    if not _is_cuda_int64(lengths) or lengths.dim() != 1:
-        sequence_mask = _torch_sequence_mask(lengths, max_length=max_length)
-        return sequence_mask.unsqueeze(1) & sequence_mask.unsqueeze(2)
-    try:
-        kernel = _build_attention_bool_mask_kernel(
-            lengths.size(0),
-            int(max_length),
-            _arch_for(lengths),
-        )
-        _log_kernel_use_once(
-            "squeezeformer_attention_mask",
-            lengths.size(0),
-            int(max_length),
-            _arch_for(lengths),
-        )
-        return _launch_pyptx_kernel(kernel, lengths).bool()
-    except Exception as exc:
-        _LOGGER.debug(
-            "using torch squeezeformer_attention_mask fallback after pyptx failure shape=(%s, %s): %s",
-            lengths.size(0),
-            max_length,
-            exc,
-        )
-        sequence_mask = _torch_sequence_mask(lengths, max_length=max_length)
-        return sequence_mask.unsqueeze(1) & sequence_mask.unsqueeze(2)
 
 
 def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
@@ -1526,52 +1299,6 @@ def ctc_log_prob_frame_stats_or_torch(
 
 
 def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
-    if (
-        _PYPTX_DISABLED
-        or torch.is_grad_enabled()
-        or hidden.dim() != 3
-        or attention_mask.shape != hidden.shape[:2]
-        or not (
-            hidden.is_cuda
-            and hidden.dtype in {torch.float32, torch.bfloat16}
-            and hidden.is_contiguous()
-            and _is_cuda_int64(attention_mask)
-        )
-    ):
-        _LOGGER.debug(
-            "using torch masked_mean fallback hidden_shape=%s mask_shape=%s device=%s dtype=%s",
-            tuple(hidden.shape),
-            tuple(attention_mask.shape),
-            hidden.device,
-            hidden.dtype,
-        )
-        mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (hidden * mask).sum(dim=1) / denom
-    try:
-        dtype = _float_dtype_key(hidden)
-        kernel = _build_masked_mean_kernel(
-            hidden.size(0),
-            hidden.size(1),
-            hidden.size(2),
-            dtype,
-            _arch_for(hidden),
-        )
-        _log_kernel_use_once(
-            "masked_mean",
-            hidden.size(0),
-            hidden.size(1),
-            hidden.size(2),
-            dtype,
-            _arch_for(hidden),
-        )
-        return _launch_pyptx_kernel(kernel, hidden, attention_mask)
-    except Exception as exc:
-        _LOGGER.debug(
-            "using torch masked_mean fallback after pyptx failure hidden_shape=%s: %s",
-            tuple(hidden.shape),
-            exc,
-        )
-        mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        return (hidden * mask).sum(dim=1) / denom
+    mask = attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+    denom = mask.sum(dim=1).clamp_min(1.0)
+    return (hidden * mask).sum(dim=1) / denom

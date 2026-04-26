@@ -19,16 +19,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import squeezeformer_pytorch.pyptx_kernels as pyptx_kernels  # noqa: E402
-from squeezeformer_pytorch.masking import make_sequence_mask  # noqa: E402
 from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
     bias_norm_or_torch,
     conv_output_epilogue_or_torch,
     ctc_log_prob_frame_stats_or_torch,
     gated_linear_unit_or_torch,
-    masked_mean_or_torch,
     scale_bias_or_torch,
     silu_time_mask_or_torch,
-    squeezeformer_attention_mask_or_torch,
     swoosh_l_or_torch,
     swoosh_r_or_torch,
 )
@@ -182,16 +179,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
     def randn(*shape: int, device: torch.device) -> torch.Tensor:
         return torch.randn(*shape, device=device, dtype=dtype)
 
-    def attention_mask_case(device: torch.device):
-        lengths = lengths_for(batch, time, device)
-        return (
-            lambda: squeezeformer_attention_mask_or_torch(lengths, max_length=time),
-            lambda: (
-                make_sequence_mask(lengths, max_length=time).unsqueeze(1)
-                & make_sequence_mask(lengths, max_length=time).unsqueeze(2)
-            ),
-        )
-
     def scale_bias_case(device: torch.device):
         x = randn(batch, time, dim, device=device)
         scale = randn(dim, device=device)
@@ -260,19 +247,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             ),
         )
 
-    def masked_mean_case(device: torch.device):
-        hidden = randn(batch, time, dim, device=device)
-        mask = (
-            lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
-        ).to(dtype=torch.long)
-        return (
-            lambda: masked_mean_or_torch(hidden, mask),
-            lambda: (
-                (hidden * mask.unsqueeze(-1).to(dtype=hidden.dtype)).sum(dim=1)
-                / mask.sum(dim=1, keepdim=True).clamp_min(1).to(dtype=hidden.dtype)
-            ),
-        )
-
     def ctc_stats_case(device: torch.device):
         logits = torch.randn(batch, time, vocab, device=device)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -283,7 +257,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     return [
-        Case("squeezeformer_attention_mask", attention_mask_case),
         Case("scale_bias", scale_bias_case),
         Case("silu_mask_bdt", silu_mask_bdt_case),
         Case("silu_mask_btd", silu_mask_btd_case),
@@ -292,7 +265,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         Case("gated_linear_unit", gated_linear_unit_case),
         Case("conv_output_epilogue", conv_output_epilogue_case),
         Case("bias_norm", bias_norm_case),
-        Case("masked_mean", masked_mean_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),
     ]
 
