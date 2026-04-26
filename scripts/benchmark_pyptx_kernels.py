@@ -337,7 +337,8 @@ def main() -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested, but torch.cuda.is_available() is false.")
 
-    os.environ.setdefault("SQUEEZEFORMER_DISABLE_PYPTX", "0")
+    os.environ["SQUEEZEFORMER_DISABLE_PYPTX"] = "0"
+    pyptx_kernels._PYPTX_DISABLED = False
     selected = set(args.cases)
     cases = make_cases(args)
     if selected != {"all"}:

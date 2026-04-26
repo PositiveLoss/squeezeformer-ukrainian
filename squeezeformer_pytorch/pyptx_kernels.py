@@ -11,11 +11,8 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-_PYPTX_DISABLED = os.environ.get("SQUEEZEFORMER_DISABLE_PYPTX", "").lower() in {
-    "1",
-    "true",
-    "yes",
-}
+_PYPTX_DISABLE_VALUE = os.environ.get("SQUEEZEFORMER_DISABLE_PYPTX", "1").lower()
+_PYPTX_DISABLED = _PYPTX_DISABLE_VALUE not in {"0", "false", "no", "off"}
 _BLOCK_CANDIDATES = (1024, 512, 256, 128, 64, 32)
 _LOG2E = 1.4426950408889634
 _LN2 = 0.6931471805599453
