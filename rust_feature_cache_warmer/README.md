@@ -92,7 +92,7 @@ RUST_LOG=asr_features=debug cargo run --release --manifest-path rust_feature_cac
   --cache-dir artifacts/feature-cache/train
 ```
 
-The output directory is a split cache root, matching the Python warmer:
+The output directory is a split cache root:
 
 ```text
 artifacts/feature-cache/train/
@@ -149,9 +149,9 @@ assert features.shape[1] == 160
 The repository's `build_featurizer_from_config()` factory now returns PyTorch
 modules backed by this extension for Squeezeformer, Zipformer, and W2V-BERT.
 That factory is used by `train.py`, `evaluate.py`, `inference.py`, and the
-Python cache warmers, so actual feature extraction no longer goes through the
-torchaudio/Hugging Face frontend path unless a test deliberately monkeypatches
-the script-local compatibility aliases.
+offline `extract_features.py` path, so actual feature extraction no longer goes
+through the torchaudio/Hugging Face frontend path unless a test deliberately
+monkeypatches the script-local compatibility aliases.
 
 ## Parallelism
 

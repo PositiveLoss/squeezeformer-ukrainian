@@ -9,15 +9,6 @@ import torchaudio
 from torch import Tensor
 from torch.nn import functional as F
 
-try:
-    import audioflux as af
-    from audioflux.type import SpectralDataType, SpectralFilterBankScaleType
-except ImportError:
-    af = None
-    SpectralDataType = None
-    SpectralFilterBankScaleType = None
-
-
 ZIPFORMER_PAPER_FEATURIZER_CONFIG: dict[str, object] = {
     "sample_rate": 16_000,
     "n_fft": 400,
@@ -140,10 +131,7 @@ class RustAudioFeaturizer(torch.nn.Module):
         self.normalize_per_frame = bool(normalize_per_frame)
         self.frontend_type = str(frontend_type)
         if self.backend != "torchaudio":
-            raise ValueError(
-                "RustAudioFeaturizer supports only backend='torchaudio'. "
-                "Use AudioFeaturizer directly for the legacy audioflux Python path."
-            )
+            raise ValueError("RustAudioFeaturizer supports only backend='torchaudio'.")
         if self.frontend_type not in {"squeezeformer", "zipformer"}:
             raise ValueError(f"Unsupported Rust frontend type: {self.frontend_type}")
         if self.n_fft <= 0:
@@ -162,7 +150,9 @@ class RustAudioFeaturizer(torch.nn.Module):
     def forward(self, waveform: Tensor, sample_rate: int) -> Tensor:
         from asr_features import extract_squeezeformer, extract_zipformer
 
-        extractor = extract_zipformer if self.frontend_type == "zipformer" else extract_squeezeformer
+        extractor = (
+            extract_zipformer if self.frontend_type == "zipformer" else extract_squeezeformer
+        )
         features = extractor(
             _waveform_to_numpy(waveform),
             int(sample_rate),
@@ -325,29 +315,6 @@ class AudioFeaturizer(torch.nn.Module):
                 hop_length=hop_length,
                 n_mels=n_mels,
             )
-            self._audioflux_bft = None
-        elif backend == "audioflux":
-            if af is None or SpectralFilterBankScaleType is None or SpectralDataType is None:
-                raise ImportError("audioflux backend requested, but audioflux is not installed.")
-            if n_fft <= 0 or n_fft & (n_fft - 1) != 0:
-                raise ValueError(
-                    "audioflux backend requires n_fft to be a power of two because "
-                    "its mel frontend uses fft_length=2**radix2_exp."
-                )
-            if self.win_length != n_fft:
-                raise ValueError(
-                    "audioflux backend requires win_length to equal n_fft because the "
-                    "configured BFT frontend does not expose a separate analysis window."
-                )
-            self.mel = None
-            self._audioflux_bft = af.BFT(
-                num=n_mels,
-                radix2_exp=int(math.log2(n_fft)),
-                samplate=sample_rate,
-                slide_length=hop_length,
-                scale_type=SpectralFilterBankScaleType.MEL,
-                data_type=SpectralDataType.POWER,
-            )
         else:
             raise ValueError(f"Unsupported frontend backend: {backend}")
 
@@ -374,13 +341,6 @@ class AudioFeaturizer(torch.nn.Module):
         if self.backend == "torchaudio":
             features = self.mel(waveform)
             features = torch.log(features.clamp_min(1e-5)).transpose(0, 1)
-        else:
-            spec = self._audioflux_bft.bft(
-                waveform.detach().cpu().numpy().astype(np.float32, copy=False)
-            )
-            spec = np.abs(spec)
-            features = torch.from_numpy(spec).to(dtype=waveform.dtype).transpose(0, 1)
-            features = torch.log(features.clamp_min(1e-5))
         if self.normalize_feature:
             if self.normalize_per_frame:
                 mean = features.mean(dim=-1, keepdim=True)

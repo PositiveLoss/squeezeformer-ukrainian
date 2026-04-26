@@ -59,9 +59,7 @@ def _is_inference_cuda_f32(x: Tensor, *others: Tensor) -> bool:
         return False
     tensors = (x, *others)
     if not all(
-        tensor.is_cuda
-        and tensor.dtype == torch.float32
-        and tensor.is_contiguous()
+        tensor.is_cuda and tensor.dtype == torch.float32 and tensor.is_contiguous()
         for tensor in tensors
     ):
         return False
@@ -667,7 +665,9 @@ def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, 
 
 
 @lru_cache(maxsize=128)
-def _build_time_recovery_repeat_kernel(batch: int, source_time: int, target_time: int, dim: int, stride: int, arch: str):
+def _build_time_recovery_repeat_kernel(
+    batch: int, source_time: int, target_time: int, dim: int, stride: int, arch: str
+):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx.types import f32, pred, u32
@@ -916,7 +916,9 @@ def _build_silu_kernel(m: int, f: int, arch: str):
 
 
 @lru_cache(maxsize=128)
-def _build_swoosh_kernel(total: int, offset: float, linear_scale: float, constant: float, arch: str):
+def _build_swoosh_kernel(
+    total: int, offset: float, linear_scale: float, constant: float, arch: str
+):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx.types import f32, pred, u32
@@ -1521,10 +1523,9 @@ def ctc_log_prob_frame_stats_or_torch(
     blank_id: int,
 ) -> Tensor:
     def torch_frame_stats() -> Tensor:
-        valid_mask = (
-            torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(0)
-            < output_lengths.to(dtype=torch.long).unsqueeze(1)
-        )
+        valid_mask = torch.arange(log_probs.size(1), device=output_lengths.device).unsqueeze(
+            0
+        ) < output_lengths.to(dtype=torch.long).unsqueeze(1)
         blank_probabilities = log_probs[..., blank_id].exp()
         argmax_blank = log_probs.argmax(dim=-1).eq(blank_id).to(dtype=torch.float32)
         nonblank_log_probs = log_probs.clone()

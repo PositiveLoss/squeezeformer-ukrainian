@@ -1409,9 +1409,7 @@ def _build_split_audit(
         )
         for split_name, records in split_records.items()
     }
-    speaker_sets = {
-        split_name: metadata[0] for split_name, metadata in audit_metadata.items()
-    }
+    speaker_sets = {split_name: metadata[0] for split_name, metadata in audit_metadata.items()}
     counts = {
         split_name: {
             "samples": len(records),

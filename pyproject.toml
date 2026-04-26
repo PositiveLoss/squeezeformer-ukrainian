@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "PyTorch implementation of the Squeezeformer encoder"
 requires-python = ">=3.12"
 dependencies = [
-    "audioflux>=0.1.9",
     "asr-features>=0.1.0",
     "gradio>=5.38.0",
     "huggingface-hub>=0.34.0",
@@ -18,10 +17,9 @@ dependencies = [
 
 [project.scripts]
 squeezeformer-torchrun = "squeezeformer_pytorch.training.torchrun_launcher:main"
-squeezeformer-warm-feature-cache = "feature_cache_warmer.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["feature_cache_warmer*", "squeezeformer_pytorch*", "w2v_bert*", "zipformer_pytorch*"]
+include = ["squeezeformer_pytorch*", "w2v_bert*", "zipformer_pytorch*"]
 namespaces = true
 
 [tool.uv]

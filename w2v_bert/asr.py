@@ -136,7 +136,9 @@ def _patch_layer_norm_modules_for_pyptx(module: nn.Module) -> int:
 
 
 def _attention_mask_from_lengths(lengths: Tensor, max_length: int) -> Tensor:
-    return attention_mask_from_lengths_or_torch(lengths.to(dtype=torch.long).contiguous(), max_length)
+    return attention_mask_from_lengths_or_torch(
+        lengths.to(dtype=torch.long).contiguous(), max_length
+    )
 
 
 @dataclass(frozen=True)

@@ -7,8 +7,8 @@ import squeezeformer_pytorch.training.data_loading as data_loading
 from squeezeformer_pytorch.data import AudioRecord
 from squeezeformer_pytorch.training.data_loading import (
     _build_disk_backed_record_store,
-    _disk_backed_record_store_exists,
     _build_split_audit,
+    _disk_backed_record_store_exists,
     _load_train_val_records,
     _record_index_path,
     _shard_records_for_rank,
@@ -119,21 +119,17 @@ def test_build_disk_backed_record_store_can_require_audio_bytes(
     assert record.audio_bytes == b"embedded bytes"
 
 
-def test_load_train_val_records_reuses_existing_record_cache(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_load_train_val_records_reuses_existing_record_cache(tmp_path: Path, monkeypatch) -> None:
     train_root = tmp_path / "train-data"
     train_root.mkdir()
     (train_root / "train.tsv").write_text(
-        "path\tsentence\tid\tduration\n"
-        "train.wav\ttraining sample\ttrain-utt\t0.3\n",
+        "path\tsentence\tid\tduration\ntrain.wav\ttraining sample\ttrain-utt\t0.3\n",
         encoding="utf-8",
     )
     validation_root = tmp_path / "validation-data"
     validation_root.mkdir()
     (validation_root / "validation.tsv").write_text(
-        "path\tsentence\tid\tduration\n"
-        "validation.wav\tvalidation sample\tvalidation-utt\t0.3\n",
+        "path\tsentence\tid\tduration\nvalidation.wav\tvalidation sample\tvalidation-utt\t0.3\n",
         encoding="utf-8",
     )
     record_cache_dir = tmp_path / "cached-metadata"
@@ -246,9 +242,7 @@ def test_split_audit_does_not_load_disk_backed_audio_blobs(tmp_path: Path) -> No
     _record_index_path(records_path, ".estimated_frames.u32").write_bytes(
         (100).to_bytes(4, "little")
     )
-    _record_index_path(records_path, ".num_samples.u64").write_bytes(
-        (16_000).to_bytes(8, "little")
-    )
+    _record_index_path(records_path, ".num_samples.u64").write_bytes((16_000).to_bytes(8, "little"))
     _record_index_path(records_path, ".sample_rates.u32").write_bytes(
         (16_000).to_bytes(4, "little")
     )

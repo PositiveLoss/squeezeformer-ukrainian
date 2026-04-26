@@ -1887,9 +1887,7 @@ def main() -> None:
         model.load_state_dict(
             checkpoint.get("resume_model_state_dict", checkpoint["model_state_dict"])
         )
-    ddp_find_unused_parameters = _ddp_find_unused_parameters_required(
-        use_w2v_bert=use_w2v_bert
-    )
+    ddp_find_unused_parameters = _ddp_find_unused_parameters_required(use_w2v_bert=use_w2v_bert)
     if distributed:
         logger.info(
             "wrapping model with DistributedDataParallel find_unused_parameters=%s",

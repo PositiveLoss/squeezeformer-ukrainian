@@ -145,17 +145,19 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         lengths = lengths_for(batch, time, device)
         return (
             lambda: squeezeformer_attention_mask_or_torch(lengths, max_length=time),
-            lambda: make_sequence_mask(lengths, max_length=time).unsqueeze(1)
-            & make_sequence_mask(lengths, max_length=time).unsqueeze(2),
+            lambda: (
+                make_sequence_mask(lengths, max_length=time).unsqueeze(1)
+                & make_sequence_mask(lengths, max_length=time).unsqueeze(2)
+            ),
         )
 
     def w2v_attention_mask_case(device: torch.device):
         lengths = lengths_for(batch, time, device)
         return (
             lambda: attention_mask_from_lengths_or_torch(lengths, max_length=time),
-            lambda: (
-                torch.arange(time, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-            ).to(dtype=torch.long),
+            lambda: (torch.arange(time, device=device).unsqueeze(0) < lengths.unsqueeze(1)).to(
+                dtype=torch.long
+            ),
         )
 
     def apply_mask_btd_case(device: torch.device):
@@ -234,9 +236,11 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         log_scale = torch.randn((), device=device) * 0.1
         return (
             lambda: bias_norm_or_torch(x, bias, log_scale, 1.0e-8),
-            lambda: x
-            / (x - bias.view(1, 1, dim)).pow(2).mean(dim=-1, keepdim=True).add(1.0e-8).sqrt()
-            * log_scale.exp(),
+            lambda: (
+                x
+                / (x - bias.view(1, 1, dim)).pow(2).mean(dim=-1, keepdim=True).add(1.0e-8).sqrt()
+                * log_scale.exp()
+            ),
         )
 
     def masked_mean_case(device: torch.device):
@@ -246,8 +250,10 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         ).to(dtype=torch.long)
         return (
             lambda: masked_mean_or_torch(hidden, mask),
-            lambda: (hidden * mask.unsqueeze(-1).to(dtype=hidden.dtype)).sum(dim=1)
-            / mask.sum(dim=1, keepdim=True).clamp_min(1).to(dtype=hidden.dtype),
+            lambda: (
+                (hidden * mask.unsqueeze(-1).to(dtype=hidden.dtype)).sum(dim=1)
+                / mask.sum(dim=1, keepdim=True).clamp_min(1).to(dtype=hidden.dtype)
+            ),
         )
 
     def ctc_stats_case(device: torch.device):
@@ -369,7 +375,9 @@ def main() -> None:
         return
 
     name_width = max(len("case"), *(len(row["case"]) for row in results))
-    print(f"{'case':<{name_width}}  {'mode':>8}  {'helper_ms':>10}  {'torch_ms':>10}  {'speedup':>8}  {'max_diff':>10}")
+    print(
+        f"{'case':<{name_width}}  {'mode':>8}  {'helper_ms':>10}  {'torch_ms':>10}  {'speedup':>8}  {'max_diff':>10}"
+    )
     for row in results:
         print(
             f"{row['case']:<{name_width}}  {row['mode']:>8}  {row['pyptx_ms']:10.4f}  "

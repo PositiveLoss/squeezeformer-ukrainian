@@ -38,7 +38,6 @@ def test_build_featurizer_from_config_uses_rust_wrappers() -> None:
 def test_rust_feature_extension_extracts_numpy_features() -> None:
     pytest.importorskip("asr_features")
     import numpy as np
-
     from asr_features import (
         extract_squeezeformer,
         extract_w2v_bert,
@@ -102,8 +101,7 @@ def test_rust_record_cache_subcommand_matches_python_store(tmp_path) -> None:
         encoding="utf-8",
     )
     (val_dir / "validation.tsv").write_text(
-        "id\tpath\tsentence\tduration\tclient_id\n"
-        "val1\taudio/c.wav\tВалідація\t2.0\tspk3\n",
+        "id\tpath\tsentence\tduration\tclient_id\nval1\taudio/c.wav\tВалідація\t2.0\tspk3\n",
         encoding="utf-8",
     )
     cache_dir = tmp_path / "record-cache"
