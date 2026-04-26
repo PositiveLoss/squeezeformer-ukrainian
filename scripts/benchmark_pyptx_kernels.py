@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Wrap both helper and Torch reference callables in torch.compile before timing.",
+    )
+    parser.add_argument(
         "--cases",
         nargs="*",
         default=["all"],
@@ -322,6 +327,10 @@ def max_abs_diff(a: Any, b: Any) -> float:
     return float((a.float() - b.float()).abs().max().item())
 
 
+def compile_callable(fn: Callable[[], Any]) -> Callable[[], Any]:
+    return torch.compile(fn, fullgraph=False, dynamic=False)
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -339,9 +348,14 @@ def main() -> None:
     results = []
     for case in cases:
         pyptx_fn, torch_fn = case.build(device)
+        if args.torch_compile:
+            pyptx_fn = compile_callable(pyptx_fn)
+            torch_fn = compile_callable(torch_fn)
+
         with torch.inference_mode():
             pyptx_out = pyptx_fn()
-            torch_out = torch_fn()
+            with pyptx_disabled():
+                torch_out = torch_fn()
             synchronize(device)
         diff = max_abs_diff(pyptx_out, torch_out)
 
@@ -362,7 +376,9 @@ def main() -> None:
         results.append(
             {
                 "case": case.name,
-                "mode": "pyptx" if device.type == "cuda" else "fallback",
+                "mode": ("compile" if args.torch_compile else "pyptx")
+                if device.type == "cuda"
+                else ("compile" if args.torch_compile else "fallback"),
                 "pyptx_ms": pyptx_ms,
                 "torch_ms": torch_ms,
                 "speedup": speedup,
