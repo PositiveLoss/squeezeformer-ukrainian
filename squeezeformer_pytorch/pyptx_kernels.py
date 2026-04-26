@@ -166,7 +166,7 @@ def _build_sequence_mask_kernel(batch: int, time: int, arch: str):
 
     @kernel(
         in_specs=(Tile(batch, s64),),
-        out_specs=(Tile(batch, time, u8),),
+        out_specs=(Tile(batch, time, pred),),
         grid=(batch, 1, 1),
         block=(block, 1, 1),
         arch=arch,
@@ -215,7 +215,7 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
 
     @kernel(
         in_specs=(Tile(batch, s64),),
-        out_specs=(Tile(batch, time, time, u8),),
+        out_specs=(Tile(batch, time, time, pred),),
         grid=(batch, time, grid_z),
         block=(block, 1, 1),
         arch=arch,
@@ -1234,7 +1234,7 @@ def sequence_mask_or_torch(lengths: Tensor, max_length: int | None = None) -> Te
     try:
         kernel = _build_sequence_mask_kernel(lengths.size(0), int(max_length), _arch_for(lengths))
         _log_kernel_use_once("sequence_mask", lengths.size(0), int(max_length), _arch_for(lengths))
-        return _launch_pyptx_kernel(kernel, lengths).bool()
+        return _launch_pyptx_kernel(kernel, lengths)
     except Exception as exc:
         _LOGGER.debug(
             "using torch sequence_mask fallback after pyptx failure shape=(%s, %s): %s",
@@ -1270,7 +1270,7 @@ def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | Non
             int(max_length),
             _arch_for(lengths),
         )
-        return _launch_pyptx_kernel(kernel, lengths).bool()
+        return _launch_pyptx_kernel(kernel, lengths)
     except Exception as exc:
         _LOGGER.debug(
             "using torch squeezeformer_attention_mask fallback after pyptx failure shape=(%s, %s): %s",
