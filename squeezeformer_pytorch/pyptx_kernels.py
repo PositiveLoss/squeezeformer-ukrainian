@@ -1174,6 +1174,19 @@ def _disable_kernel_builders_for_torch_compile() -> None:
 _disable_kernel_builders_for_torch_compile()
 
 
+def _launch_pyptx_kernel(kernel, *args):
+    return kernel(*args)
+
+
+_torch_compile_disable = getattr(getattr(torch, "compiler", None), "disable", None)
+if _torch_compile_disable is not None:
+    _launch_pyptx_kernel = _torch_compile_disable(
+        _launch_pyptx_kernel,
+        recursive=True,
+        reason="pyptx Kernel.__call__ uses launch machinery outside Dynamo graphs",
+    )
+
+
 def _arch_for(x: Tensor) -> str:
     major, _minor = torch.cuda.get_device_capability(x.device)
     if major >= 10:
@@ -1199,7 +1212,7 @@ def attention_mask_from_lengths_or_torch(lengths: Tensor, max_length: int) -> Te
     try:
         kernel = _build_attention_mask_kernel(lengths.size(0), int(max_length), _arch_for(lengths))
         _log_kernel_use_once("attention_mask", lengths.size(0), int(max_length), _arch_for(lengths))
-        return kernel(lengths)
+        return _launch_pyptx_kernel(kernel, lengths)
     except Exception as exc:
         _LOGGER.debug(
             "using torch attention_mask fallback after pyptx failure shape=(%s, %s): %s",
@@ -1224,7 +1237,7 @@ def sequence_mask_or_torch(lengths: Tensor, max_length: int | None = None) -> Te
     try:
         kernel = _build_sequence_mask_kernel(lengths.size(0), int(max_length), _arch_for(lengths))
         _log_kernel_use_once("sequence_mask", lengths.size(0), int(max_length), _arch_for(lengths))
-        return kernel(lengths).bool()
+        return _launch_pyptx_kernel(kernel, lengths).bool()
     except Exception as exc:
         _LOGGER.debug(
             "using torch sequence_mask fallback after pyptx failure shape=(%s, %s): %s",
@@ -1260,7 +1273,7 @@ def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | Non
             int(max_length),
             _arch_for(lengths),
         )
-        return kernel(lengths).bool()
+        return _launch_pyptx_kernel(kernel, lengths).bool()
     except Exception as exc:
         _LOGGER.debug(
             "using torch squeezeformer_attention_mask fallback after pyptx failure shape=(%s, %s): %s",
@@ -1285,7 +1298,7 @@ def scale_bias_or_torch(x: Tensor, scale: Tensor, bias: Tensor) -> Tensor:
     try:
         kernel = _build_scale_bias_kernel(flat.size(0), flat.size(1), _arch_for(x))
         _log_kernel_use_once("scale_bias", flat.size(0), flat.size(1), _arch_for(x))
-        return kernel(flat, scale, bias).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat, scale, bias).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
             "using torch scale_bias fallback after pyptx failure shape=%s: %s",
@@ -1308,7 +1321,7 @@ def silu_or_torch(x: Tensor) -> Tensor:
     try:
         kernel = _build_silu_kernel(flat.size(0), flat.size(1), _arch_for(x))
         _log_kernel_use_once("silu", flat.size(0), flat.size(1), _arch_for(x))
-        return kernel(flat).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
             "using torch silu fallback after pyptx failure shape=%s: %s",
@@ -1355,7 +1368,7 @@ def _swoosh_or_torch(
             _arch_for(x),
         )
         _log_kernel_use_once(name, flat.numel(), _arch_for(x))
-        return kernel(flat).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
             "using torch %s fallback after pyptx failure shape=%s: %s",
@@ -1382,7 +1395,7 @@ def gated_linear_unit_or_torch(projected: Tensor) -> Tensor:
             flat.size(1),
             _arch_for(projected),
         )
-        return kernel(flat).reshape(*original_shape[:-1], original_shape[-1] // 2)
+        return _launch_pyptx_kernel(kernel, flat).reshape(*original_shape[:-1], original_shape[-1] // 2)
     except Exception as exc:
         _LOGGER.debug(
             "using torch gated_linear_unit fallback after pyptx failure shape=%s: %s",
@@ -1411,7 +1424,7 @@ def bias_norm_or_torch(x: Tensor, bias: Tensor, log_scale: Tensor, eps: float) -
     try:
         kernel = _build_bias_norm_kernel(flat.size(0), flat.size(1), float(eps), _arch_for(x))
         _log_kernel_use_once("bias_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
-        return kernel(flat, bias, log_scale.reshape(1)).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat, bias, log_scale.reshape(1)).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
             "using torch bias_norm fallback after pyptx failure shape=%s: %s",
@@ -1459,7 +1472,7 @@ def layer_norm_or_torch(
             _arch_for(x),
         )
         _log_kernel_use_once("layer_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
-        return kernel(flat, weight, bias).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat, weight, bias).reshape(original_shape)
     except Exception as exc:
         _LOGGER.debug(
             "using torch layer_norm fallback after pyptx failure shape=%s: %s",
@@ -1490,7 +1503,7 @@ def apply_time_mask_or_torch(x: Tensor, mask: Tensor, *, layout: str = "btd") ->
     try:
         kernel = _build_apply_time_mask_kernel(batch, time, dim, layout, _arch_for(x))
         _log_kernel_use_once("apply_time_mask", batch, time, dim, layout, _arch_for(x))
-        return kernel(x, mask)
+        return _launch_pyptx_kernel(kernel, x, mask)
     except Exception as exc:
         _LOGGER.debug(
             "using torch apply_time_mask fallback after pyptx failure shape=%s layout=%s: %s",
@@ -1533,7 +1546,7 @@ def time_recovery_repeat_or_torch(x: Tensor, target_length: int, stride: int) ->
             int(stride),
             _arch_for(x),
         )
-        return kernel(x)
+        return _launch_pyptx_kernel(kernel, x)
     except Exception as exc:
         _LOGGER.debug(
             "using torch time_recovery_repeat fallback after pyptx failure shape=%s target=%s: %s",
@@ -1600,7 +1613,7 @@ def ctc_log_prob_frame_stats_or_torch(
             int(blank_id),
             _arch_for(log_probs),
         )
-        return kernel(log_probs, lengths)
+        return _launch_pyptx_kernel(kernel, log_probs, lengths)
     except Exception as exc:
         _LOGGER.debug(
             "using torch ctc_log_prob_frame_stats fallback after pyptx failure shape=%s: %s",
@@ -1647,7 +1660,7 @@ def masked_mean_or_torch(hidden: Tensor, attention_mask: Tensor) -> Tensor:
             hidden.size(2),
             _arch_for(hidden),
         )
-        return kernel(hidden, attention_mask)
+        return _launch_pyptx_kernel(kernel, hidden, attention_mask)
     except Exception as exc:
         _LOGGER.debug(
             "using torch masked_mean fallback after pyptx failure hidden_shape=%s: %s",
