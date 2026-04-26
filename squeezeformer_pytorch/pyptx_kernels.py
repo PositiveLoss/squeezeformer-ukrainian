@@ -97,10 +97,7 @@ def _is_inference_cuda_float(x: Tensor, *others: Tensor) -> bool:
     if dtype not in {torch.float32, torch.bfloat16}:
         return False
     if not all(
-        tensor.is_cuda
-        and tensor.dtype == dtype
-        and tensor.is_contiguous()
-        for tensor in tensors
+        tensor.is_cuda and tensor.dtype == dtype and tensor.is_contiguous() for tensor in tensors
     ):
         return False
     major, _minor = torch.cuda.get_device_capability(x.device)
