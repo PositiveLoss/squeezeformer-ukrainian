@@ -96,6 +96,8 @@ def _validate_startup_args(
     if world_size > 1 and args.compile:
         raise ValueError("--compile is not currently supported together with distributed training.")
     if args.zipformer:
+        if args.paraformer:
+            raise ValueError("--zipformer cannot be combined with --paraformer.")
         if args.aed_decoder:
             raise ValueError("--zipformer does not support the AED decoder.")
         if args.liberta_distill:
@@ -105,6 +107,8 @@ def _validate_startup_args(
     if args.w2v_bert:
         if args.zipformer:
             raise ValueError("--w2v-bert cannot be combined with --zipformer.")
+        if args.paraformer:
+            raise ValueError("--w2v-bert cannot be combined with --paraformer.")
         if args.zipformer_transducer:
             raise ValueError("--w2v-bert does not support the Zipformer transducer objective.")
         if args.aed_decoder:
@@ -115,6 +119,15 @@ def _validate_startup_args(
             raise ValueError("--w2v-bert does not support audio-teacher distillation.")
     if args.zipformer_transducer and not args.zipformer:
         raise ValueError("--zipformer-transducer requires --zipformer.")
+    if args.paraformer:
+        if args.zipformer_transducer:
+            raise ValueError("--paraformer does not support the Zipformer transducer objective.")
+        if args.aed_decoder:
+            raise ValueError("--paraformer does not support the AED decoder.")
+        if args.liberta_distill:
+            raise ValueError("--paraformer does not support LiBERTa distillation.")
+        if args.audio_teacher:
+            raise ValueError("--paraformer does not support audio-teacher distillation.")
 
     requested_device = resolve_device(args.device)
     _validate_device_ready(requested_device)
@@ -492,6 +505,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--w2v-bert",
         action="store_true",
         help="Fine-tune facebook/w2v-bert-2.0 with the current CTC training pipeline.",
+    )
+    parser.add_argument(
+        "--paraformer",
+        action="store_true",
+        help="Train a Paraformer-v2 ASR model from paraformer_pytorch.",
+    )
+    parser.add_argument(
+        "--paraformer-enhanced",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the enhanced Paraformer-v2 model with shallow CTC, boundary, and refinement heads.",
+    )
+    parser.add_argument(
+        "--paraformer-alignment-mode",
+        choices=["viterbi", "uniform"],
+        default="viterbi",
+        help="Alignment strategy used to build Paraformer decoder queries during training.",
+    )
+    parser.add_argument(
+        "--paraformer-alignment-backend",
+        choices=["auto", "python", "cython", "triton"],
+        default="auto",
+        help="CTC Viterbi alignment backend for Paraformer training.",
     )
     parser.add_argument(
         "--w2v-bert-model-name",

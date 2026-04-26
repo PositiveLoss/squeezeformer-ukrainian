@@ -213,14 +213,13 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
     from pyptx import Tile, kernel, ptx, reg
 
     block = 256
-    total = time * time
-    items_per_thread = (total + block - 1) // block
+    grid_z = (time + block - 1) // block
     version = (8, 7) if arch.startswith("sm_100") else None
 
     @kernel(
         in_specs=(Tile(batch, s64),),
         out_specs=(Tile(batch, time, time, u8),),
-        grid=(batch, 1, 1),
+        grid=(batch, time, grid_z),
         block=(block, 1, 1),
         arch=arch,
         version=version,
@@ -231,40 +230,39 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
         ptx.inst.mov.u32(batch_idx, ptx.special.ctaid.x())
         tid = reg.scalar(u32)
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        q = reg.scalar(u32)
+        ptx.inst.mov.u32(q, ptx.special.ctaid.y())
+        k_tile = reg.scalar(u32)
+        ptx.inst.mov.u32(k_tile, ptx.special.ctaid.z())
 
         length = reg.scalar(s64)
         ptx.inst.ld.global_.s64(length, ptx.addr(pl + batch_idx * 8))
-        out_batch = po + batch_idx * total
+        out_row = po + (batch_idx * time + q) * time
         one = reg.scalar(u8, init=1)
         zero = reg.scalar(u8, init=0)
 
-        for i in range(items_per_thread):
-            linear = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, linear, total)
-            q = reg.scalar(u32)
-            ptx.inst.div.u32(q, linear, time)
-            k = reg.scalar(u32)
-            ptx.inst.rem.u32(k, linear, time)
-            q_s64 = reg.scalar(s64)
-            k_s64 = reg.scalar(s64)
-            ptx.inst.cvt.s64.u32(q_s64, q)
-            ptx.inst.cvt.s64.u32(k_s64, k)
-            q_valid = reg.scalar(pred)
-            k_valid = reg.scalar(pred)
-            ptx.inst.setp.lt.s64(q_valid, q_s64, length)
-            ptx.inst.setp.lt.s64(k_valid, k_s64, length)
-            q_word = reg.scalar(u32)
-            k_word = reg.scalar(u32)
-            valid_word = reg.scalar(u32)
-            ptx.selp(u32, q_word, 1, 0, q_valid)
-            ptx.selp(u32, k_word, 1, 0, k_valid)
-            ptx.inst.and_.b32(valid_word, q_word, k_word)
-            is_valid = reg.scalar(pred)
-            ptx.inst.setp.ne.u32(is_valid, valid_word, 0)
-            value = reg.scalar(u8)
-            ptx.selp(u8, value, one, zero, is_valid)
-            ptx.inst.st.global_.u8(ptx.addr(out_batch + linear), value, pred=in_bounds)
+        k = k_tile * block + tid
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, k, time)
+        q_s64 = reg.scalar(s64)
+        k_s64 = reg.scalar(s64)
+        ptx.inst.cvt.s64.u32(q_s64, q)
+        ptx.inst.cvt.s64.u32(k_s64, k)
+        q_valid = reg.scalar(pred)
+        k_valid = reg.scalar(pred)
+        ptx.inst.setp.lt.s64(q_valid, q_s64, length)
+        ptx.inst.setp.lt.s64(k_valid, k_s64, length)
+        q_word = reg.scalar(u32)
+        k_word = reg.scalar(u32)
+        valid_word = reg.scalar(u32)
+        ptx.selp(u32, q_word, 1, 0, q_valid)
+        ptx.selp(u32, k_word, 1, 0, k_valid)
+        ptx.inst.and_.b32(valid_word, q_word, k_word)
+        is_valid = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(is_valid, valid_word, 0)
+        value = reg.scalar(u8)
+        ptx.selp(u8, value, one, zero, is_valid)
+        ptx.inst.st.global_.u8(ptx.addr(out_row + k), value, pred=in_bounds)
         ptx.ret()
 
     return attention_bool_mask
@@ -593,14 +591,14 @@ def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, 
     from pyptx import Tile, kernel, ptx, reg
 
     block = 256
-    total = batch * time * dim
-    items_per_thread = (total + block - 1) // block
+    feature_tiles = (dim + block - 1) // block
+    time_tiles = (time + block - 1) // block
     version = (8, 7) if arch.startswith("sm_100") else None
 
     @kernel(
         in_specs=(Tile(batch, time, dim, f32), Tile(batch, time, pred)),
         out_specs=(Tile(batch, time, dim, f32),),
-        grid=(1, 1, 1),
+        grid=(batch, time, feature_tiles),
         block=(block, 1, 1),
         arch=arch,
         version=version,
@@ -609,28 +607,33 @@ def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, 
         px, pm, po = ptx.global_ptrs(x, mask, out)
         tid = reg.scalar(u32)
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        sample = reg.scalar(u32)
+        ptx.inst.mov.u32(sample, ptx.special.ctaid.x())
+        time_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(time_idx, ptx.special.ctaid.y())
+        feature_tile = reg.scalar(u32)
+        ptx.inst.mov.u32(feature_tile, ptx.special.ctaid.z())
         zero = reg.scalar(f32, init=0.0)
-        for i in range(items_per_thread):
-            linear = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, linear, total)
-            bt = reg.scalar(u32)
-            ptx.inst.div.u32(bt, linear, dim)
-            mask_value = reg.scalar(u32, init=0)
-            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
-            keep = reg.scalar(pred)
-            ptx.inst.setp.ne.u32(keep, mask_value, 0)
-            x_value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
-            y_value = reg.scalar(f32)
-            ptx.selp(f32, y_value, x_value, zero, keep)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        feature = feature_tile * block + tid
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, feature, dim)
+        bt = sample * time + time_idx
+        linear = bt * dim + feature
+        mask_value = reg.scalar(u32, init=0)
+        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt), pred=in_bounds)
+        keep = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(keep, mask_value, 0)
+        x_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+        y_value = reg.scalar(f32)
+        ptx.selp(f32, y_value, x_value, zero, keep)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
         ptx.ret()
 
     @kernel(
         in_specs=(Tile(batch, dim, time, f32), Tile(batch, time, pred)),
         out_specs=(Tile(batch, dim, time, f32),),
-        grid=(1, 1, 1),
+        grid=(batch, dim, time_tiles),
         block=(block, 1, 1),
         arch=arch,
         version=version,
@@ -639,26 +642,27 @@ def _build_apply_time_mask_kernel(batch: int, time: int, dim: int, layout: str, 
         px, pm, po = ptx.global_ptrs(x, mask, out)
         tid = reg.scalar(u32)
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        sample = reg.scalar(u32)
+        ptx.inst.mov.u32(sample, ptx.special.ctaid.x())
+        feature = reg.scalar(u32)
+        ptx.inst.mov.u32(feature, ptx.special.ctaid.y())
+        time_tile = reg.scalar(u32)
+        ptx.inst.mov.u32(time_tile, ptx.special.ctaid.z())
         zero = reg.scalar(f32, init=0.0)
-        for i in range(items_per_thread):
-            linear = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, linear, total)
-            sample = reg.scalar(u32)
-            ptx.inst.div.u32(sample, linear, dim * time)
-            rem = linear - sample * (dim * time)
-            t = reg.scalar(u32)
-            ptx.inst.rem.u32(t, rem, time)
-            mask_idx = sample * time + t
-            mask_value = reg.scalar(u32, init=0)
-            ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
-            keep = reg.scalar(pred)
-            ptx.inst.setp.ne.u32(keep, mask_value, 0)
-            x_value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
-            y_value = reg.scalar(f32)
-            ptx.selp(f32, y_value, x_value, zero, keep)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
+        t = time_tile * block + tid
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, t, time)
+        mask_idx = sample * time + t
+        linear = (sample * dim + feature) * time + t
+        mask_value = reg.scalar(u32, init=0)
+        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + mask_idx), pred=in_bounds)
+        keep = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(keep, mask_value, 0)
+        x_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(x_value, ptx.addr(px + linear * 4), pred=in_bounds)
+        y_value = reg.scalar(f32)
+        ptx.selp(f32, y_value, x_value, zero, keep)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y_value, pred=in_bounds)
         ptx.ret()
 
     return apply_bdt if layout == "bdt" else apply_btd
@@ -675,14 +679,13 @@ def _build_time_recovery_repeat_kernel(
     from pyptx import Tile, kernel, ptx, reg
 
     block = 256
-    total = batch * target_time * dim
-    items_per_thread = (total + block - 1) // block
+    feature_tiles = (dim + block - 1) // block
     version = (8, 7) if arch.startswith("sm_100") else None
 
     @kernel(
         in_specs=(Tile(batch, source_time, dim, f32),),
         out_specs=(Tile(batch, target_time, dim, f32),),
-        grid=(1, 1, 1),
+        grid=(batch, target_time, feature_tiles),
         block=(block, 1, 1),
         arch=arch,
         version=version,
@@ -691,27 +694,27 @@ def _build_time_recovery_repeat_kernel(
         px, po = ptx.global_ptrs(x, out)
         tid = reg.scalar(u32)
         ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        sample = reg.scalar(u32)
+        ptx.inst.mov.u32(sample, ptx.special.ctaid.x())
+        target_t = reg.scalar(u32)
+        ptx.inst.mov.u32(target_t, ptx.special.ctaid.y())
+        feature_tile = reg.scalar(u32)
+        ptx.inst.mov.u32(feature_tile, ptx.special.ctaid.z())
         max_source = source_time - 1
-        for i in range(items_per_thread):
-            linear = tid if i == 0 else tid + (i * block)
-            in_bounds = reg.scalar(pred)
-            ptx.inst.setp.lt.u32(in_bounds, linear, total)
-            sample = reg.scalar(u32)
-            ptx.inst.div.u32(sample, linear, target_time * dim)
-            rem = linear - sample * (target_time * dim)
-            target_t = reg.scalar(u32)
-            ptx.inst.div.u32(target_t, rem, dim)
-            feature = rem - target_t * dim
-            source_t = reg.scalar(u32)
-            ptx.inst.div.u32(source_t, target_t, stride)
-            over = reg.scalar(pred)
-            ptx.inst.setp.gt.u32(over, source_t, max_source)
-            clipped_source = reg.scalar(u32)
-            ptx.selp(u32, clipped_source, max_source, source_t, over)
-            src_idx = (sample * source_time + clipped_source) * dim + feature
-            value = reg.scalar(f32, init=0.0)
-            ptx.inst.ld.global_.f32(value, ptx.addr(px + src_idx * 4), pred=in_bounds)
-            ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), value, pred=in_bounds)
+        feature = feature_tile * block + tid
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, feature, dim)
+        source_t = reg.scalar(u32)
+        ptx.inst.div.u32(source_t, target_t, stride)
+        over = reg.scalar(pred)
+        ptx.inst.setp.gt.u32(over, source_t, max_source)
+        clipped_source = reg.scalar(u32)
+        ptx.selp(u32, clipped_source, max_source, source_t, over)
+        src_idx = (sample * source_time + clipped_source) * dim + feature
+        linear = (sample * target_time + target_t) * dim + feature
+        value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(value, ptx.addr(px + src_idx * 4), pred=in_bounds)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), value, pred=in_bounds)
         ptx.ret()
 
     return repeat_recover

@@ -23,6 +23,11 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from paraformer_pytorch.asr import (
+    ParaformerASR,
+    paraformer_config_from_mapping,
+    paraformer_variant,
+)
 from squeezeformer_pytorch import data as _data
 from squeezeformer_pytorch.asr import (
     CharacterTokenizer,
@@ -632,6 +637,19 @@ def _checkpoint_uses_w2v_bert(checkpoint: dict[str, object] | None) -> bool:
     )
 
 
+def _checkpoint_uses_paraformer(checkpoint: dict[str, object] | None) -> bool:
+    if checkpoint is None:
+        return False
+    training_args = checkpoint.get("training_args")
+    if isinstance(training_args, dict) and bool(training_args.get("paraformer")):
+        return True
+    encoder_config = checkpoint.get("encoder_config")
+    return (
+        isinstance(encoder_config, dict)
+        and str(encoder_config.get("architecture", "")).startswith("paraformer")
+    )
+
+
 def _checkpoint_uses_zipformer_transducer(checkpoint: dict[str, object] | None) -> bool:
     if checkpoint is None:
         return False
@@ -678,6 +696,24 @@ def _resolve_w2v_bert_usage(
         )
     args.w2v_bert = checkpoint_uses_w2v_bert or bool(args.w2v_bert)
     return bool(args.w2v_bert)
+
+
+def _resolve_paraformer_usage(
+    *,
+    args,
+    checkpoint: dict[str, object] | None,
+    checkpoint_path: Path | None,
+) -> bool:
+    checkpoint_uses_paraformer = _checkpoint_uses_paraformer(checkpoint)
+    if checkpoint is None:
+        return bool(args.paraformer)
+    if args.paraformer and not checkpoint_uses_paraformer:
+        raise RuntimeError(
+            f"Resume checkpoint '{checkpoint_path}' was not created for Paraformer, so it cannot "
+            "be resumed with --paraformer."
+        )
+    args.paraformer = checkpoint_uses_paraformer or bool(args.paraformer)
+    return bool(args.paraformer)
 
 
 def _ddp_find_unused_parameters_required(*, use_w2v_bert: bool) -> bool:
@@ -729,6 +765,23 @@ def _validate_w2v_bert_runtime_args(args) -> None:
         raise ValueError("--w2v-bert does not support audio-teacher distillation.")
 
 
+def _validate_paraformer_runtime_args(args) -> None:
+    if args.zipformer:
+        raise ValueError("--paraformer cannot be combined with --zipformer.")
+    if args.w2v_bert:
+        raise ValueError("--paraformer cannot be combined with --w2v-bert.")
+    if args.zipformer_transducer:
+        raise ValueError("--paraformer does not support the Zipformer transducer objective.")
+    if args.aed_decoder:
+        raise ValueError("--paraformer does not support the AED decoder.")
+    if args.liberta_distill:
+        raise ValueError("--paraformer does not support LiBERTa distillation.")
+    if args.audio_teacher:
+        raise ValueError("--paraformer does not support audio-teacher distillation.")
+    if args.dtype == DTypeChoice.FP8:
+        raise ValueError("--paraformer does not currently support --dtype fp8.")
+
+
 def _resolve_w2v_bert_model_source(
     args,
     checkpoint: dict[str, object] | None = None,
@@ -757,6 +810,7 @@ def _resolve_training_featurizer_config(
     checkpoint: dict[str, object] | None,
     use_zipformer: bool,
     use_w2v_bert: bool,
+    use_paraformer: bool,
 ) -> dict[str, object]:
     if checkpoint is not None:
         checkpoint_config = checkpoint.get("featurizer_config")
@@ -1335,10 +1389,11 @@ def main() -> None:
         _initialize_hf_checkpoint_repository(args, output_dir=output_dir, logger=logger)
     resume_path = _resolve_resume_checkpoint_path(args, output_dir=output_dir, logger=logger)
     logger.info(
-        "starting training variant=%s zipformer_requested=%s w2v_bert_requested=%s device=%s distributed=%s world_size=%s output_dir=%s",
+        "starting training variant=%s zipformer_requested=%s w2v_bert_requested=%s paraformer_requested=%s device=%s distributed=%s world_size=%s output_dir=%s",
         args.variant,
         args.zipformer,
         args.w2v_bert,
+        args.paraformer,
         requested_device,
         distributed,
         world_size,
@@ -1458,8 +1513,13 @@ def main() -> None:
         checkpoint=checkpoint,
         checkpoint_path=resume_path,
     )
-    if use_zipformer and use_w2v_bert:
-        raise RuntimeError("--zipformer and --w2v-bert are mutually exclusive.")
+    use_paraformer = _resolve_paraformer_usage(
+        args=args,
+        checkpoint=checkpoint,
+        checkpoint_path=resume_path,
+    )
+    if sum(bool(value) for value in (use_zipformer, use_w2v_bert, use_paraformer)) > 1:
+        raise RuntimeError("--zipformer, --w2v-bert, and --paraformer are mutually exclusive.")
     use_zipformer_transducer = _resolve_zipformer_transducer_usage(
         args=args,
         checkpoint=checkpoint,
@@ -1469,10 +1529,12 @@ def main() -> None:
         _validate_zipformer_runtime_args(args)
     if use_w2v_bert:
         _validate_w2v_bert_runtime_args(args)
+    if use_paraformer:
+        _validate_paraformer_runtime_args(args)
     w2v_bert_model_source = _resolve_w2v_bert_model_source(args, checkpoint)
     if use_zipformer_transducer and not use_zipformer:
         raise RuntimeError("--zipformer-transducer requires --zipformer.")
-    if use_zipformer or use_w2v_bert:
+    if use_zipformer or use_w2v_bert or use_paraformer:
         (
             aed_decoder_enabled,
             aed_decoder_layers,
@@ -1612,6 +1674,7 @@ def main() -> None:
             checkpoint=checkpoint,
             use_zipformer=use_zipformer,
             use_w2v_bert=use_w2v_bert,
+            use_paraformer=use_paraformer,
         ),
         use_zipformer=use_zipformer,
         use_w2v_bert=use_w2v_bert,
@@ -1749,6 +1812,18 @@ def main() -> None:
                 feature_dim=featurizer.n_mels,
             )
         )
+    elif use_paraformer:
+        encoder_config = (
+            paraformer_config_from_mapping(checkpoint["encoder_config"])
+            if checkpoint is not None
+            else paraformer_variant(
+                args.variant,
+                input_dim=featurizer.n_mels,
+                vocab_size=tokenizer.vocab_size,
+                blank_id=tokenizer.blank_id,
+                enhanced=args.paraformer_enhanced,
+            )
+        )
     else:
         encoder_config = (
             SqueezeformerConfig.from_mapping(checkpoint["encoder_config"])
@@ -1817,6 +1892,8 @@ def main() -> None:
         architecture_name = "zipformer"
     elif use_w2v_bert:
         architecture_name = "w2v-bert"
+    elif use_paraformer:
+        architecture_name = "paraformer"
     else:
         architecture_name = "squeezeformer"
     logger.info(
@@ -1865,6 +1942,12 @@ def main() -> None:
             load_pretrained=checkpoint is None,
             use_transformer_engine=args.dtype == DTypeChoice.FP8,
             activation_checkpointing=args.activation_checkpointing,
+        )
+    elif use_paraformer:
+        model = ParaformerASR(
+            encoder_config=encoder_config,
+            alignment_mode=args.paraformer_alignment_mode,
+            alignment_backend=args.paraformer_alignment_backend,
         )
     else:
         model = SqueezeformerCTC(
@@ -2936,7 +3019,11 @@ def main() -> None:
                     "architecture": (
                         "zipformer"
                         if use_zipformer
-                        else ("w2v_bert" if use_w2v_bert else "squeezeformer")
+                        else (
+                            "w2v_bert"
+                            if use_w2v_bert
+                            else ("paraformer" if use_paraformer else "squeezeformer")
+                        )
                     ),
                     "variant": args.variant,
                     "keep_top_k": args.keep_top_k,
