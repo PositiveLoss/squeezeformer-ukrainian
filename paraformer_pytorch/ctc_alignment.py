@@ -95,7 +95,10 @@ def ctc_viterbi_alignment(
         result = batch_ctc_viterbi_alignments_triton(
             log_probs.detach().to(dtype=torch.float32).contiguous().unsqueeze(0),
             torch.tensor([log_probs.size(0)], dtype=torch.long, device=log_probs.device),
-            targets.detach().to(dtype=torch.long, device=log_probs.device).contiguous().unsqueeze(0),
+            targets.detach()
+            .to(dtype=torch.long, device=log_probs.device)
+            .contiguous()
+            .unsqueeze(0),
             torch.tensor([targets.numel()], dtype=torch.long, device=log_probs.device),
             int(blank_id),
         )
@@ -104,7 +107,10 @@ def ctc_viterbi_alignment(
         result = batch_ctc_viterbi_alignments_cuda(
             log_probs.detach().to(dtype=torch.float32).contiguous().unsqueeze(0),
             torch.tensor([log_probs.size(0)], dtype=torch.long, device=log_probs.device),
-            targets.detach().to(dtype=torch.long, device=log_probs.device).contiguous().unsqueeze(0),
+            targets.detach()
+            .to(dtype=torch.long, device=log_probs.device)
+            .contiguous()
+            .unsqueeze(0),
             torch.tensor([targets.numel()], dtype=torch.long, device=log_probs.device),
             int(blank_id),
         )

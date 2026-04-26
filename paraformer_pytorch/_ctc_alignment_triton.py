@@ -125,7 +125,9 @@ def _forward_kernel(
         tl.where((states_count > 1) & (states == (states_count - 2)), final_scores, -1.0e30),
         axis=0,
     )
-    final_state = tl.where((states_count > 1) & (score_penult > score_last), states_count - 2, states_count - 1)
+    final_state = tl.where(
+        (states_count > 1) & (score_penult > score_last), states_count - 2, states_count - 1
+    )
     tl.store(final_states_ptr + pid, final_state)
 
 
@@ -193,7 +195,9 @@ def batch_ctc_viterbi_alignments_triton(
     max_states = max_target_len * 2 + 1
     block_states = _next_power_of_two(max_states)
     if block_states > 1024:
-        raise RuntimeError(f"Triton CTC alignment backend only supports up to 1024 states, got {block_states}.")
+        raise RuntimeError(
+            f"Triton CTC alignment backend only supports up to 1024 states, got {block_states}."
+        )
 
     alignments = torch.full((batch, max_time), blank_id, dtype=torch.long, device=log_probs.device)
     back = torch.full((batch, max_time, max_states), -1, dtype=torch.long, device=log_probs.device)

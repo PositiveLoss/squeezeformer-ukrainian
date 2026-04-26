@@ -40,11 +40,7 @@ def ctc_viterbi_alignment_python(
             candidates = [(dp[t - 1, s], s)]
             if s - 1 >= 0:
                 candidates.append((dp[t - 1, s - 1], s - 1))
-            if (
-                s - 2 >= 0
-                and extended[s] != blank_id
-                and extended[s] != extended[s - 2]
-            ):
+            if s - 2 >= 0 and extended[s] != blank_id and extended[s] != extended[s - 2]:
                 candidates.append((dp[t - 1, s - 2], s - 2))
 
             scores = torch.stack([score for score, _ in candidates])

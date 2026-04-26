@@ -11,4 +11,3 @@ __all__ = [
     "paraformer_config_from_mapping",
     "paraformer_variant",
 ]
-

@@ -114,9 +114,9 @@ def _convert_linear_modules_to_transformer_engine(module: nn.Module) -> int:
 
 def _attention_mask_from_lengths(lengths: Tensor, max_length: int) -> Tensor:
     lengths = lengths.to(dtype=torch.long)
-    return (
-        torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
-    ).to(dtype=torch.long)
+    return (torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)).to(
+        dtype=torch.long
+    )
 
 
 @dataclass(frozen=True)

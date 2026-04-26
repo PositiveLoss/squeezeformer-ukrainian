@@ -11,6 +11,7 @@ from .ctc_alignment import batch_ctc_viterbi_alignments, batch_uniform_alignment
 try:
     dynamo_disable = torch._dynamo.disable
 except AttributeError:
+
     def dynamo_disable(fn):  # type: ignore[no-redef]
         return fn
 
@@ -94,7 +95,9 @@ class ConvSubsampling(nn.Module):
         )
         self.proj = nn.Linear(output_dim * ((input_dim + 3) // 4), output_dim)
 
-    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, features: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = features.unsqueeze(1)
         x = self.conv(x)
         batch, channels, time, freq = x.shape
@@ -179,7 +182,9 @@ class ConformerEncoder(nn.Module):
             ]
         )
 
-    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, features: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x, lengths = self.subsampling(features, lengths)
         mask = lengths_to_padding_mask(lengths, x.size(1))
         for layer in self.layers:

@@ -320,7 +320,9 @@ def compile_callable(fn: Callable[[], Any]) -> Callable[[], Any]:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s:%(name)s:%(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level), format="%(levelname)s:%(name)s:%(message)s"
+    )
     if args.log_pyptx:
         logging.getLogger(pyptx_kernels.__name__).setLevel(logging.DEBUG)
 

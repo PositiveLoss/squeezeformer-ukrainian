@@ -54,7 +54,9 @@ def paraformer_variant(
 
 def paraformer_config_from_mapping(values: Mapping[str, object]) -> ParaformerV2Config:
     architecture = str(values.get("architecture", "paraformer"))
-    config_cls = BetterParaformerV2Config if architecture == "paraformer_better" else ParaformerV2Config
+    config_cls = (
+        BetterParaformerV2Config if architecture == "paraformer_better" else ParaformerV2Config
+    )
     valid_fields = set(config_cls.__dataclass_fields__)
     return config_cls(**{key: value for key, value in values.items() if key in valid_fields})
 

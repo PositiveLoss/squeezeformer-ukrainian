@@ -12,6 +12,7 @@ from .model import ConformerBlock, ConvSubsampling, ParaformerV2Config, lengths_
 try:
     dynamo_disable = torch._dynamo.disable
 except AttributeError:
+
     def dynamo_disable(fn):  # type: ignore[no-redef]
         return fn
 
@@ -25,7 +26,9 @@ class BetterParaformerV2Config(ParaformerV2Config):
     low_confidence_threshold: float = 0.7
 
     @classmethod
-    def from_variant(cls, variant: str, **overrides: int | float | None) -> "BetterParaformerV2Config":
+    def from_variant(
+        cls, variant: str, **overrides: int | float | None
+    ) -> "BetterParaformerV2Config":
         base = ParaformerV2Config.from_variant(variant)
         config = {
             "architecture": "paraformer_better",
@@ -64,7 +67,9 @@ class MultiResolutionConformerEncoder(nn.Module):
         )
         self.shallow_index = max(0, (config.encoder_layers // 2) - 1)
 
-    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, features: torch.Tensor, lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x, lengths = self.subsampling(features, lengths)
         mask = lengths_to_padding_mask(lengths, x.size(1))
         shallow = None
@@ -132,7 +137,9 @@ class BetterParaformerV2(nn.Module):
         alignment_mode: str = "viterbi",
         alignment_backend: str = "auto",
     ) -> dict[str, torch.Tensor]:
-        shallow_encoder_out, final_encoder_out, encoder_lengths = self.encoder(features, feature_lengths)
+        shallow_encoder_out, final_encoder_out, encoder_lengths = self.encoder(
+            features, feature_lengths
+        )
         shallow_logits = self.shallow_ctc_projection(shallow_encoder_out)
         final_logits = self.final_ctc_projection(final_encoder_out)
         shallow_log_probs = F.log_softmax(shallow_logits, dim=-1)
@@ -173,7 +180,9 @@ class BetterParaformerV2(nn.Module):
             boundary_logits.sigmoid(),
             self.config.confidence_threshold,
         )
-        decoder_in = self.query_projection(query_features) * query_confidences.unsqueeze(-1).clamp_min(0.1)
+        decoder_in = self.query_projection(query_features) * query_confidences.unsqueeze(
+            -1
+        ).clamp_min(0.1)
         memory = self.memory_projection(final_encoder_out)
         tgt_mask = lengths_to_padding_mask(query_lengths, decoder_in.size(1))
         memory_mask = lengths_to_padding_mask(encoder_lengths, memory.size(1))
@@ -244,7 +253,9 @@ class BetterParaformerV2(nn.Module):
         base_ce_loss = masked_cross_entropy(out["initial_decoder_logits"], targets, target_lengths)
         refined_ce_loss = masked_cross_entropy(out["decoder_logits"], targets, target_lengths)
         boundary_targets = build_boundary_targets(out["alignments"], out["encoder_lengths"])
-        boundary_mask = ~lengths_to_padding_mask(out["encoder_lengths"], out["boundary_logits"].size(1))
+        boundary_mask = ~lengths_to_padding_mask(
+            out["encoder_lengths"], out["boundary_logits"].size(1)
+        )
         boundary_loss = F.binary_cross_entropy_with_logits(
             out["boundary_logits"][boundary_mask],
             boundary_targets[boundary_mask],
@@ -306,7 +317,9 @@ def compress_confidence_gated_queries(
             shallow_pool = (shallow_frames[start:end] * gate.unsqueeze(-1)).sum(dim=0) / gate_sum
             final_pool = (final_frames[start:end] * gate.unsqueeze(-1)).sum(dim=0) / gate_sum
             segment_confidence = frame_confidence.mean()
-            left_boundary = boundaries[start - 1] if segment_index > 0 else boundaries.new_tensor(1.0)
+            left_boundary = (
+                boundaries[start - 1] if segment_index > 0 else boundaries.new_tensor(1.0)
+            )
             right_boundary = boundaries[end - 1]
             smooth_left = (1.0 - left_boundary) * 0.25
             smooth_right = (1.0 - right_boundary) * 0.25
@@ -340,7 +353,11 @@ def compress_confidence_gated_queries(
     for batch_index, piece in enumerate(pieces):
         padded[batch_index, : piece.size(0)] = piece
         padded_confidences[batch_index, : piece.size(0)] = piece_confidences[batch_index]
-    return padded, torch.tensor(piece_lengths, dtype=torch.long, device=shallow_posteriors.device), padded_confidences
+    return (
+        padded,
+        torch.tensor(piece_lengths, dtype=torch.long, device=shallow_posteriors.device),
+        padded_confidences,
+    )
 
 
 @dynamo_disable

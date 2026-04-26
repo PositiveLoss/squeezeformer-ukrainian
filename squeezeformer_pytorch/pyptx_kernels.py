@@ -147,9 +147,8 @@ def _flat_1d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
 def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import pred, s64, u8, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import pred, s64, u8, u32
 
     block = 256
     items_per_thread = (time + block - 1) // block
@@ -210,9 +209,8 @@ def _build_attention_bool_mask_kernel(batch: int, time: int, arch: str):
 def _build_scale_bias_kernel(m: int, f: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import f32, u32
 
     block = _pick_block(f)
     items_per_thread = f // block
@@ -279,9 +277,8 @@ def _build_scale_bias_kernel(m: int, f: int, arch: str):
 def _build_masked_mean_kernel(batch: int, time: int, dim: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, s64, u32
-
     from pyptx import Tile, kernel, ptx, reg, smem
+    from pyptx.types import f32, pred, s64, u32
 
     warp_size = 32
     block = 256
@@ -388,9 +385,8 @@ def _build_ctc_log_prob_frame_stats_kernel(
 ):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, s64, u32
-
     from pyptx import Tile, kernel, ptx, reg, smem
+    from pyptx.types import f32, pred, s64, u32
 
     warp_size = 32
     block = 256
@@ -511,9 +507,8 @@ def _build_ctc_log_prob_frame_stats_kernel(
 def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import f32, pred, u32
 
     total = batch * time * dim
     scalar_block = 256
@@ -665,9 +660,8 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
 def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import f32, pred, u32
 
     v4_block = _pick_v4_block_or_none(dim)
     block = v4_block if v4_block is not None else 256
@@ -677,7 +671,11 @@ def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: st
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
     @kernel(
-        in_specs=(Tile(batch, time, dim, f32), Tile(batch, dim, time, f32), Tile(batch, time, pred)),
+        in_specs=(
+            Tile(batch, time, dim, f32),
+            Tile(batch, dim, time, f32),
+            Tile(batch, time, pred),
+        ),
         out_specs=(Tile(batch, time, dim, f32),),
         grid=(batch, time, 1),
         block=(block, 1, 1),
@@ -749,9 +747,8 @@ def _build_swoosh_kernel(
 ):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import f32, pred, u32
 
     block = 256
     grid_x = (total + block - 1) // block
@@ -817,9 +814,8 @@ def _build_swoosh_kernel(
 def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, u32
-
     from pyptx import Tile, kernel, ptx, reg
+    from pyptx.types import f32, pred, u32
 
     f = f2 // 2
     total = m * f
@@ -908,9 +904,8 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
 def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
-    from pyptx.types import f32, pred, u32
-
     from pyptx import Tile, kernel, ptx, reg, smem
+    from pyptx.types import f32, pred, u32
 
     warp_size = 32
     block = 256
@@ -1060,7 +1055,7 @@ def squeezeformer_attention_mask_or_torch(lengths: Tensor, max_length: int | Non
             (lengths.size(0), 0, 0),
             device=lengths.device,
             dtype=torch.bool,
-    )
+        )
     lengths = lengths.to(dtype=torch.long).contiguous()
     if not _is_cuda_int64(lengths) or lengths.dim() != 1:
         sequence_mask = _torch_sequence_mask(lengths, max_length=max_length)
@@ -1253,7 +1248,9 @@ def gated_linear_unit_or_torch(projected: Tensor) -> Tensor:
             flat.size(1),
             _arch_for(projected),
         )
-        return _launch_pyptx_kernel(kernel, flat).reshape(*original_shape[:-1], original_shape[-1] // 2)
+        return _launch_pyptx_kernel(kernel, flat).reshape(
+            *original_shape[:-1], original_shape[-1] // 2
+        )
     except Exception as exc:
         _LOGGER.debug(
             "using torch gated_linear_unit fallback after pyptx failure shape=%s: %s",
@@ -1282,7 +1279,9 @@ def bias_norm_or_torch(x: Tensor, bias: Tensor, log_scale: Tensor, eps: float) -
     try:
         kernel = _build_bias_norm_kernel(flat.size(0), flat.size(1), float(eps), _arch_for(x))
         _log_kernel_use_once("bias_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
-        return _launch_pyptx_kernel(kernel, flat, bias, log_scale.reshape(1)).reshape(original_shape)
+        return _launch_pyptx_kernel(kernel, flat, bias, log_scale.reshape(1)).reshape(
+            original_shape
+        )
     except Exception as exc:
         _LOGGER.debug(
             "using torch bias_norm fallback after pyptx failure shape=%s: %s",

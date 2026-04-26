@@ -40,4 +40,3 @@ def test_paraformer_asr_training_contract_smoke() -> None:
     assert outputs["main_log_probs"].shape[-1] == config.vocab_size
     assert outputs["output_lengths"].tolist() == [6, 5]
     outputs["main_ctc_loss"].backward()
-

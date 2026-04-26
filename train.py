@@ -644,10 +644,9 @@ def _checkpoint_uses_paraformer(checkpoint: dict[str, object] | None) -> bool:
     if isinstance(training_args, dict) and bool(training_args.get("paraformer")):
         return True
     encoder_config = checkpoint.get("encoder_config")
-    return (
-        isinstance(encoder_config, dict)
-        and str(encoder_config.get("architecture", "")).startswith("paraformer")
-    )
+    return isinstance(encoder_config, dict) and str(
+        encoder_config.get("architecture", "")
+    ).startswith("paraformer")
 
 
 def _checkpoint_uses_zipformer_transducer(checkpoint: dict[str, object] | None) -> bool:
