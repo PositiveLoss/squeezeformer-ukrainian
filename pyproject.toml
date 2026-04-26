@@ -47,7 +47,7 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-asr-features = { path = "rust_feature_cache_warmer" }
+asr-features = { path = "rust" }
 torch = [
     { index = "pytorch-cu126", group = "cu126" },
     { index = "pytorch-cu128", group = "cu12" },

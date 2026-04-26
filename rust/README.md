@@ -21,7 +21,7 @@ The crate has no default features. Pick the capability set you want:
 Build the CLI against the system FFmpeg development libraries with:
 
 ```bash
-cargo build --release --manifest-path rust_feature_cache_warmer/Cargo.toml --bin asr-features --features cli
+cargo build --release --manifest-path rust/Cargo.toml --bin asr-features --features cli
 ```
 
 To build and statically link the FFmpeg 8.x release used by `ffmpeg-sys-next`
@@ -29,13 +29,13 @@ instead of system-installed FFmpeg libraries, enable `bundled-ffmpeg`:
 
 ```bash
 sudo apt-get install -y clang nasm pkg-config
-cargo build --release --manifest-path rust_feature_cache_warmer/Cargo.toml --bin asr-features --features cli,bundled-ffmpeg
+cargo build --release --manifest-path rust/Cargo.toml --bin asr-features --features cli,bundled-ffmpeg
 ```
 
 Example:
 
 ```bash
-cargo run --release --manifest-path rust_feature_cache_warmer/Cargo.toml --features cli -- \
+cargo run --release --manifest-path rust/Cargo.toml --features cli -- \
   --input /data/cv22/train.parquet \
   --cache-dir artifacts/feature-cache/train \
   --frontend squeezeformer \
@@ -54,19 +54,19 @@ Python-compatible disk-backed record cache first, then feed a split JSONL file
 to the feature warmer:
 
 ```bash
-cargo run --release --manifest-path rust_feature_cache_warmer/Cargo.toml --features cli -- record-cache \
+cargo run --release --manifest-path rust/Cargo.toml --features cli -- record-cache \
   --record-cache-dir /content/cache-cv-zipformer \
   --dataset-source /content/cv22-opus/ \
   --validation-dataset-source /content/cv10-uk-testset-clean-punctuated/data/ \
   --require-readable-audio
 
-cargo run --release --manifest-path rust_feature_cache_warmer/Cargo.toml --features cli -- \
+cargo run --release --manifest-path rust/Cargo.toml --features cli -- \
   --input-record-cache /content/cache-cv-zipformer/train.jsonl \
   --cache-dir /content/feature-cache-parquet-cv-zipformer/train \
   --frontend zipformer \
   --threads 26
 
-cargo run --release --manifest-path rust_feature_cache_warmer/Cargo.toml --features cli -- \
+cargo run --release --manifest-path rust/Cargo.toml --features cli -- \
   --input-record-cache /content/cache-cv-zipformer/validation.jsonl \
   --cache-dir /content/feature-cache-parquet-cv-zipformer/validation \
   --frontend zipformer \
@@ -87,7 +87,7 @@ shard flush details, or `RUST_LOG=asr_features=trace` for per-row
 feature extraction logs:
 
 ```bash
-RUST_LOG=asr_features=debug cargo run --release --manifest-path rust_feature_cache_warmer/Cargo.toml --features cli -- \
+RUST_LOG=asr_features=debug cargo run --release --manifest-path rust/Cargo.toml --features cli -- \
   --input /data/cv22/train.parquet \
   --cache-dir artifacts/feature-cache/train
 ```
@@ -128,7 +128,7 @@ The feature extraction code is also exposed as an optional PyO3 extension. Build
 and install it into the active Python environment with:
 
 ```bash
-cd rust_feature_cache_warmer
+cd rust
 maturin develop --features python --release
 ```
 

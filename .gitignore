@@ -7,7 +7,7 @@ __pycache__/
 
 # Rust
 /target/
-/rust_feature_cache_warmer/target/
+/rust/target/
 **/*.rs.bk
 
 artifacts/
