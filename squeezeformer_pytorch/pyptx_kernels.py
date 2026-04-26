@@ -1081,7 +1081,12 @@ def _build_layer_norm_silu_scale_kernel(rows: int, dim: int, eps: float, dtype: 
             ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
 
     @kernel(
-        in_specs=(Tile(rows, dim, data_t), Tile(dim, data_t), Tile(dim, data_t), Tile(rows, data_t)),
+        in_specs=(
+            Tile(rows, dim, data_t),
+            Tile(dim, data_t),
+            Tile(dim, data_t),
+            Tile(rows, data_t),
+        ),
         out_specs=(Tile(rows, dim, data_t),),
         grid=(rows, 1, 1),
         block=(block, 1, 1),
@@ -1515,11 +1520,7 @@ def layer_norm_silu_scale_or_torch(
         or x.size(-1) != bias.numel()
         or confidence.shape != x.shape[:-1]
         or not _is_inference_cuda_float(x, weight, bias)
-        or not (
-            confidence.is_cuda
-            and confidence.dtype == x.dtype
-            and confidence.is_contiguous()
-        )
+        or not (confidence.is_cuda and confidence.dtype == x.dtype and confidence.is_contiguous())
     ):
         return torch_epilogue()
     flat, original_shape = _flat_2d(x)

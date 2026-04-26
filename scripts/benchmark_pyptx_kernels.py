@@ -264,8 +264,10 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         eps = 1.0e-5
         return (
             lambda: layer_norm_silu_scale_or_torch(x, weight, bias, confidence, eps),
-            lambda: F.silu(F.layer_norm(x, (dim,), weight, bias, eps))
-            * confidence.unsqueeze(-1).clamp_min(0.1),
+            lambda: (
+                F.silu(F.layer_norm(x, (dim,), weight, bias, eps))
+                * confidence.unsqueeze(-1).clamp_min(0.1)
+            ),
         )
 
     def ctc_stats_case(device: torch.device):
