@@ -71,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         help="Wrap both helper and Torch reference callables in torch.compile before timing.",
     )
     parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        help="Configure Python logging verbosity.",
+    )
+    parser.add_argument(
+        "--log-pyptx",
+        action="store_true",
+        help="Enable DEBUG logging for squeezeformer_pytorch.pyptx_kernels.",
+    )
+    parser.add_argument(
         "--cases",
         nargs="*",
         default=["all"],
@@ -385,6 +396,10 @@ def compile_callable(fn: Callable[[], Any]) -> Callable[[], Any]:
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s:%(name)s:%(message)s")
+    if args.log_pyptx:
+        logging.getLogger(pyptx_kernels.__name__).setLevel(logging.DEBUG)
+
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested, but torch.cuda.is_available() is false.")

@@ -17,6 +17,7 @@ _BLOCK_CANDIDATES = (1024, 512, 256, 128, 64, 32)
 _LOG2E = 1.4426950408889634
 _LN2 = 0.6931471805599453
 _PYPTX_IMPORT_READY = False
+_PYPTX_TORCH_RUNTIME_READY = False
 _LOGGER = logging.getLogger(__name__)
 _LOGGED_KERNEL_USES: set[tuple[object, ...]] = set()
 
@@ -49,6 +50,30 @@ def _ensure_pyptx_importable() -> bool:
             return False
     _PYPTX_IMPORT_READY = True
     return True
+
+
+def _ensure_pyptx_torch_runtime_ready() -> None:
+    global _PYPTX_TORCH_RUNTIME_READY
+    if _PYPTX_TORCH_RUNTIME_READY or _PYPTX_DISABLED:
+        return
+    try:
+        from pyptx import torch_support
+
+        shim_path = torch_support._find_shim_path()
+        if shim_path is None:
+            try:
+                from pyptx._shim.auto_build import try_auto_build
+
+                shim_path = try_auto_build()
+            except Exception as exc:
+                _LOGGER.debug("pyptx shim auto-build failed: %s", exc)
+
+        ext = torch_support._try_load_cpp_ext()
+        if ext is not None and shim_path is not None:
+            ext.load_shim(shim_path)
+        _PYPTX_TORCH_RUNTIME_READY = True
+    except Exception as exc:
+        _LOGGER.debug("pyptx torch runtime setup failed: %s", exc)
 
 
 def _is_inference_cuda_f32(x: Tensor, *others: Tensor) -> bool:
@@ -1316,6 +1341,7 @@ _disable_kernel_builders_for_torch_compile()
 
 
 def _launch_pyptx_kernel(kernel, *args):
+    _ensure_pyptx_torch_runtime_ready()
     return kernel(*args)
 
 
