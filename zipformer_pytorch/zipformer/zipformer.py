@@ -6,13 +6,20 @@ from typing import Sequence
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
+from squeezeformer_pytorch.pyptx_kernels import (
+    apply_time_mask_or_torch,
+    bias_norm_or_torch,
+    gated_linear_unit_or_torch,
+    sequence_mask_or_torch,
+    swoosh_l_or_torch,
+    swoosh_r_or_torch,
+)
 from zipformer_pytorch.fp8 import apply_linear_with_fp8_padding, make_linear
 
 
 def _make_padding_mask(lengths: Tensor, *, max_length: int) -> Tensor:
-    return torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return sequence_mask_or_torch(lengths, max_length=max_length)
 
 
 def _ceil_divide(lengths: Tensor, factor: int) -> Tensor:
@@ -36,7 +43,7 @@ def _convert_num_channels(x: Tensor, num_channels: int) -> Tensor:
 def _mask_tensor(x: Tensor, mask: Tensor | None) -> Tensor:
     if mask is None:
         return x
-    return x.masked_fill(~mask.unsqueeze(-1), 0.0)
+    return apply_time_mask_or_torch(x, mask, layout="btd")
 
 
 def _no_op(x: Tensor) -> Tensor:
@@ -302,12 +309,12 @@ class Whiten(nn.Module):
 
 class SwooshR(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
-        return F.softplus(x - 1.0) - 0.08 * x - 0.313261687
+        return swoosh_r_or_torch(x)
 
 
 class SwooshL(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
-        return F.softplus(x - 4.0) - 0.08 * x - 0.035
+        return swoosh_l_or_torch(x)
 
 
 class BiasNorm(nn.Module):
@@ -321,9 +328,7 @@ class BiasNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if x.size(-1) != self.num_features:
             raise ValueError(f"BiasNorm expected {self.num_features} channels, got {x.size(-1)}.")
-        bias = self.bias.view(*([1] * (x.ndim - 1)), self.num_features)
-        rms = (x - bias).pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms * self.log_scale.exp()
+        return bias_norm_or_torch(x, self.bias, self.log_scale, self.eps)
 
 
 class BypassModule(nn.Module):
@@ -879,14 +884,12 @@ class ZipformerConvModule(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: Tensor, mask: Tensor | None) -> Tensor:
-        x, gate = self.input_balancer(apply_linear_with_fp8_padding(self.input_proj, x)).chunk(
-            2,
-            dim=-1,
+        x = gated_linear_unit_or_torch(
+            self.input_balancer(apply_linear_with_fp8_padding(self.input_proj, x))
         )
-        x = x * torch.sigmoid(gate)
         x = x.transpose(1, 2)
         if mask is not None:
-            x = x.masked_fill(~mask.unsqueeze(1), 0.0)
+            x = apply_time_mask_or_torch(x, mask, layout="bdt")
         x = self.depthwise(x)
         x = x.transpose(1, 2)
         x = self.depthwise_balancer(x)

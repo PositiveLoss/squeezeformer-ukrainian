@@ -18,6 +18,7 @@ _PYPTX_DISABLED = os.environ.get("SQUEEZEFORMER_DISABLE_PYPTX", "").lower() in {
 }
 _BLOCK_CANDIDATES = (1024, 512, 256, 128, 64, 32)
 _LOG2E = 1.4426950408889634
+_LN2 = 0.6931471805599453
 _PYPTX_IMPORT_READY = False
 _LOGGER = logging.getLogger(__name__)
 _LOGGED_KERNEL_USES: set[tuple[object, ...]] = set()
@@ -99,6 +100,11 @@ def _pick_block(n: int) -> int:
 def _flat_2d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
     original_shape = tuple(x.shape)
     return x.reshape(-1, original_shape[-1]), original_shape
+
+
+def _flat_1d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
+    original_shape = tuple(x.shape)
+    return x.reshape(-1), original_shape
 
 
 @lru_cache(maxsize=128)
@@ -909,6 +915,231 @@ def _build_silu_kernel(m: int, f: int, arch: str):
     return silu
 
 
+@lru_cache(maxsize=128)
+def _build_swoosh_kernel(total: int, offset: float, linear_scale: float, constant: float, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    grid_x = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(total, f32),),
+        out_specs=(Tile(total, f32),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def swoosh(x, out):
+        px, po = ptx.global_ptrs(x, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        idx = block_idx * block + tid
+        one = reg.scalar(f32, init=1.0)
+        log2e = reg.scalar(f32, init=_LOG2E)
+        ln2 = reg.scalar(f32, init=_LN2)
+        offset_reg = reg.scalar(f32, init=offset)
+        linear_scale_reg = reg.scalar(f32, init=linear_scale)
+        constant_reg = reg.scalar(f32, init=constant)
+
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, idx, total)
+        xv = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
+        shifted = reg.scalar(f32)
+        ptx.inst.sub.f32(shifted, xv, offset_reg)
+        abs_shifted = reg.scalar(f32)
+        ptx.inst.abs.f32(abs_shifted, shifted)
+        neg_abs_shifted = reg.scalar(f32)
+        ptx.inst.neg.f32(neg_abs_shifted, abs_shifted)
+        exp_arg = reg.scalar(f32)
+        ptx.inst.mul.f32(exp_arg, neg_abs_shifted, log2e)
+        exp_value = reg.scalar(f32)
+        ptx.inst.ex2.approx.f32(exp_value, exp_arg)
+        one_plus = reg.scalar(f32)
+        ptx.inst.add.f32(one_plus, one, exp_value)
+        log2_value = reg.scalar(f32)
+        ptx.inst.lg2.approx.f32(log2_value, one_plus)
+        log1p_exp = reg.scalar(f32)
+        ptx.inst.mul.f32(log1p_exp, log2_value, ln2)
+        zero = reg.scalar(f32, init=0.0)
+        max_shifted = reg.scalar(f32)
+        ptx.inst.max.f32(max_shifted, shifted, zero)
+        softplus = reg.scalar(f32)
+        ptx.inst.add.f32(softplus, max_shifted, log1p_exp)
+        y = reg.scalar(f32)
+        ptx.inst.fma.rn.f32(y, xv, linear_scale_reg, softplus)
+        ptx.inst.sub.f32(y, y, constant_reg)
+        ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+        ptx.ret()
+
+    return swoosh
+
+
+@lru_cache(maxsize=128)
+def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    block = 256
+    f = f2 // 2
+    total = m * f
+    grid_x = (total + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(m, f2, f32),),
+        out_specs=(Tile(m, f, f32),),
+        grid=(grid_x, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def gated_linear_unit(projected, out):
+        pp, po = ptx.global_ptrs(projected, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        block_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(block_idx, ptx.special.ctaid.x())
+        linear = block_idx * block + tid
+        neg_log2e = reg.scalar(f32, init=-_LOG2E)
+        one = reg.scalar(f32, init=1.0)
+
+        in_bounds = reg.scalar(pred)
+        ptx.inst.setp.lt.u32(in_bounds, linear, total)
+        row = reg.scalar(u32)
+        ptx.inst.div.u32(row, linear, f)
+        col = linear - row * f
+        row_base = row * f2
+        x_value = reg.scalar(f32, init=0.0)
+        gate_value = reg.scalar(f32, init=0.0)
+        ptx.inst.ld.global_.f32(
+            x_value,
+            ptx.addr(pp + (row_base + col) * 4),
+            pred=in_bounds,
+        )
+        ptx.inst.ld.global_.f32(
+            gate_value,
+            ptx.addr(pp + (row_base + f + col) * 4),
+            pred=in_bounds,
+        )
+        neg_gate = reg.scalar(f32)
+        ptx.inst.mul.f32(neg_gate, gate_value, neg_log2e)
+        exp_neg = reg.scalar(f32)
+        ptx.inst.ex2.approx.f32(exp_neg, neg_gate)
+        denom = reg.scalar(f32)
+        ptx.inst.add.f32(denom, one, exp_neg)
+        sigm = reg.scalar(f32)
+        ptx.inst.rcp.approx.f32(sigm, denom)
+        y = reg.scalar(f32)
+        ptx.inst.mul.f32(y, x_value, sigm)
+        ptx.inst.st.global_.f32(ptx.addr(po + linear * 4), y, pred=in_bounds)
+        ptx.ret()
+
+    return gated_linear_unit
+
+
+@lru_cache(maxsize=128)
+def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg, smem
+
+    warp_size = 32
+    block = 256
+    num_warps = block // warp_size
+    items_per_thread = (dim + block - 1) // block
+    version = (8, 7) if arch.startswith("sm_100") else None
+
+    @kernel(
+        in_specs=(Tile(rows, dim, f32), Tile(dim, f32), Tile(1, f32)),
+        out_specs=(Tile(rows, dim, f32),),
+        grid=(rows, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def bias_norm(x, bias, log_scale, out):
+        partials = smem.alloc(f32, (num_warps, 1))
+        stats = smem.alloc(f32, (1, 1))
+        px, pb, pls, po = ptx.global_ptrs(x, bias, log_scale, out)
+        row = reg.scalar(u32)
+        ptx.inst.mov.u32(row, ptx.special.ctaid.x())
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        lane = tid & (warp_size - 1)
+        warp_id = tid >> 5
+        row_byte_off = row * (dim * 4)
+        px += row_byte_off
+        po += row_byte_off
+
+        sum_sq = reg.scalar(f32, init=0.0)
+        for i in range(items_per_thread):
+            idx = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, idx, dim)
+            xv = reg.scalar(f32, init=0.0)
+            bv = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
+            ptx.inst.ld.global_.f32(bv, ptx.addr(pb + idx * 4), pred=in_bounds)
+            diff = reg.scalar(f32)
+            ptx.inst.sub.f32(diff, xv, bv)
+            ptx.inst.fma.rn.f32(sum_sq, diff, diff, sum_sq)
+
+        ptx.warp.reduce_sum(sum_sq)
+        with ptx.if_(lane == 0):
+            partials[warp_id, 0] = sum_sq
+        ptx.bar.sync(0)
+
+        with ptx.if_(tid == 0):
+            block_sum = reg.scalar(f32, init=0.0)
+            for i in range(num_warps):
+                ptx.inst.add.f32(block_sum, block_sum, partials[i, 0])
+            stats[0, 0] = block_sum
+        ptx.bar.sync(0)
+
+        ptx.inst.mov.f32(sum_sq, stats[0, 0])
+        inv_dim = reg.scalar(f32, init=1.0 / dim)
+        mean_sq = reg.scalar(f32)
+        ptx.inst.mul.f32(mean_sq, sum_sq, inv_dim)
+        eps_reg = reg.scalar(f32, init=eps)
+        ptx.inst.add.f32(mean_sq, mean_sq, eps_reg)
+        rstd = reg.scalar(f32)
+        ptx.inst.rsqrt.approx.f32(rstd, mean_sq)
+        ls = reg.scalar(f32)
+        ptx.inst.ld.global_.f32(ls, ptx.addr(pls))
+        exp_arg = reg.scalar(f32)
+        ptx.inst.mul.f32(exp_arg, ls, _LOG2E)
+        scale = reg.scalar(f32)
+        ptx.inst.ex2.approx.f32(scale, exp_arg)
+        ptx.inst.mul.f32(scale, scale, rstd)
+
+        for i in range(items_per_thread):
+            idx = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, idx, dim)
+            xv = reg.scalar(f32, init=0.0)
+            ptx.inst.ld.global_.f32(xv, ptx.addr(px + idx * 4), pred=in_bounds)
+            y = reg.scalar(f32)
+            ptx.inst.mul.f32(y, xv, scale)
+            ptx.inst.st.global_.f32(ptx.addr(po + idx * 4), y, pred=in_bounds)
+        ptx.ret()
+
+    return bias_norm
+
+
 def _arch_for(x: Tensor) -> str:
     major, _minor = torch.cuda.get_device_capability(x.device)
     if major >= 10:
@@ -1051,6 +1282,109 @@ def silu_or_torch(x: Tensor) -> Tensor:
             exc,
         )
         return F.silu(x)
+
+
+def swoosh_l_or_torch(x: Tensor) -> Tensor:
+    return _swoosh_or_torch(x, offset=4.0, linear_scale=-0.08, constant=0.035, name="swoosh_l")
+
+
+def swoosh_r_or_torch(x: Tensor) -> Tensor:
+    return _swoosh_or_torch(
+        x,
+        offset=1.0,
+        linear_scale=-0.08,
+        constant=0.313261687,
+        name="swoosh_r",
+    )
+
+
+def _swoosh_or_torch(
+    x: Tensor,
+    *,
+    offset: float,
+    linear_scale: float,
+    constant: float,
+    name: str,
+) -> Tensor:
+    def torch_swoosh() -> Tensor:
+        return F.softplus(x - offset) + linear_scale * x - constant
+
+    if not _is_inference_cuda_f32(x) or x.dim() < 1:
+        return torch_swoosh()
+    flat, original_shape = _flat_1d(x)
+    try:
+        kernel = _build_swoosh_kernel(
+            flat.numel(),
+            float(offset),
+            float(linear_scale),
+            float(constant),
+            _arch_for(x),
+        )
+        _log_kernel_use_once(name, flat.numel(), _arch_for(x))
+        return kernel(flat).reshape(original_shape)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch %s fallback after pyptx failure shape=%s: %s",
+            name,
+            original_shape,
+            exc,
+        )
+        return torch_swoosh()
+
+
+def gated_linear_unit_or_torch(projected: Tensor) -> Tensor:
+    if projected.size(-1) % 2 != 0:
+        x, gate = projected.chunk(2, dim=-1)
+        return x * torch.sigmoid(gate)
+    if not _is_inference_cuda_f32(projected) or projected.dim() < 1:
+        x, gate = projected.chunk(2, dim=-1)
+        return x * torch.sigmoid(gate)
+    flat, original_shape = _flat_2d(projected)
+    try:
+        kernel = _build_gated_linear_unit_kernel(flat.size(0), flat.size(1), _arch_for(projected))
+        _log_kernel_use_once(
+            "gated_linear_unit",
+            flat.size(0),
+            flat.size(1),
+            _arch_for(projected),
+        )
+        return kernel(flat).reshape(*original_shape[:-1], original_shape[-1] // 2)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch gated_linear_unit fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
+        x, gate = projected.chunk(2, dim=-1)
+        return x * torch.sigmoid(gate)
+
+
+def bias_norm_or_torch(x: Tensor, bias: Tensor, log_scale: Tensor, eps: float) -> Tensor:
+    def torch_bias_norm() -> Tensor:
+        view_shape = (*([1] * (x.ndim - 1)), x.size(-1))
+        bias_view = bias.view(view_shape)
+        rms = (x - bias_view).pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+        return x / rms * log_scale.exp()
+
+    if (
+        x.dim() < 1
+        or x.size(-1) != bias.numel()
+        or log_scale.numel() != 1
+        or not _is_inference_cuda_f32(x, bias, log_scale)
+    ):
+        return torch_bias_norm()
+    flat, original_shape = _flat_2d(x)
+    try:
+        kernel = _build_bias_norm_kernel(flat.size(0), flat.size(1), float(eps), _arch_for(x))
+        _log_kernel_use_once("bias_norm", flat.size(0), flat.size(1), float(eps), _arch_for(x))
+        return kernel(flat, bias, log_scale.reshape(1)).reshape(original_shape)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch bias_norm fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
+        return torch_bias_norm()
 
 
 def layer_norm_or_torch(
