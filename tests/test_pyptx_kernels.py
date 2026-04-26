@@ -49,3 +49,14 @@ def test_fused_residual_add_matches_torch_fallback() -> None:
     x = torch.randn(2, 3, 4)
 
     assert torch.allclose(residual_add_or_torch(residual, x, 0.5), residual + 0.5 * x)
+
+
+def test_arch_for_uses_sm120_for_rtx_blackwell(monkeypatch) -> None:
+    import squeezeformer_pytorch.pyptx_kernels as pyptx_kernels
+
+    class _FakeTensor:
+        device = torch.device("cuda")
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+
+    assert pyptx_kernels._arch_for(_FakeTensor()) == "sm_120"

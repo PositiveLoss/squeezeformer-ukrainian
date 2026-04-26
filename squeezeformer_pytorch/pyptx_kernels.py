@@ -1329,7 +1329,9 @@ if _torch_compile_disable is not None:
 
 
 def _arch_for(x: Tensor) -> str:
-    major, _minor = torch.cuda.get_device_capability(x.device)
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if major >= 12:
+        return f"sm_{major}{minor}"
     if major >= 10:
         return "sm_100a"
     return "sm_90a"

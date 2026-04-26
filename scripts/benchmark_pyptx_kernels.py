@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from collections.abc import Callable
@@ -92,6 +93,27 @@ def pyptx_disabled():
         yield
     finally:
         pyptx_kernels._PYPTX_DISABLED = previous
+
+
+@contextmanager
+def capture_pyptx_fallbacks():
+    records: list[logging.LogRecord] = []
+
+    class _FallbackHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "fallback" in record.getMessage():
+                records.append(record)
+
+    logger = logging.getLogger(pyptx_kernels.__name__)
+    handler = _FallbackHandler(level=logging.DEBUG)
+    logger.addHandler(handler)
+    previous_level = logger.level
+    logger.setLevel(min(previous_level, logging.DEBUG) if previous_level else logging.DEBUG)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 def time_callable(
@@ -384,11 +406,13 @@ def main() -> None:
             torch_fn = compile_callable(torch_fn)
 
         with torch.inference_mode():
-            pyptx_out = pyptx_fn()
+            with capture_pyptx_fallbacks() as fallback_records:
+                pyptx_out = pyptx_fn()
             with pyptx_disabled():
                 torch_out = torch_fn()
             synchronize(device)
         diff = max_abs_diff(pyptx_out, torch_out)
+        pyptx_fell_back = bool(fallback_records)
 
         pyptx_ms = time_callable(
             pyptx_fn,
@@ -410,6 +434,7 @@ def main() -> None:
                 "mode": ("compile" if args.torch_compile else "pyptx")
                 if device.type == "cuda"
                 else ("compile" if args.torch_compile else "fallback"),
+                "pyptx_fallback": pyptx_fell_back,
                 "pyptx_ms": pyptx_ms,
                 "torch_ms": torch_ms,
                 "speedup": speedup,
@@ -423,12 +448,12 @@ def main() -> None:
 
     name_width = max(len("case"), *(len(row["case"]) for row in results))
     print(
-        f"{'case':<{name_width}}  {'mode':>8}  {'helper_ms':>10}  {'torch_ms':>10}  {'speedup':>8}  {'max_diff':>10}"
+        f"{'case':<{name_width}}  {'mode':>8}  {'fallback':>8}  {'helper_ms':>10}  {'torch_ms':>10}  {'speedup':>8}  {'max_diff':>10}"
     )
     for row in results:
         print(
-            f"{row['case']:<{name_width}}  {row['mode']:>8}  {row['pyptx_ms']:10.4f}  "
-            f"{row['torch_ms']:10.4f}  {row['speedup']:8.3f}  "
+            f"{row['case']:<{name_width}}  {row['mode']:>8}  {str(row['pyptx_fallback']):>8}  "
+            f"{row['pyptx_ms']:10.4f}  {row['torch_ms']:10.4f}  {row['speedup']:8.3f}  "
             f"{row['max_abs_diff']:10.3g}"
         )
 
