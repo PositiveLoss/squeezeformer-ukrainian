@@ -25,6 +25,7 @@ from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
     ctc_log_prob_frame_stats_or_torch,
     gated_linear_unit_bdt_or_torch,
     gated_linear_unit_or_torch,
+    layer_norm_silu_scale_or_torch,
     scale_bias_or_torch,
     silu_time_mask_or_torch,
     swoosh_l_or_torch,
@@ -255,6 +256,18 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             ),
         )
 
+    def layer_norm_silu_scale_case(device: torch.device):
+        x = randn(batch, time, dim, device=device)
+        weight = randn(dim, device=device)
+        bias = randn(dim, device=device)
+        confidence = torch.rand(batch, time, device=device, dtype=dtype)
+        eps = 1.0e-5
+        return (
+            lambda: layer_norm_silu_scale_or_torch(x, weight, bias, confidence, eps),
+            lambda: F.silu(F.layer_norm(x, (dim,), weight, bias, eps))
+            * confidence.unsqueeze(-1).clamp_min(0.1),
+        )
+
     def ctc_stats_case(device: torch.device):
         logits = torch.randn(batch, time, vocab, device=device)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -274,6 +287,7 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         Case("gated_linear_unit_bdt", gated_linear_unit_bdt_case),
         Case("conv_output_epilogue", conv_output_epilogue_case),
         Case("bias_norm", bias_norm_case),
+        Case("layer_norm_silu_scale", layer_norm_silu_scale_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),
     ]
 

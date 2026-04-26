@@ -1047,6 +1047,139 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, dtype: str, arch: s
     return bias_norm
 
 
+@lru_cache(maxsize=128)
+def _build_layer_norm_silu_scale_kernel(rows: int, dim: int, eps: float, dtype: str, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx import Tile, kernel, ptx, reg, smem
+    from pyptx.types import b16, bf16, f32, pred, u32
+
+    data_t = bf16 if dtype == "bf16" else f32
+    elem_bytes = 2 if dtype == "bf16" else 4
+    warp_size = 32
+    block = 256
+    num_warps = block // warp_size
+    items_per_thread = (dim + block - 1) // block
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
+
+    def load_data_f32(ptr, *, pred=None):
+        value = reg.scalar(f32, init=0.0)
+        if dtype == "bf16":
+            raw = reg.scalar(b16, init=0)
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred)
+            ptx.inst.cvt.f32.bf16(value, raw)
+        else:
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred)
+        return value
+
+    def store_data_f32(ptr, value, *, pred=None):
+        if dtype == "bf16":
+            raw = reg.scalar(b16, init=0)
+            ptx.inst.cvt.rn.bf16.f32(raw, value)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred)
+        else:
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred)
+
+    @kernel(
+        in_specs=(Tile(rows, dim, data_t), Tile(dim, data_t), Tile(dim, data_t), Tile(rows, data_t)),
+        out_specs=(Tile(rows, dim, data_t),),
+        grid=(rows, 1, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def layer_norm_silu_scale(x, weight, bias, confidence, out):
+        partials = smem.alloc(f32, (num_warps, 2))
+        stats = smem.alloc(f32, (2, 1))
+        px, pw, pb, pc, po = ptx.global_ptrs(x, weight, bias, confidence, out)
+        row = reg.scalar(u32)
+        ptx.inst.mov.u32(row, ptx.special.ctaid.x())
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        lane = tid & (warp_size - 1)
+        warp_id = tid >> 5
+        row_byte_off = row * (dim * elem_bytes)
+        px += row_byte_off
+        po += row_byte_off
+
+        sum_value = reg.scalar(f32, init=0.0)
+        sum_sq = reg.scalar(f32, init=0.0)
+        for i in range(items_per_thread):
+            idx = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, idx, dim)
+            xv = load_data_f32(px + idx * elem_bytes, pred=in_bounds)
+            ptx.inst.add.f32(sum_value, sum_value, xv)
+            ptx.inst.fma.rn.f32(sum_sq, xv, xv, sum_sq)
+
+        ptx.warp.reduce_sum(sum_value)
+        ptx.warp.reduce_sum(sum_sq)
+        with ptx.if_(lane == 0):
+            partials[warp_id, 0] = sum_value
+            partials[warp_id, 1] = sum_sq
+        ptx.bar.sync(0)
+
+        with ptx.if_(tid == 0):
+            block_sum = reg.scalar(f32, init=0.0)
+            block_sum_sq = reg.scalar(f32, init=0.0)
+            for i in range(num_warps):
+                ptx.inst.add.f32(block_sum, block_sum, partials[i, 0])
+                ptx.inst.add.f32(block_sum_sq, block_sum_sq, partials[i, 1])
+            stats[0, 0] = block_sum
+            stats[1, 0] = block_sum_sq
+        ptx.bar.sync(0)
+
+        inv_dim = reg.scalar(f32, init=1.0 / dim)
+        mean = reg.scalar(f32)
+        ptx.inst.mul.f32(mean, stats[0, 0], inv_dim)
+        mean_sq = reg.scalar(f32)
+        ptx.inst.mul.f32(mean_sq, stats[1, 0], inv_dim)
+        mean_times_mean = reg.scalar(f32)
+        ptx.inst.mul.f32(mean_times_mean, mean, mean)
+        var = reg.scalar(f32)
+        ptx.inst.sub.f32(var, mean_sq, mean_times_mean)
+        eps_reg = reg.scalar(f32, init=eps)
+        ptx.inst.add.f32(var, var, eps_reg)
+        rstd = reg.scalar(f32)
+        ptx.inst.rsqrt.approx.f32(rstd, var)
+
+        conf = load_data_f32(pc + row * elem_bytes)
+        min_conf = reg.scalar(f32, init=0.1)
+        ptx.inst.max.f32(conf, conf, min_conf)
+        neg_log2e = reg.scalar(f32, init=-_LOG2E)
+        one = reg.scalar(f32, init=1.0)
+
+        for i in range(items_per_thread):
+            idx = tid if i == 0 else tid + (i * block)
+            in_bounds = reg.scalar(pred)
+            ptx.inst.setp.lt.u32(in_bounds, idx, dim)
+            xv = load_data_f32(px + idx * elem_bytes, pred=in_bounds)
+            wv = load_data_f32(pw + idx * elem_bytes, pred=in_bounds)
+            bv = load_data_f32(pb + idx * elem_bytes, pred=in_bounds)
+            centered = reg.scalar(f32)
+            ptx.inst.sub.f32(centered, xv, mean)
+            normed = reg.scalar(f32)
+            ptx.inst.mul.f32(normed, centered, rstd)
+            affine = reg.scalar(f32)
+            ptx.inst.fma.rn.f32(affine, normed, wv, bv)
+
+            neg_value = reg.scalar(f32)
+            ptx.inst.mul.f32(neg_value, affine, neg_log2e)
+            exp_neg = reg.scalar(f32)
+            ptx.inst.ex2.approx.f32(exp_neg, neg_value)
+            denom = reg.scalar(f32)
+            ptx.inst.add.f32(denom, one, exp_neg)
+            sigm = reg.scalar(f32)
+            ptx.inst.rcp.approx.f32(sigm, denom)
+            y = reg.scalar(f32)
+            ptx.inst.mul.f32(y, affine, sigm)
+            ptx.inst.mul.f32(y, y, conf)
+            store_data_f32(po + idx * elem_bytes, y, pred=in_bounds)
+        ptx.ret()
+
+    return layer_norm_silu_scale
+
+
 def _disable_kernel_builders_for_torch_compile() -> None:
     disable = getattr(getattr(torch, "compiler", None), "disable", None)
     if disable is None:
@@ -1060,6 +1193,7 @@ def _disable_kernel_builders_for_torch_compile() -> None:
         "_build_gated_linear_unit_kernel",
         "_build_gated_linear_unit_bdt_kernel",
         "_build_bias_norm_kernel",
+        "_build_layer_norm_silu_scale_kernel",
     ):
         globals()[name] = disable(
             globals()[name],
@@ -1362,6 +1496,61 @@ def bias_norm_or_torch(x: Tensor, bias: Tensor, log_scale: Tensor, eps: float) -
             exc,
         )
         return torch_bias_norm()
+
+
+def layer_norm_silu_scale_or_torch(
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    confidence: Tensor,
+    eps: float,
+) -> Tensor:
+    def torch_epilogue() -> Tensor:
+        y = F.layer_norm(x, (x.size(-1),), weight, bias, eps)
+        return F.silu(y) * confidence.unsqueeze(-1).clamp_min(0.1)
+
+    if (
+        x.dim() < 1
+        or x.size(-1) != weight.numel()
+        or x.size(-1) != bias.numel()
+        or confidence.shape != x.shape[:-1]
+        or not _is_inference_cuda_float(x, weight, bias)
+        or not (
+            confidence.is_cuda
+            and confidence.dtype == x.dtype
+            and confidence.is_contiguous()
+        )
+    ):
+        return torch_epilogue()
+    flat, original_shape = _flat_2d(x)
+    confidence_flat = confidence.reshape(-1)
+    try:
+        dtype = _float_dtype_key(x)
+        kernel = _build_layer_norm_silu_scale_kernel(
+            flat.size(0),
+            flat.size(1),
+            float(eps),
+            dtype,
+            _arch_for(x),
+        )
+        _log_kernel_use_once(
+            "layer_norm_silu_scale",
+            flat.size(0),
+            flat.size(1),
+            float(eps),
+            dtype,
+            _arch_for(x),
+        )
+        return _launch_pyptx_kernel(kernel, flat, weight, bias, confidence_flat).reshape(
+            original_shape
+        )
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch layer_norm_silu_scale fallback after pyptx failure shape=%s: %s",
+            original_shape,
+            exc,
+        )
+        return torch_epilogue()
 
 
 def ctc_log_prob_frame_stats_or_torch(

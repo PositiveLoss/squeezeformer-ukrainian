@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from squeezeformer_pytorch.pyptx_kernels import layer_norm_silu_scale_or_torch
+
 from .ctc_alignment import batch_ctc_viterbi_alignments, batch_uniform_alignments
 from .model import ConformerBlock, ConvSubsampling, ParaformerV2Config, lengths_to_padding_mask
 
@@ -180,9 +182,15 @@ class BetterParaformerV2(nn.Module):
             boundary_logits.sigmoid(),
             self.config.confidence_threshold,
         )
-        decoder_in = self.query_projection(query_features) * query_confidences.unsqueeze(
-            -1
-        ).clamp_min(0.1)
+        query_projection = self.query_projection
+        projected_queries = query_projection[0](query_features)
+        decoder_in = layer_norm_silu_scale_or_torch(
+            projected_queries,
+            query_projection[1].weight,
+            query_projection[1].bias,
+            query_confidences,
+            query_projection[1].eps,
+        )
         memory = self.memory_projection(final_encoder_out)
         tgt_mask = lengths_to_padding_mask(query_lengths, decoder_in.size(1))
         memory_mask = lengths_to_padding_mask(encoder_lengths, memory.size(1))
