@@ -22,6 +22,9 @@ squeezeformer-torchrun = "squeezeformer_pytorch.training.torchrun_launcher:main"
 include = ["squeezeformer_pytorch*", "w2v_bert*", "zipformer_pytorch*", "paraformer_pytorch*", "paramormer_pytorch*"]
 namespaces = true
 
+[tool.setuptools.package-data]
+paraformer_pytorch = ["*.cpp", "*.cu", "*.pyx"]
+
 [tool.uv]
 conflicts = [
     [
