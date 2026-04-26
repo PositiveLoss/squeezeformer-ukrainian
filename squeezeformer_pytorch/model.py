@@ -410,13 +410,9 @@ class ConvolutionModule(nn.Module):
             x = silu_or_torch(x)
         x = self.depthwise(x)
         if pad_mask is not None:
-            x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
-        x = x.transpose(1, 2)
-        if pad_mask is not None:
-            x = silu_time_mask_or_torch(x, pad_mask, layout="btd")
+            x = silu_time_mask_or_torch(x, pad_mask, layout="bdt")
         else:
             x = silu_or_torch(x)
-        x = x.transpose(1, 2)
         x = self.pointwise_out(x)
         if pad_mask is not None:
             x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
