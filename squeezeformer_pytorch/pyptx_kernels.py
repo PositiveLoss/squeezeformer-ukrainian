@@ -1142,6 +1142,35 @@ def _build_bias_norm_kernel(rows: int, dim: int, eps: float, arch: str):
     return bias_norm
 
 
+def _disable_kernel_builders_for_torch_compile() -> None:
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    if disable is None:
+        return
+    for name in (
+        "_build_attention_mask_kernel",
+        "_build_sequence_mask_kernel",
+        "_build_attention_bool_mask_kernel",
+        "_build_scale_bias_kernel",
+        "_build_masked_mean_kernel",
+        "_build_layer_norm_kernel",
+        "_build_apply_time_mask_kernel",
+        "_build_time_recovery_repeat_kernel",
+        "_build_ctc_log_prob_frame_stats_kernel",
+        "_build_silu_kernel",
+        "_build_swoosh_kernel",
+        "_build_gated_linear_unit_kernel",
+        "_build_bias_norm_kernel",
+    ):
+        globals()[name] = disable(
+            globals()[name],
+            recursive=True,
+            reason="pyptx kernel builders use lru_cache and PTX codegen setup outside Dynamo graphs",
+        )
+
+
+_disable_kernel_builders_for_torch_compile()
+
+
 def _arch_for(x: Tensor) -> str:
     major, _minor = torch.cuda.get_device_capability(x.device)
     if major >= 10:
