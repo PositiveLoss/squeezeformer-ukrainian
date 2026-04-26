@@ -140,6 +140,13 @@ def _pick_block(n: int) -> int:
     raise ValueError(f"feature dimension {n} is not supported by pyptx fast kernels")
 
 
+def _pick_scale_bias_block(n: int) -> int:
+    try:
+        return _pick_block(n)
+    except ValueError:
+        return 128 if n <= 256 else 256
+
+
 def _pick_v4_block(n: int) -> int:
     block = _pick_v4_block_or_none(n)
     if block is not None:
@@ -171,33 +178,33 @@ def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
     if not _ensure_pyptx_importable():
         raise RuntimeError("pyptx is not importable")
     from pyptx import Tile, kernel, ptx, reg
-    from pyptx.types import b16, bf16, f32, u32
+    from pyptx.types import b16, bf16, f32, pred, u32
 
     data_t = bf16 if dtype == "bf16" else f32
     elem_bytes = 2 if dtype == "bf16" else 4
-    block = _pick_block(f)
-    items_per_thread = f // block
-    use_v4 = dtype == "f32" and items_per_thread % 4 == 0
-    v4_iters = items_per_thread // 4 if use_v4 else 0
+    block = _pick_scale_bias_block(f)
+    items_per_thread = (f + block - 1) // block
+    use_v4 = dtype == "f32" and f % (block * 4) == 0
+    v4_iters = f // (block * 4) if use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
-    def load_data_f32(ptr):
+    def load_data_f32(ptr, *, pred_guard=None):
         value = reg.scalar(f32, init=0.0)
         if dtype == "bf16":
             raw = reg.scalar(b16, init=0)
-            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr))
+            ptx.inst.ld.global_.b16(raw, ptx.addr(ptr), pred=pred_guard)
             ptx.inst.cvt.f32.bf16(value, raw)
         else:
-            ptx.inst.ld.global_.f32(value, ptx.addr(ptr))
+            ptx.inst.ld.global_.f32(value, ptx.addr(ptr), pred=pred_guard)
         return value
 
-    def store_data_f32(ptr, value):
+    def store_data_f32(ptr, value, *, pred_guard=None):
         if dtype == "bf16":
             raw = reg.scalar(b16, init=0)
             ptx.inst.cvt.rn.bf16.f32(raw, value)
-            ptx.inst.st.global_.b16(ptx.addr(ptr), raw)
+            ptx.inst.st.global_.b16(ptx.addr(ptr), raw, pred=pred_guard)
         else:
-            ptx.inst.st.global_.f32(ptx.addr(ptr), value)
+            ptx.inst.st.global_.f32(ptx.addr(ptr), value, pred=pred_guard)
 
     @kernel(
         in_specs=(Tile(m, f, data_t), Tile(f, data_t), Tile(f, data_t)),
@@ -239,13 +246,15 @@ def _build_scale_bias_kernel(m: int, f: int, dtype: str, arch: str):
             for i in range(items_per_thread):
                 idx = reg.scalar(u32)
                 ptx.inst.add.u32(idx, tid, i * block)
+                in_bounds = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(in_bounds, idx, f)
                 off = idx * elem_bytes
-                xv = load_data_f32(px + off)
-                sv = load_data_f32(ps + off)
-                bv = load_data_f32(pb + off)
+                xv = load_data_f32(px + off, pred_guard=in_bounds)
+                sv = load_data_f32(ps + off, pred_guard=in_bounds)
+                bv = load_data_f32(pb + off, pred_guard=in_bounds)
                 y = reg.scalar(f32)
                 ptx.inst.fma.rn.f32(y, xv, sv, bv)
-                store_data_f32(po + off, y)
+                store_data_f32(po + off, y, pred_guard=in_bounds)
         ptx.ret()
 
     return scale_bias
