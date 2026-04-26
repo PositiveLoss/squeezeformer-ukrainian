@@ -51,6 +51,18 @@ def test_fused_residual_add_matches_torch_fallback() -> None:
     assert torch.allclose(residual_add_or_torch(residual, x, 0.5), residual + 0.5 * x)
 
 
+def test_fused_conv_output_epilogue_matches_torch_fallback() -> None:
+    from squeezeformer_pytorch.pyptx_kernels import conv_output_epilogue_or_torch
+
+    residual = torch.randn(2, 3, 4)
+    x_bdt = torch.randn(2, 4, 3)
+    mask = torch.tensor([[True, True, False], [True, False, False]])
+
+    expected = residual + (x_bdt * mask.unsqueeze(1).to(dtype=x_bdt.dtype)).transpose(1, 2)
+
+    assert torch.allclose(conv_output_epilogue_or_torch(residual, x_bdt, mask), expected)
+
+
 def test_arch_for_uses_sm120_for_rtx_blackwell(monkeypatch) -> None:
     import squeezeformer_pytorch.pyptx_kernels as pyptx_kernels
 

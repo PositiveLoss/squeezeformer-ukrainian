@@ -118,12 +118,19 @@ def _pick_block(n: int) -> int:
 
 
 def _pick_v4_block(n: int) -> int:
+    block = _pick_v4_block_or_none(n)
+    if block is not None:
+        return block
+    raise ValueError(f"dimension {n} is not supported by pyptx v4 kernels")
+
+
+def _pick_v4_block_or_none(n: int) -> int | None:
     if n % 4 != 0:
-        raise ValueError(f"dimension {n} is not divisible by 4")
+        return None
     for block in (256, 128, 64, 32):
         if n % (block * 4) == 0:
             return block
-    raise ValueError(f"dimension {n} is not supported by pyptx v4 kernels")
+    return None
 
 
 def _flat_2d(x: Tensor) -> tuple[Tensor, tuple[int, ...]]:
@@ -960,11 +967,13 @@ def _build_silu_time_mask_kernel(batch: int, time: int, dim: int, layout: str, a
     total = batch * time * dim
     scalar_block = 256
     scalar_grid_x = (total + scalar_block - 1) // scalar_block
-    btd_use_v4 = dim % 4 == 0
-    btd_block = _pick_v4_block(dim) if btd_use_v4 else scalar_block
+    btd_v4_block = _pick_v4_block_or_none(dim)
+    btd_use_v4 = btd_v4_block is not None
+    btd_block = btd_v4_block if btd_v4_block is not None else scalar_block
     btd_v4_iters = dim // (btd_block * 4) if btd_use_v4 else 0
-    bdt_use_v4 = time % 4 == 0
-    bdt_block = _pick_v4_block(time) if bdt_use_v4 else scalar_block
+    bdt_v4_block = _pick_v4_block_or_none(time)
+    bdt_use_v4 = bdt_v4_block is not None
+    bdt_block = bdt_v4_block if bdt_v4_block is not None else scalar_block
     bdt_v4_iters = time // (bdt_block * 4) if bdt_use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
@@ -1160,6 +1169,88 @@ def _build_residual_add_kernel(total: int, scale: float, arch: str):
 
 
 @lru_cache(maxsize=128)
+def _build_conv_output_epilogue_kernel(batch: int, time: int, dim: int, arch: str):
+    if not _ensure_pyptx_importable():
+        raise RuntimeError("pyptx is not importable")
+    from pyptx.types import f32, pred, u32
+
+    from pyptx import Tile, kernel, ptx, reg
+
+    v4_block = _pick_v4_block_or_none(dim)
+    block = v4_block if v4_block is not None else 256
+    use_v4 = v4_block is not None
+    v4_iters = dim // (block * 4) if use_v4 else 0
+    items_per_thread = (dim + block - 1) // block
+    version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
+
+    @kernel(
+        in_specs=(Tile(batch, time, dim, f32), Tile(batch, dim, time, f32), Tile(batch, time, pred)),
+        out_specs=(Tile(batch, time, dim, f32),),
+        grid=(batch, time, 1),
+        block=(block, 1, 1),
+        arch=arch,
+        version=version,
+    )
+    def conv_output_epilogue(residual, x, mask, out):
+        pr, px, pm, po = ptx.global_ptrs(residual, x, mask, out)
+        tid = reg.scalar(u32)
+        ptx.inst.mov.u32(tid, ptx.special.tid.x())
+        sample = reg.scalar(u32)
+        ptx.inst.mov.u32(sample, ptx.special.ctaid.x())
+        time_idx = reg.scalar(u32)
+        ptx.inst.mov.u32(time_idx, ptx.special.ctaid.y())
+        zero = reg.scalar(f32, init=0.0)
+
+        bt = sample * time + time_idx
+        residual_row = bt * dim
+        x_sample_base = sample * (dim * time)
+        mask_value = reg.scalar(u32, init=0)
+        ptx.inst.ld.global_.u8(mask_value, ptx.addr(pm + bt))
+        keep = reg.scalar(pred)
+        ptx.inst.setp.ne.u32(keep, mask_value, 0)
+
+        if use_v4:
+            elem_base = tid << 2
+            for j in range(v4_iters):
+                feature = elem_base if j == 0 else elem_base + (j * block * 4)
+                out_off = (residual_row + feature) * 4
+                residual_vals = [reg.scalar(f32) for _ in range(4)]
+                ptx.inst.ld.global_.v4.f32(residual_vals, ptx.addr(pr + out_off))
+                y_vals = []
+                for sub in range(4):
+                    x_value = reg.scalar(f32, init=0.0)
+                    x_idx = x_sample_base + (feature + sub) * time + time_idx
+                    ptx.inst.ld.global_.f32(x_value, ptx.addr(px + x_idx * 4))
+                    ptx.selp(f32, x_value, x_value, zero, keep)
+                    y = reg.scalar(f32)
+                    ptx.inst.add.f32(y, residual_vals[sub], x_value)
+                    y_vals.append(y)
+                ptx.inst.st.global_.v4.f32(ptx.addr(po + out_off), y_vals)
+        else:
+            for i in range(items_per_thread):
+                feature = tid if i == 0 else tid + (i * block)
+                in_bounds = reg.scalar(pred)
+                ptx.inst.setp.lt.u32(in_bounds, feature, dim)
+                residual_idx = residual_row + feature
+                residual_value = reg.scalar(f32, init=0.0)
+                x_value = reg.scalar(f32, init=0.0)
+                ptx.inst.ld.global_.f32(
+                    residual_value,
+                    ptx.addr(pr + residual_idx * 4),
+                    pred=in_bounds,
+                )
+                x_idx = x_sample_base + feature * time + time_idx
+                ptx.inst.ld.global_.f32(x_value, ptx.addr(px + x_idx * 4), pred=in_bounds)
+                ptx.selp(f32, x_value, x_value, zero, keep)
+                y = reg.scalar(f32)
+                ptx.inst.add.f32(y, residual_value, x_value)
+                ptx.inst.st.global_.f32(ptx.addr(po + residual_idx * 4), y, pred=in_bounds)
+        ptx.ret()
+
+    return conv_output_epilogue
+
+
+@lru_cache(maxsize=128)
 def _build_swoosh_kernel(
     total: int, offset: float, linear_scale: float, constant: float, arch: str
 ):
@@ -1241,8 +1332,9 @@ def _build_gated_linear_unit_kernel(m: int, f2: int, arch: str):
     total = m * f
     scalar_block = 256
     scalar_grid_x = (total + scalar_block - 1) // scalar_block
-    use_v4 = f % 4 == 0
-    block = _pick_v4_block(f) if use_v4 else scalar_block
+    v4_block = _pick_v4_block_or_none(f)
+    use_v4 = v4_block is not None
+    block = v4_block if v4_block is not None else scalar_block
     v4_iters = f // (block * 4) if use_v4 else 0
     version = (8, 7) if arch.startswith(("sm_100", "sm_120")) else None
 
@@ -1427,6 +1519,7 @@ def _disable_kernel_builders_for_torch_compile() -> None:
         "_build_silu_kernel",
         "_build_silu_time_mask_kernel",
         "_build_residual_add_kernel",
+        "_build_conv_output_epilogue_kernel",
         "_build_swoosh_kernel",
         "_build_gated_linear_unit_kernel",
         "_build_bias_norm_kernel",
@@ -1656,6 +1749,49 @@ def residual_add_or_torch(residual: Tensor, x: Tensor, scale: float = 1.0) -> Te
             exc,
         )
         return residual + float(scale) * x
+
+
+def conv_output_epilogue_or_torch(residual: Tensor, x_bdt: Tensor, mask: Tensor) -> Tensor:
+    def torch_epilogue() -> Tensor:
+        masked = x_bdt * mask.unsqueeze(1).to(dtype=x_bdt.dtype)
+        return residual + masked.transpose(1, 2)
+
+    if (
+        residual.dim() != 3
+        or x_bdt.dim() != 3
+        or residual.size(0) != x_bdt.size(0)
+        or residual.size(1) != x_bdt.size(2)
+        or residual.size(2) != x_bdt.size(1)
+        or mask.shape != (residual.size(0), residual.size(1))
+        or torch.is_grad_enabled()
+        or not _is_inference_cuda_f32(residual, x_bdt)
+        or not _is_cuda_bool(mask)
+    ):
+        return torch_epilogue()
+    try:
+        kernel = _build_conv_output_epilogue_kernel(
+            residual.size(0),
+            residual.size(1),
+            residual.size(2),
+            _arch_for(residual),
+        )
+        _log_kernel_use_once(
+            "conv_output_epilogue",
+            residual.size(0),
+            residual.size(1),
+            residual.size(2),
+            _arch_for(residual),
+        )
+        return _launch_pyptx_kernel(kernel, residual, x_bdt, mask)
+    except Exception as exc:
+        _LOGGER.debug(
+            "using torch conv_output_epilogue fallback after pyptx failure residual_shape=%s "
+            "x_shape=%s: %s",
+            tuple(residual.shape),
+            tuple(x_bdt.shape),
+            exc,
+        )
+        return torch_epilogue()
 
 
 def swoosh_l_or_torch(x: Tensor) -> Tensor:

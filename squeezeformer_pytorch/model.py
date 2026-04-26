@@ -13,6 +13,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from .masking import make_attention_mask, make_sequence_mask
 from .pyptx_kernels import (
     apply_time_mask_or_torch,
+    conv_output_epilogue_or_torch,
     layer_norm_or_torch,
     residual_add_or_torch,
     scale_bias_or_torch,
@@ -414,6 +415,8 @@ class ConvolutionModule(nn.Module):
         else:
             x = silu_or_torch(x)
         x = self.pointwise_out(x)
+        if pad_mask is not None and not self.training:
+            return conv_output_epilogue_or_torch(residual, x, pad_mask)
         if pad_mask is not None:
             x = apply_time_mask_or_torch(x, pad_mask, layout="bdt")
         x = x.transpose(1, 2)

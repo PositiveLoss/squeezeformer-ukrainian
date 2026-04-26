@@ -24,6 +24,7 @@ from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
     apply_time_mask_or_torch,
     attention_mask_from_lengths_or_torch,
     bias_norm_or_torch,
+    conv_output_epilogue_or_torch,
     ctc_log_prob_frame_stats_or_torch,
     gated_linear_unit_or_torch,
     layer_norm_or_torch,
@@ -295,6 +296,15 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             lambda: residual + scale * x,
         )
 
+    def conv_output_epilogue_case(device: torch.device):
+        residual = torch.randn(batch, time, dim, device=device)
+        x = torch.randn(batch, dim, time, device=device)
+        mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
+        return (
+            lambda: conv_output_epilogue_or_torch(residual, x, mask),
+            lambda: residual + (x * mask.unsqueeze(1).to(dtype=x.dtype)).transpose(1, 2),
+        )
+
     def bias_norm_case(device: torch.device):
         x = torch.randn(batch, time, dim, device=device)
         bias = torch.randn(dim, device=device)
@@ -346,6 +356,7 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         Case("swoosh_r", swoosh_r_case),
         Case("gated_linear_unit", gated_linear_unit_case),
         Case("residual_add", residual_add_case),
+        Case("conv_output_epilogue", conv_output_epilogue_case),
         Case("bias_norm", bias_norm_case),
         Case("masked_mean", masked_mean_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),
