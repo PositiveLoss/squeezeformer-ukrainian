@@ -42,15 +42,6 @@ def test_fused_silu_time_mask_matches_torch_fallback() -> None:
     )
 
 
-def test_fused_residual_add_matches_torch_fallback() -> None:
-    from squeezeformer_pytorch.pyptx_kernels import residual_add_or_torch
-
-    residual = torch.randn(2, 3, 4)
-    x = torch.randn(2, 3, 4)
-
-    assert torch.allclose(residual_add_or_torch(residual, x, 0.5), residual + 0.5 * x)
-
-
 def test_fused_conv_output_epilogue_matches_torch_fallback() -> None:
     from squeezeformer_pytorch.pyptx_kernels import conv_output_epilogue_or_torch
 

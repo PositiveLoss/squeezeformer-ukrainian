@@ -8,10 +8,8 @@ import torch
 from torch import Tensor, nn
 
 from squeezeformer_pytorch.pyptx_kernels import (
-    apply_time_mask_or_torch,
     bias_norm_or_torch,
     gated_linear_unit_or_torch,
-    sequence_mask_or_torch,
     swoosh_l_or_torch,
     swoosh_r_or_torch,
 )
@@ -19,7 +17,8 @@ from zipformer_pytorch.fp8 import apply_linear_with_fp8_padding, make_linear
 
 
 def _make_padding_mask(lengths: Tensor, *, max_length: int) -> Tensor:
-    return sequence_mask_or_torch(lengths, max_length=max_length)
+    lengths = lengths.to(dtype=torch.long)
+    return torch.arange(max_length, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
 
 
 def _ceil_divide(lengths: Tensor, factor: int) -> Tensor:
@@ -43,7 +42,7 @@ def _convert_num_channels(x: Tensor, num_channels: int) -> Tensor:
 def _mask_tensor(x: Tensor, mask: Tensor | None) -> Tensor:
     if mask is None:
         return x
-    return apply_time_mask_or_torch(x, mask, layout="btd")
+    return x * mask.unsqueeze(-1).to(dtype=x.dtype)
 
 
 def _no_op(x: Tensor) -> Tensor:
@@ -889,7 +888,7 @@ class ZipformerConvModule(nn.Module):
         )
         x = x.transpose(1, 2)
         if mask is not None:
-            x = apply_time_mask_or_torch(x, mask, layout="bdt")
+            x = x * mask.unsqueeze(1).to(dtype=x.dtype)
         x = self.depthwise(x)
         x = x.transpose(1, 2)
         x = self.depthwise_balancer(x)

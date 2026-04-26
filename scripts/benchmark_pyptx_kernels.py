@@ -21,23 +21,16 @@ if str(REPO_ROOT) not in sys.path:
 import squeezeformer_pytorch.pyptx_kernels as pyptx_kernels  # noqa: E402
 from squeezeformer_pytorch.masking import make_sequence_mask  # noqa: E402
 from squeezeformer_pytorch.pyptx_kernels import (  # noqa: E402
-    apply_time_mask_or_torch,
-    attention_mask_from_lengths_or_torch,
     bias_norm_or_torch,
     conv_output_epilogue_or_torch,
     ctc_log_prob_frame_stats_or_torch,
     gated_linear_unit_or_torch,
-    layer_norm_or_torch,
     masked_mean_or_torch,
-    residual_add_or_torch,
     scale_bias_or_torch,
     silu_time_mask_or_torch,
-    sequence_mask_or_torch,
-    silu_or_torch,
     squeezeformer_attention_mask_or_torch,
     swoosh_l_or_torch,
     swoosh_r_or_torch,
-    time_recovery_repeat_or_torch,
 )
 
 
@@ -175,13 +168,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
     conv_dim = dim * 2
     vocab = args.vocab_size
 
-    def sequence_mask_case(device: torch.device):
-        lengths = lengths_for(batch, time, device)
-        return (
-            lambda: sequence_mask_or_torch(lengths, max_length=time),
-            lambda: torch.arange(time, device=device).unsqueeze(0) < lengths.unsqueeze(1),
-        )
-
     def attention_mask_case(device: torch.device):
         lengths = lengths_for(batch, time, device)
         return (
@@ -192,48 +178,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
             ),
         )
 
-    def w2v_attention_mask_case(device: torch.device):
-        lengths = lengths_for(batch, time, device)
-        return (
-            lambda: attention_mask_from_lengths_or_torch(lengths, max_length=time),
-            lambda: (torch.arange(time, device=device).unsqueeze(0) < lengths.unsqueeze(1)).to(
-                dtype=torch.long
-            ),
-        )
-
-    def apply_mask_btd_case(device: torch.device):
-        x = torch.randn(batch, time, dim, device=device)
-        mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
-        return (
-            lambda: apply_time_mask_or_torch(x, mask, layout="btd"),
-            lambda: x * mask.unsqueeze(-1).to(dtype=x.dtype),
-        )
-
-    def apply_mask_bdt_case(device: torch.device):
-        x = torch.randn(batch, conv_dim, time, device=device)
-        mask = lengths_for(batch, time, device).unsqueeze(1) > torch.arange(time, device=device)
-        return (
-            lambda: apply_time_mask_or_torch(x, mask, layout="bdt"),
-            lambda: x * mask.unsqueeze(1).to(dtype=x.dtype),
-        )
-
-    def time_recovery_case(device: torch.device):
-        source_time = max(1, (time + 1) // 2)
-        x = torch.randn(batch, source_time, dim, device=device)
-        return (
-            lambda: time_recovery_repeat_or_torch(x, time, 2),
-            lambda: _torch_time_recovery_repeat(x, time, 2),
-        )
-
-    def layer_norm_case(device: torch.device):
-        x = torch.randn(batch, time, dim, device=device)
-        weight = torch.randn(dim, device=device)
-        bias = torch.randn(dim, device=device)
-        return (
-            lambda: layer_norm_or_torch(x, (dim,), weight, bias, 1e-5),
-            lambda: F.layer_norm(x, (dim,), weight, bias, 1e-5),
-        )
-
     def scale_bias_case(device: torch.device):
         x = torch.randn(batch, time, dim, device=device)
         scale = torch.randn(dim, device=device)
@@ -241,13 +185,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         return (
             lambda: scale_bias_or_torch(x, scale, bias),
             lambda: x * scale + bias,
-        )
-
-    def silu_case(device: torch.device):
-        x = torch.randn(batch, time, hidden_dim, device=device)
-        return (
-            lambda: silu_or_torch(x),
-            lambda: F.silu(x),
         )
 
     def silu_mask_bdt_case(device: torch.device):
@@ -285,15 +222,6 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         return (
             lambda: gated_linear_unit_or_torch(x),
             lambda: x[..., :dim] * torch.sigmoid(x[..., dim:]),
-        )
-
-    def residual_add_case(device: torch.device):
-        residual = torch.randn(batch, time, dim, device=device)
-        x = torch.randn(batch, time, dim, device=device)
-        scale = 0.5
-        return (
-            lambda: residual_add_or_torch(residual, x, scale),
-            lambda: residual + scale * x,
         )
 
     def conv_output_epilogue_case(device: torch.device):
@@ -341,33 +269,18 @@ def make_cases(args: argparse.Namespace) -> list[Case]:
         )
 
     return [
-        Case("sequence_mask", sequence_mask_case),
         Case("squeezeformer_attention_mask", attention_mask_case),
-        Case("w2v_attention_mask", w2v_attention_mask_case),
-        Case("apply_mask_btd", apply_mask_btd_case),
-        Case("apply_mask_bdt", apply_mask_bdt_case),
-        Case("time_recovery_repeat", time_recovery_case),
-        Case("layer_norm", layer_norm_case),
         Case("scale_bias", scale_bias_case),
-        Case("silu", silu_case),
         Case("silu_mask_bdt", silu_mask_bdt_case),
         Case("silu_mask_btd", silu_mask_btd_case),
         Case("swoosh_l", swoosh_l_case),
         Case("swoosh_r", swoosh_r_case),
         Case("gated_linear_unit", gated_linear_unit_case),
-        Case("residual_add", residual_add_case),
         Case("conv_output_epilogue", conv_output_epilogue_case),
         Case("bias_norm", bias_norm_case),
         Case("masked_mean", masked_mean_case),
         Case("ctc_log_prob_frame_stats", ctc_stats_case),
     ]
-
-
-def _torch_time_recovery_repeat(x: torch.Tensor, target_length: int, stride: int) -> torch.Tensor:
-    repeated = torch.repeat_interleave(x, repeats=stride, dim=1)
-    if repeated.size(1) < target_length:
-        return F.pad(repeated, (0, 0, 0, target_length - repeated.size(1)), mode="replicate")
-    return repeated[:, :target_length, :]
 
 
 def _torch_ctc_frame_stats(
