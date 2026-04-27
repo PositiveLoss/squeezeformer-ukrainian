@@ -15,6 +15,7 @@ def test_build_featurizer_from_config_uses_rust_wrappers() -> None:
         RustAudioFeaturizer,
         RustW2VBertFeatureExtractor,
         build_featurizer_from_config,
+        paraformer_featurizer_config,
         zipformer_paper_featurizer_config,
     )
 
@@ -27,18 +28,25 @@ def test_build_featurizer_from_config_uses_rust_wrappers() -> None:
         {"type": "w2v_bert", "model_source": "facebook/w2v-bert-2.0"},
         use_w2v_bert=True,
     )
+    paraformer = build_featurizer_from_config(
+        paraformer_featurizer_config(),
+        use_paraformer=True,
+    )
 
     assert isinstance(squeezeformer, RustAudioFeaturizer)
     assert squeezeformer.frontend_type == "squeezeformer"
     assert isinstance(zipformer, RustAudioFeaturizer)
     assert zipformer.frontend_type == "zipformer"
     assert isinstance(w2v_bert, RustW2VBertFeatureExtractor)
+    assert isinstance(paraformer, RustAudioFeaturizer)
+    assert paraformer.frontend_type == "paraformer"
 
 
 def test_rust_feature_extension_extracts_numpy_features() -> None:
     pytest.importorskip("asr_features")
     import numpy as np
     from asr_features import (
+        extract_paraformer,
         extract_squeezeformer,
         extract_w2v_bert,
         extract_zipformer,
@@ -48,12 +56,15 @@ def test_rust_feature_extension_extracts_numpy_features() -> None:
 
     squeezeformer = extract_squeezeformer(waveform, 16_000)
     zipformer = extract_zipformer(waveform, 16_000)
+    paraformer = extract_paraformer(waveform, 16_000)
     w2v_bert = extract_w2v_bert(waveform, 16_000)
 
     assert squeezeformer.dtype == np.float32
     assert squeezeformer.shape[1] == 80
     assert zipformer.dtype == np.float32
     assert zipformer.shape[1] == 80
+    assert paraformer.dtype == np.float32
+    assert paraformer.shape[1] == 80
     assert w2v_bert.dtype == np.float32
     assert w2v_bert.shape[1] == 160
 
@@ -70,14 +81,18 @@ def test_rust_featurizer_modules_extract_torch_features() -> None:
         {"type": "w2v_bert", "model_source": "facebook/w2v-bert-2.0"},
         use_w2v_bert=True,
     )
+    paraformer = build_featurizer_from_config({"type": "paraformer"}, use_paraformer=True)
 
     squeezeformer_features = squeezeformer(waveform, 16_000)
     w2v_bert_features = w2v_bert(waveform, 16_000)
+    paraformer_features = paraformer(waveform, 16_000)
 
     assert squeezeformer_features.dtype == torch.float32
     assert squeezeformer_features.shape[1] == 80
     assert w2v_bert_features.dtype == torch.float32
     assert w2v_bert_features.shape[1] == 160
+    assert paraformer_features.dtype == torch.float32
+    assert paraformer_features.shape[1] == 80
 
 
 def test_rust_record_cache_subcommand_matches_python_store(tmp_path) -> None:

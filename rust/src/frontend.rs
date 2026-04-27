@@ -30,6 +30,7 @@ pub struct W2vBertFrontendConfig {
 #[derive(Debug, Clone)]
 pub(crate) enum FrontendConfig {
     Audio(AudioFrontendConfig),
+    Paraformer(AudioFrontendConfig),
     W2vBert(W2vBertFrontendConfig),
 }
 
@@ -66,6 +67,10 @@ pub fn zipformer_frontend_config() -> AudioFrontendConfig {
         normalize_feature: false,
         normalize_per_frame: false,
     }
+}
+
+pub fn paraformer_frontend_config() -> AudioFrontendConfig {
+    squeezeformer_frontend_config()
 }
 
 pub fn w2v_bert_frontend_config(
@@ -115,6 +120,9 @@ pub(crate) fn compute_features(
         FrontendConfig::Audio(config) => {
             compute_audio_featurizer_features(&mut waveform, sample_rate, config)
         }
+        FrontendConfig::Paraformer(config) => {
+            compute_audio_featurizer_features(&mut waveform, sample_rate, config)
+        }
         FrontendConfig::W2vBert(config) => {
             compute_w2v_bert_features(&mut waveform, sample_rate, config)
         }
@@ -125,6 +133,7 @@ impl FrontendConfig {
     pub(crate) fn feature_dim(&self) -> usize {
         match self {
             Self::Audio(config) => config.n_mels,
+            Self::Paraformer(config) => config.n_mels,
             Self::W2vBert(config) => config.feature_dim,
         }
     }
@@ -132,6 +141,7 @@ impl FrontendConfig {
     pub(crate) fn sample_rate(&self) -> u32 {
         match self {
             Self::Audio(config) => config.sample_rate,
+            Self::Paraformer(config) => config.sample_rate,
             Self::W2vBert(config) => config.sample_rate,
         }
     }
@@ -140,6 +150,18 @@ impl FrontendConfig {
         match self {
             Self::Audio(config) => format!(
                 "{{'featurizer': {{'sample_rate': {}, 'n_fft': {}, 'win_length': {}, 'n_mels': {}, 'backend': 'torchaudio', 'preemphasis': {}, 'normalize_signal': {}, 'normalize_feature': {}, 'normalize_per_frame': {}, 'hop_length': {}}}}}",
+                config.sample_rate,
+                config.n_fft,
+                config.win_length,
+                config.n_mels,
+                py_float(config.preemphasis),
+                py_bool(config.normalize_signal),
+                py_bool(config.normalize_feature),
+                py_bool(config.normalize_per_frame),
+                config.hop_length,
+            ),
+            Self::Paraformer(config) => format!(
+                "{{'featurizer': {{'type': 'paraformer', 'sample_rate': {}, 'n_fft': {}, 'win_length': {}, 'n_mels': {}, 'backend': 'torchaudio', 'preemphasis': {}, 'normalize_signal': {}, 'normalize_feature': {}, 'normalize_per_frame': {}, 'hop_length': {}}}}}",
                 config.sample_rate,
                 config.n_fft,
                 config.win_length,

@@ -45,6 +45,7 @@ from squeezeformer_pytorch.data import (
 )
 from squeezeformer_pytorch.frontend import (
     build_featurizer_from_config,
+    paraformer_featurizer_config,
     zipformer_paper_featurizer_config,
 )
 from squeezeformer_pytorch.lm import NGramLanguageModel
@@ -819,6 +820,19 @@ def _resolve_training_featurizer_config(
         return w2v_bert_featurizer_config(_resolve_w2v_bert_model_source(args, checkpoint))
     if use_zipformer:
         return zipformer_paper_featurizer_config()
+    if use_paraformer:
+        return paraformer_featurizer_config(
+            {
+                "n_fft": args.n_fft,
+                "hop_length": args.hop_length,
+                "n_mels": args.n_mels,
+                "backend": args.frontend_backend,
+                "preemphasis": args.preemphasis,
+                "normalize_signal": args.normalize_signal,
+                "normalize_feature": args.normalize_feature,
+                "normalize_per_frame": args.normalize_per_frame,
+            }
+        )
     return {
         "n_fft": args.n_fft,
         "hop_length": args.hop_length,
@@ -1677,6 +1691,7 @@ def main() -> None:
         ),
         use_zipformer=use_zipformer,
         use_w2v_bert=use_w2v_bert,
+        use_paraformer=use_paraformer,
     )
     specaugment = None
     waveform_augment = None

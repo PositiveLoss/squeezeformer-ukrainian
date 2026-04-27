@@ -27,8 +27,8 @@ pub use cli::run_cli;
 #[cfg(feature = "frontend")]
 pub use frontend::{
     extract_audio_features_from_samples, extract_w2v_bert_features_from_samples,
-    squeezeformer_frontend_config, w2v_bert_frontend_config, zipformer_frontend_config,
-    AudioFrontendConfig, FeatureMatrix, W2vBertFrontendConfig,
+    paraformer_frontend_config, squeezeformer_frontend_config, w2v_bert_frontend_config,
+    zipformer_frontend_config, AudioFrontendConfig, FeatureMatrix, W2vBertFrontendConfig,
 };
 
 #[cfg(all(test, feature = "cli"))]

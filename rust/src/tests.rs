@@ -47,6 +47,25 @@ fn zipformer_config_uses_paper_defaults() {
 }
 
 #[test]
+fn paraformer_config_hash_matches_python_repr_contract() {
+    let cli = Cli::parse_from([
+        "test",
+        "--input",
+        "in.parquet",
+        "--cache-dir",
+        "cache",
+        "--frontend",
+        "paraformer",
+    ]);
+    let config = FrontendConfig::from_cli(&cli);
+    assert_eq!(
+            config.config_repr(),
+            "{'featurizer': {'type': 'paraformer', 'sample_rate': 16000, 'n_fft': 400, 'win_length': 400, 'n_mels': 80, 'backend': 'torchaudio', 'preemphasis': 0.97, 'normalize_signal': True, 'normalize_feature': True, 'normalize_per_frame': False, 'hop_length': 160}}"
+        );
+    assert_eq!(config.feature_dim(), 80);
+}
+
+#[test]
 fn w2v_bert_config_hash_matches_python_repr_contract() {
     let cli = Cli::parse_from([
         "test",

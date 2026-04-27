@@ -7,8 +7,8 @@ use pyo3::wrap_pyfunction;
 use crate::feature_loader::RustParquetFeatureCacheReader;
 use crate::{
     extract_audio_features_from_samples, extract_w2v_bert_features_from_samples,
-    squeezeformer_frontend_config, w2v_bert_frontend_config, zipformer_frontend_config,
-    FeatureMatrix,
+    paraformer_frontend_config, squeezeformer_frontend_config, w2v_bert_frontend_config,
+    zipformer_frontend_config, FeatureMatrix,
 };
 
 fn py_error(error: anyhow::Error) -> PyErr {
@@ -147,6 +147,52 @@ fn extract_zipformer<'py>(
 }
 
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (
+    waveform,
+    sample_rate,
+    *,
+    target_sample_rate=16_000,
+    n_fft=400,
+    win_length=None,
+    hop_length=160,
+    n_mels=80,
+    preemphasis=0.97,
+    normalize_signal=true,
+    normalize_feature=true,
+    normalize_per_frame=false
+))]
+fn extract_paraformer<'py>(
+    py: Python<'py>,
+    waveform: PyReadonlyArrayDyn<'py, f32>,
+    sample_rate: u32,
+    target_sample_rate: u32,
+    n_fft: usize,
+    win_length: Option<usize>,
+    hop_length: usize,
+    n_mels: usize,
+    preemphasis: f32,
+    normalize_signal: bool,
+    normalize_feature: bool,
+    normalize_per_frame: bool,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    let waveform = mono_waveform(waveform)?;
+    let mut config = paraformer_frontend_config();
+    config.sample_rate = target_sample_rate;
+    config.n_fft = n_fft;
+    config.win_length = win_length.unwrap_or(n_fft);
+    config.hop_length = hop_length;
+    config.n_mels = n_mels;
+    config.preemphasis = preemphasis;
+    config.normalize_signal = normalize_signal;
+    config.normalize_feature = normalize_feature;
+    config.normalize_per_frame = normalize_per_frame;
+    let features =
+        extract_audio_features_from_samples(&waveform, sample_rate, &config).map_err(py_error)?;
+    feature_matrix_to_pyarray(py, features)
+}
+
+#[pyfunction]
 #[pyo3(signature = (
     waveform,
     sample_rate,
@@ -183,6 +229,7 @@ fn extract_w2v_bert<'py>(
 fn asr_features(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extract_squeezeformer, m)?)?;
     m.add_function(wrap_pyfunction!(extract_zipformer, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_paraformer, m)?)?;
     m.add_function(wrap_pyfunction!(extract_w2v_bert, m)?)?;
     m.add_class::<RustParquetFeatureCacheReader>()?;
     Ok(())

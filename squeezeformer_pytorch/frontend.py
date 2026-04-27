@@ -22,6 +22,20 @@ ZIPFORMER_PAPER_FEATURIZER_CONFIG: dict[str, object] = {
     "normalize_per_frame": False,
 }
 
+PARAFORMER_FEATURIZER_CONFIG: dict[str, object] = {
+    "type": "paraformer",
+    "sample_rate": 16_000,
+    "n_fft": 400,
+    "win_length": 400,
+    "hop_length": 160,
+    "n_mels": 80,
+    "backend": "torchaudio",
+    "preemphasis": 0.97,
+    "normalize_signal": True,
+    "normalize_feature": True,
+    "normalize_per_frame": False,
+}
+
 
 def estimate_num_feature_frames(
     num_samples: int,
@@ -62,11 +76,21 @@ def zipformer_paper_featurizer_config(
     return config
 
 
+def paraformer_featurizer_config(
+    overrides: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    config = dict(PARAFORMER_FEATURIZER_CONFIG)
+    if overrides is not None:
+        config.update(overrides)
+    return config
+
+
 def resolve_checkpoint_featurizer_config(
     featurizer_config: Mapping[str, object] | None,
     *,
     use_zipformer: bool,
     use_w2v_bert: bool = False,
+    use_paraformer: bool = False,
 ) -> dict[str, object]:
     if featurizer_config:
         return dict(featurizer_config)
@@ -74,6 +98,8 @@ def resolve_checkpoint_featurizer_config(
         return {"type": "w2v_bert", "model_source": "facebook/w2v-bert-2.0"}
     if use_zipformer:
         return zipformer_paper_featurizer_config()
+    if use_paraformer:
+        return paraformer_featurizer_config()
     return {}
 
 
@@ -82,15 +108,19 @@ def build_featurizer_from_config(
     *,
     use_zipformer: bool = False,
     use_w2v_bert: bool = False,
+    use_paraformer: bool = False,
 ):
     config = resolve_checkpoint_featurizer_config(
         featurizer_config,
         use_zipformer=use_zipformer,
         use_w2v_bert=use_w2v_bert,
+        use_paraformer=use_paraformer,
     )
     if str(config.get("type", "")) == "w2v_bert":
         return RustW2VBertFeatureExtractor.from_config(config)
-    frontend_type = "zipformer" if use_zipformer else "squeezeformer"
+    frontend_type = str(config.pop("type", ""))
+    if frontend_type not in {"squeezeformer", "zipformer", "paraformer"}:
+        frontend_type = "paraformer" if use_paraformer else ("zipformer" if use_zipformer else "squeezeformer")
     return RustAudioFeaturizer(frontend_type=frontend_type, **config)
 
 
@@ -132,7 +162,7 @@ class RustAudioFeaturizer(torch.nn.Module):
         self.frontend_type = str(frontend_type)
         if self.backend != "torchaudio":
             raise ValueError("RustAudioFeaturizer supports only backend='torchaudio'.")
-        if self.frontend_type not in {"squeezeformer", "zipformer"}:
+        if self.frontend_type not in {"squeezeformer", "zipformer", "paraformer"}:
             raise ValueError(f"Unsupported Rust frontend type: {self.frontend_type}")
         if self.n_fft <= 0:
             raise ValueError(f"n_fft must be > 0, got {self.n_fft}.")
@@ -148,11 +178,14 @@ class RustAudioFeaturizer(torch.nn.Module):
             raise ValueError(f"n_mels must be > 0, got {self.n_mels}.")
 
     def forward(self, waveform: Tensor, sample_rate: int) -> Tensor:
-        from asr_features import extract_squeezeformer, extract_zipformer
+        from asr_features import extract_paraformer, extract_squeezeformer, extract_zipformer
 
-        extractor = (
-            extract_zipformer if self.frontend_type == "zipformer" else extract_squeezeformer
-        )
+        extractors = {
+            "paraformer": extract_paraformer,
+            "squeezeformer": extract_squeezeformer,
+            "zipformer": extract_zipformer,
+        }
+        extractor = extractors[self.frontend_type]
         features = extractor(
             _waveform_to_numpy(waveform),
             int(sample_rate),
@@ -180,7 +213,7 @@ class RustAudioFeaturizer(torch.nn.Module):
         )
 
     def config_dict(self) -> dict[str, object]:
-        return {
+        config: dict[str, object] = {
             "sample_rate": self.sample_rate,
             "n_fft": self.n_fft,
             "win_length": self.win_length,
@@ -192,6 +225,9 @@ class RustAudioFeaturizer(torch.nn.Module):
             "normalize_per_frame": self.normalize_per_frame,
             "hop_length": self.hop_length,
         }
+        if self.frontend_type == "paraformer":
+            config = {"type": "paraformer", **config}
+        return config
 
 
 class RustW2VBertFeatureExtractor(torch.nn.Module):

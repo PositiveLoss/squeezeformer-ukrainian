@@ -92,21 +92,26 @@ def build_checkpoint_featurizer(
     *,
     use_zipformer: bool,
     use_w2v_bert: bool,
+    use_paraformer: bool = False,
 ):
     config = resolve_checkpoint_featurizer_config(
         featurizer_config,
         use_zipformer=use_zipformer,
         use_w2v_bert=use_w2v_bert,
+        use_paraformer=use_paraformer,
     )
     if str(config.get("type", "")) == "w2v_bert":
         if W2VBertFeatureExtractor is not _PythonW2VBertFeatureExtractor:
             return W2VBertFeatureExtractor.from_config(config)
     elif AudioFeaturizer is not _PythonAudioFeaturizer:
-        return AudioFeaturizer(**config)
+        audio_config = dict(config)
+        audio_config.pop("type", None)
+        return AudioFeaturizer(**audio_config)
     return build_featurizer_from_config(
         config,
         use_zipformer=use_zipformer,
         use_w2v_bert=use_w2v_bert,
+        use_paraformer=use_paraformer,
     )
 
 

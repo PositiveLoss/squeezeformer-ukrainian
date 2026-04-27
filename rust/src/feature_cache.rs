@@ -16,8 +16,8 @@ use crate::arrow_utils::{column_by_name, scalar_as_bytes, scalar_as_string, stru
 use crate::audio::{decode_audio, AudioSource};
 use crate::cache::{cache_key, encode_feature_payload, CacheRow, ShardedCacheWriter};
 use crate::frontend::{
-    compute_features, squeezeformer_frontend_config, w2v_bert_frontend_config,
-    zipformer_frontend_config, AudioFrontendConfig, FrontendConfig,
+    compute_features, paraformer_frontend_config, squeezeformer_frontend_config,
+    w2v_bert_frontend_config, zipformer_frontend_config, AudioFrontendConfig, FrontendConfig,
 };
 use crate::util::resolve_path;
 
@@ -25,6 +25,7 @@ use crate::util::resolve_path;
 pub(crate) enum FrontendKind {
     Squeezeformer,
     Zipformer,
+    Paraformer,
     W2vBert,
 }
 
@@ -582,6 +583,11 @@ impl FrontendConfig {
                 let mut config = zipformer_frontend_config();
                 apply_audio_cli_overrides(&mut config, cli);
                 Self::Audio(config)
+            }
+            FrontendKind::Paraformer => {
+                let mut config = paraformer_frontend_config();
+                apply_audio_cli_overrides(&mut config, cli);
+                Self::Paraformer(config)
             }
             FrontendKind::W2vBert => {
                 let feature_size = cli.n_mels.unwrap_or(cli.w2v_feature_size);
