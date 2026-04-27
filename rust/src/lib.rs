@@ -22,6 +22,8 @@ mod util;
 #[cfg(feature = "python")]
 mod python;
 
+#[cfg(feature = "audio-decode")]
+pub use audio::{decode_audio_from_bytes, decode_audio_from_path};
 #[cfg(feature = "cli")]
 pub use cli::run_cli;
 #[cfg(feature = "frontend")]

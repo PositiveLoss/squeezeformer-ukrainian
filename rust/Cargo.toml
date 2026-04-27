@@ -1,6 +1,6 @@
 [package]
 name = "asr-features"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "ASR feature extraction and cache warming utilities"
 license = "MIT"
@@ -46,6 +46,7 @@ cli = [
 ]
 python = [
     "frontend",
+    "audio-decode",
     "dep:anyhow",
     "dep:arrow",
     "dep:numpy",

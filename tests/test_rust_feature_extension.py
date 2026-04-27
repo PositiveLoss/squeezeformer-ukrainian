@@ -46,6 +46,7 @@ def test_rust_feature_extension_extracts_numpy_features() -> None:
     pytest.importorskip("asr_features")
     import numpy as np
     from asr_features import (
+        decode_audio_bytes,
         extract_paraformer,
         extract_squeezeformer,
         extract_w2v_bert,
@@ -53,11 +54,16 @@ def test_rust_feature_extension_extracts_numpy_features() -> None:
     )
 
     waveform = np.sin(np.arange(16_000, dtype=np.float32) * 0.01).astype(np.float32)
+    wav_bytes = _test_wav_bytes()
 
     squeezeformer = extract_squeezeformer(waveform, 16_000)
     zipformer = extract_zipformer(waveform, 16_000)
     paraformer = extract_paraformer(waveform, 16_000)
     w2v_bert = extract_w2v_bert(waveform, 16_000)
+    decoded_waveform, decoded_sample_rate = decode_audio_bytes(
+        wav_bytes,
+        path_hint="audio.wav",
+    )
 
     assert squeezeformer.dtype == np.float32
     assert squeezeformer.shape[1] == 80
@@ -67,6 +73,9 @@ def test_rust_feature_extension_extracts_numpy_features() -> None:
     assert paraformer.shape[1] == 80
     assert w2v_bert.dtype == np.float32
     assert w2v_bert.shape[1] == 160
+    assert decoded_waveform.dtype == np.float32
+    assert decoded_waveform.ndim == 1
+    assert decoded_sample_rate == 16_000
 
 
 def test_rust_featurizer_modules_extract_torch_features() -> None:
@@ -215,3 +224,19 @@ def _write_test_wav(path: Path) -> None:
             sample = int(12_000 * math.sin(index * 0.03))
             frames.extend(struct.pack("<h", sample))
         handle.writeframes(bytes(frames))
+
+
+def _test_wav_bytes() -> bytes:
+    import io
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16_000)
+        frames = bytearray()
+        for index in range(160):
+            sample = int(12_000 * math.sin(index * 0.03))
+            frames.extend(struct.pack("<h", sample))
+        handle.writeframes(bytes(frames))
+    return buffer.getvalue()

@@ -1,14 +1,15 @@
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArrayDyn};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArrayDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::wrap_pyfunction;
 
 use crate::feature_loader::RustParquetFeatureCacheReader;
 use crate::{
-    extract_audio_features_from_samples, extract_w2v_bert_features_from_samples,
-    paraformer_frontend_config, squeezeformer_frontend_config, w2v_bert_frontend_config,
-    zipformer_frontend_config, FeatureMatrix,
+    decode_audio_from_bytes, decode_audio_from_path, extract_audio_features_from_samples,
+    extract_w2v_bert_features_from_samples, paraformer_frontend_config,
+    squeezeformer_frontend_config, w2v_bert_frontend_config, zipformer_frontend_config,
+    FeatureMatrix,
 };
 
 fn py_error(error: anyhow::Error) -> PyErr {
@@ -52,6 +53,56 @@ fn feature_matrix_to_pyarray<'py>(
     let array = Array2::from_shape_vec((features.rows, features.cols), features.values)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(array.into_pyarray(py))
+}
+
+fn decoded_audio_to_pyarray<'py>(
+    py: Python<'py>,
+    decoded: (Vec<f32>, u32),
+) -> (Bound<'py, PyArray1<f32>>, u32) {
+    (decoded.0.into_pyarray(py), decoded.1)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    path,
+    *,
+    fallback_sample_rate=16_000,
+    ffmpeg_fallback=true
+))]
+fn decode_audio_path<'py>(
+    py: Python<'py>,
+    path: String,
+    fallback_sample_rate: u32,
+    ffmpeg_fallback: bool,
+) -> PyResult<(Bound<'py, PyArray1<f32>>, u32)> {
+    let decoded =
+        decode_audio_from_path(path, fallback_sample_rate, ffmpeg_fallback).map_err(py_error)?;
+    Ok(decoded_audio_to_pyarray(py, decoded))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    audio,
+    *,
+    path_hint=None,
+    fallback_sample_rate=16_000,
+    ffmpeg_fallback=true
+))]
+fn decode_audio_bytes<'py>(
+    py: Python<'py>,
+    audio: &[u8],
+    path_hint: Option<String>,
+    fallback_sample_rate: u32,
+    ffmpeg_fallback: bool,
+) -> PyResult<(Bound<'py, PyArray1<f32>>, u32)> {
+    let decoded = decode_audio_from_bytes(
+        audio,
+        path_hint.as_deref(),
+        fallback_sample_rate,
+        ffmpeg_fallback,
+    )
+    .map_err(py_error)?;
+    Ok(decoded_audio_to_pyarray(py, decoded))
 }
 
 #[pyfunction]
@@ -227,6 +278,8 @@ fn extract_w2v_bert<'py>(
 
 #[pymodule]
 fn asr_features(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(decode_audio_path, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_audio_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(extract_squeezeformer, m)?)?;
     m.add_function(wrap_pyfunction!(extract_zipformer, m)?)?;
     m.add_function(wrap_pyfunction!(extract_paraformer, m)?)?;

@@ -95,6 +95,31 @@ pub(crate) fn decode_audio(
     }
 }
 
+pub fn decode_audio_from_path<P: AsRef<Path>>(
+    path: P,
+    fallback_sample_rate: u32,
+    ffmpeg_fallback: bool,
+) -> Result<(Vec<f32>, u32)> {
+    decode_audio(
+        AudioSource::Path(path.as_ref().to_path_buf(), None),
+        fallback_sample_rate,
+        ffmpeg_fallback,
+    )
+}
+
+pub fn decode_audio_from_bytes(
+    bytes: &[u8],
+    path_hint: Option<&str>,
+    fallback_sample_rate: u32,
+    ffmpeg_fallback: bool,
+) -> Result<(Vec<f32>, u32)> {
+    decode_audio(
+        AudioSource::Bytes(bytes.to_vec(), path_hint.map(str::to_owned)),
+        fallback_sample_rate,
+        ffmpeg_fallback,
+    )
+}
+
 fn decode_audio_symphonia(source: AudioSource) -> Result<(Vec<f32>, u32)> {
     let (mss, extension) = match source {
         AudioSource::Path(path, path_hint) => {
